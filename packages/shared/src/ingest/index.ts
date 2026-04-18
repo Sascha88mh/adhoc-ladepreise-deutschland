@@ -408,9 +408,9 @@ async function upsertStaticCatalog(
         t.station_code, t.cpo_id, t.name, t.address_line, t.city, t.postal_code, t.country_code,
         st_setsrid(st_makepoint(t.lng, t.lat), 4326),
         t.cp_count, t.max_kw,
-        coalesce(string_to_array(nullif(t.cur_types, ''), '|'), '{}'),
-        coalesce(string_to_array(nullif(t.conn_types, ''), '|'), '{}'),
-        coalesce(string_to_array(nullif(t.pay_methods, ''), '|'), '{}'),
+        coalesce(string_to_array(nullif(t.cur_types, ''), '|'), '{}'::text[]),
+        coalesce(string_to_array(nullif(t.conn_types, ''), '|'), '{}'::text[]),
+        coalesce(string_to_array(nullif(t.pay_methods, ''), '|'), '{}'::text[]),
         0, 0, 0, t.cp_count, now(), now(), now()
       from unnest(
         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
