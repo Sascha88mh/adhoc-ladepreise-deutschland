@@ -380,150 +380,194 @@ async function upsertStaticCatalog(
   feed: FeedConfig,
   parsed: ParsedStaticFeed,
 ) {
-  const stationCodes = new Set<string>();
+  if (!parsed.catalog.length) return 0;
 
-  for (const station of parsed.catalog) {
-    stationCodes.add(station.stationCode);
-    await client.query(
-      `insert into cpos (id, name, country_code)
-       values ($1, $2, $3)
-       on conflict (id) do update
-         set name = excluded.name,
-             country_code = excluded.country_code`,
-      [station.cpoId, station.cpoName, station.countryCode],
-    );
+  // ── 1. CPOs (deduplicated, one bulk upsert) ───────────────────────────────
+  const cpoMap = new Map<string, { name: string; countryCode: string }>();
+  for (const s of parsed.catalog) cpoMap.set(s.cpoId, { name: s.cpoName, countryCode: s.countryCode });
+  const cpoIds = [...cpoMap.keys()];
+  await client.query(
+    `insert into cpos (id, name, country_code)
+     select * from unnest($1::text[], $2::text[], $3::text[]) as t(id, name, country_code)
+     on conflict (id) do update
+       set name = excluded.name, country_code = excluded.country_code`,
+    [cpoIds, cpoIds.map((id) => cpoMap.get(id)!.name), cpoIds.map((id) => cpoMap.get(id)!.countryCode)],
+  );
 
-    const stationResult = await client.query<{ id: string }>(
-      `insert into stations (
-          station_code,
-          cpo_id,
-          name,
-          address_line,
-          city,
-          postal_code,
-          country_code,
-          geom,
-          charge_point_count,
-          max_power_kw,
-          current_types,
-          connector_types,
-          payment_methods,
-          available_count,
-          occupied_count,
-          out_of_service_count,
-          unknown_count,
-          last_price_update_at,
-          last_status_update_at,
-          updated_at
-        ) values (
-          $1, $2, $3, $4, $5, $6, $7,
-          st_setsrid(st_makepoint($8, $9), 4326),
-          $10, $11, $12, $13, $14, 0, 0, 0, $10, now(), now(), now()
-        )
-        on conflict (station_code) do update
-          set cpo_id = excluded.cpo_id,
-              name = excluded.name,
-              address_line = excluded.address_line,
-              city = excluded.city,
-              postal_code = excluded.postal_code,
-              country_code = excluded.country_code,
-              geom = excluded.geom,
-              charge_point_count = excluded.charge_point_count,
-              max_power_kw = excluded.max_power_kw,
-              current_types = excluded.current_types,
-              connector_types = excluded.connector_types,
-              payment_methods = excluded.payment_methods,
-              unknown_count = excluded.charge_point_count,
-              last_price_update_at = now(),
-              updated_at = now()
-        returning id::text`,
-      [
-        station.stationCode,
-        station.cpoId,
-        station.name,
-        station.addressLine,
-        station.city,
-        station.postalCode,
-        station.countryCode,
-        station.coordinates.lng,
-        station.coordinates.lat,
-        station.chargePointCount,
-        station.maxPowerKw,
-        station.currentTypes,
-        station.connectorTypes,
-        station.paymentMethods,
-      ],
-    );
+  // ── 2. Stations (one bulk upsert, returns station_code → id map) ──────────
+  const c = parsed.catalog;
+  const stationResult = await client.query<{ station_code: string; id: string }>(
+    `insert into stations (
+        station_code, cpo_id, name, address_line, city, postal_code, country_code,
+        geom, charge_point_count, max_power_kw, current_types, connector_types,
+        payment_methods, available_count, occupied_count, out_of_service_count,
+        unknown_count, last_price_update_at, last_status_update_at, updated_at
+      )
+      select
+        t.station_code, t.cpo_id, t.name, t.address_line, t.city, t.postal_code, t.country_code,
+        st_setsrid(st_makepoint(t.lng, t.lat), 4326),
+        t.cp_count, t.max_kw,
+        coalesce(string_to_array(nullif(t.cur_types, ''), '|'), '{}'),
+        coalesce(string_to_array(nullif(t.conn_types, ''), '|'), '{}'),
+        coalesce(string_to_array(nullif(t.pay_methods, ''), '|'), '{}'),
+        0, 0, 0, t.cp_count, now(), now(), now()
+      from unnest(
+        $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+        $8::float8[], $9::float8[],
+        $10::int[], $11::float8[], $12::text[], $13::text[], $14::text[]
+      ) as t(
+        station_code, cpo_id, name, address_line, city, postal_code, country_code,
+        lng, lat, cp_count, max_kw, cur_types, conn_types, pay_methods
+      )
+      on conflict (station_code) do update
+        set cpo_id = excluded.cpo_id, name = excluded.name,
+            address_line = excluded.address_line, city = excluded.city,
+            postal_code = excluded.postal_code, country_code = excluded.country_code,
+            geom = excluded.geom, charge_point_count = excluded.charge_point_count,
+            max_power_kw = excluded.max_power_kw, current_types = excluded.current_types,
+            connector_types = excluded.connector_types, payment_methods = excluded.payment_methods,
+            unknown_count = excluded.charge_point_count, last_price_update_at = now(), updated_at = now()
+      returning station_code, id::text`,
+    [
+      c.map((s) => s.stationCode),
+      c.map((s) => s.cpoId),
+      c.map((s) => s.name),
+      c.map((s) => s.addressLine),
+      c.map((s) => s.city),
+      c.map((s) => s.postalCode ?? ""),
+      c.map((s) => s.countryCode),
+      c.map((s) => s.coordinates.lng),
+      c.map((s) => s.coordinates.lat),
+      c.map((s) => s.chargePointCount),
+      c.map((s) => s.maxPowerKw ?? null),
+      c.map((s) => s.currentTypes.join("|")),
+      c.map((s) => s.connectorTypes.join("|")),
+      c.map((s) => s.paymentMethods.join("|")),
+    ],
+  );
+  const stationIdMap = new Map(stationResult.rows.map((r) => [r.station_code, r.id]));
 
-    const stationId = String(stationResult.rows[0].id);
-    const chargePointCodes = new Set<string>();
-    const tariffCodes = new Set<string>();
-
-    for (const point of station.chargePoints) {
-      chargePointCodes.add(point.chargePointCode);
-      const chargePointResult = await client.query<{ id: string }>(
-        `insert into charge_points (
-            station_id,
-            charge_point_code,
-            current_type,
-            max_power_kw,
-            last_status_raw,
-            last_status_canonical,
-            last_status_update_at
-          ) values ($1::uuid, $2, $3, $4, 'UNKNOWN', 'UNKNOWN', now())
-          on conflict (charge_point_code) do update
-            set station_id = excluded.station_id,
-                current_type = excluded.current_type,
-                max_power_kw = excluded.max_power_kw
-          returning id::text`,
-        [stationId, point.chargePointCode, point.currentType, point.maxPowerKw],
-      );
-
-      const chargePointId = String(chargePointResult.rows[0].id);
-      await client.query(`delete from connectors where charge_point_id = $1::uuid`, [chargePointId]);
-
-      for (const connector of point.connectors) {
-        await client.query(
-          `insert into connectors (
-              charge_point_id,
-              connector_type,
-              max_power_kw
-            ) values ($1::uuid, $2, $3)`,
-          [chargePointId, connector.connectorType, connector.maxPowerKw],
-        );
-      }
-
-      for (const tariff of point.tariffs) {
-        tariffCodes.add(tariff.id);
-        await insertTariffShape(client, {
-          stationId,
-          chargePointId,
-          tariff,
-        });
-      }
+  // ── 3. Charge points (one bulk upsert) ────────────────────────────────────
+  type FlatCp = { stationCode: string; stationId: string; code: string; currentType: string; maxPowerKw: number | null; connectors: typeof parsed.catalog[0]["chargePoints"][0]["connectors"]; tariffs: typeof parsed.catalog[0]["chargePoints"][0]["tariffs"] };
+  const allCps: FlatCp[] = [];
+  for (const station of c) {
+    const stationId = stationIdMap.get(station.stationCode);
+    if (!stationId) continue;
+    for (const cp of station.chargePoints) {
+      allCps.push({ stationCode: station.stationCode, stationId, code: cp.chargePointCode, currentType: cp.currentType, maxPowerKw: cp.maxPowerKw ?? null, connectors: cp.connectors, tariffs: cp.tariffs });
     }
+  }
 
-    await client.query(
-      `delete from charge_points
-        where station_id = $1::uuid
-          and not (charge_point_code = any($2::text[]))`,
-      [stationId, [...chargePointCodes]],
-    );
+  const cpResult = await client.query<{ charge_point_code: string; id: string }>(
+    `insert into charge_points (station_id, charge_point_code, current_type, max_power_kw, last_status_raw, last_status_canonical, last_status_update_at)
+     select t.sid::uuid, t.code, t.cur_type, t.max_kw, 'UNKNOWN', 'UNKNOWN', now()
+     from unnest($1::text[], $2::text[], $3::text[], $4::float8[]) as t(sid, code, cur_type, max_kw)
+     on conflict (charge_point_code) do update
+       set station_id = excluded.station_id, current_type = excluded.current_type, max_power_kw = excluded.max_power_kw
+     returning charge_point_code, id::text`,
+    [allCps.map((cp) => cp.stationId), allCps.map((cp) => cp.code), allCps.map((cp) => cp.currentType), allCps.map((cp) => cp.maxPowerKw)],
+  );
+  const cpIdMap = new Map(cpResult.rows.map((r) => [r.charge_point_code, r.id]));
+  const allCpIds = cpResult.rows.map((r) => r.id);
 
+  // ── 4. Connectors (bulk delete + insert) ─────────────────────────────────
+  if (allCpIds.length) {
+    await client.query(`delete from connectors where charge_point_id = any($1::uuid[])`, [allCpIds]);
+  }
+  const connRows: Array<{ cpId: string; connType: string; maxKw: number | null }> = [];
+  for (const cp of allCps) {
+    const cpId = cpIdMap.get(cp.code);
+    if (!cpId) continue;
+    for (const conn of cp.connectors) connRows.push({ cpId, connType: conn.connectorType, maxKw: conn.maxPowerKw ?? null });
+  }
+  if (connRows.length) {
     await client.query(
-      `delete from tariffs
-        where station_id = $1::uuid
-          and not (tariff_code = any($2::text[]))`,
-      [stationId, [...tariffCodes]],
+      `insert into connectors (charge_point_id, connector_type, max_power_kw)
+       select t.cp_id::uuid, t.conn_type, t.max_kw
+       from unnest($1::text[], $2::text[], $3::float8[]) as t(cp_id, conn_type, max_kw)`,
+      [connRows.map((r) => r.cpId), connRows.map((r) => r.connType), connRows.map((r) => r.maxKw)],
     );
   }
 
-  if (feed.cpoId && stationCodes.size) {
+  // ── 5. Tariffs (bulk upsert per charge-point, then components) ─────────────
+  const tariffRows: Array<{ stationId: string; cpId: string | null; code: string; label: string; currency: string; isComplete: boolean; tariff: typeof allCps[0]["tariffs"][0] }> = [];
+  for (const cp of allCps) {
+    const cpId = cpIdMap.get(cp.code) ?? null;
+    const stationId = cp.stationId;
+    for (const tariff of cp.tariffs) tariffRows.push({ stationId, cpId, code: tariff.id, label: tariff.label ?? "", currency: tariff.currency ?? "EUR", isComplete: tariff.isComplete ?? false, tariff });
+  }
+  if (tariffRows.length) {
+    const tariffResult = await client.query<{ tariff_code: string; id: string }>(
+      `insert into tariffs (station_id, charge_point_id, tariff_code, label, currency, is_complete, updated_at)
+       select t.sid::uuid, t.cpid::uuid, t.code, t.label, t.currency, t.complete, now()
+       from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bool[]) as t(sid, cpid, code, label, currency, complete)
+       on conflict (tariff_code) do update
+         set station_id = excluded.station_id, charge_point_id = excluded.charge_point_id,
+             label = excluded.label, currency = excluded.currency, is_complete = excluded.is_complete, updated_at = now()
+       returning tariff_code, id::text`,
+      [tariffRows.map((t) => t.stationId), tariffRows.map((t) => t.cpId ?? ""), tariffRows.map((t) => t.code), tariffRows.map((t) => t.label), tariffRows.map((t) => t.currency), tariffRows.map((t) => t.isComplete)],
+    );
+    const tariffIdMap = new Map(tariffResult.rows.map((r) => [r.tariff_code, r.id]));
+    const allTariffIds = tariffResult.rows.map((r) => r.id);
+
+    await client.query(`delete from tariff_components where tariff_id = any($1::uuid[])`, [allTariffIds]);
+    await client.query(`delete from tariff_payment_methods where tariff_id = any($1::uuid[])`, [allTariffIds]);
+    await client.query(`delete from tariff_brands_accepted where tariff_id = any($1::uuid[])`, [allTariffIds]);
+
+    const compRows: Array<[string, string, number | null, number | null, number | null]> = [];
+    const pmRows: Array<[string, string]> = [];
+    const brandRows: Array<[string, string]> = [];
+    for (const row of tariffRows) {
+      const tid = tariffIdMap.get(row.code);
+      if (!tid) continue;
+      const t = row.tariff;
+      if (t.pricePerKwh != null) compRows.push([tid, "pricePerKWh", t.pricePerKwh, null, null]);
+      if (t.pricePerMinute != null) compRows.push([tid, "pricePerMinute", t.pricePerMinute, null, null]);
+      if (t.sessionFee != null) compRows.push([tid, "sessionFee", t.sessionFee, null, null]);
+      if (t.preauthAmount != null) compRows.push([tid, "preauth", t.preauthAmount, null, null]);
+      if (t.blockingFeePerMinute != null) compRows.push([tid, "blockingFee", t.blockingFeePerMinute, t.blockingFeeStartsAfterMinutes ?? null, null]);
+      for (const cap of t.caps ?? []) compRows.push([tid, "cap", null, null, cap.amount]);
+      for (const pm of t.paymentMethods ?? []) pmRows.push([tid, pm]);
+      for (const brand of t.brandsAccepted ?? []) brandRows.push([tid, brand]);
+    }
+    if (compRows.length) {
+      await client.query(
+        `insert into tariff_components (tariff_id, component_type, amount, starts_after_minutes, price_cap)
+         select t.tid::uuid, t.ctype, t.amount, t.sam, t.pcap
+         from unnest($1::text[], $2::text[], $3::float8[], $4::float8[], $5::float8[]) as t(tid, ctype, amount, sam, pcap)`,
+        [compRows.map((r) => r[0]), compRows.map((r) => r[1]), compRows.map((r) => r[2]), compRows.map((r) => r[3]), compRows.map((r) => r[4])],
+      );
+    }
+    if (pmRows.length) {
+      await client.query(
+        `insert into tariff_payment_methods (tariff_id, payment_method) select t.tid::uuid, t.pm from unnest($1::text[], $2::text[]) as t(tid, pm) on conflict do nothing`,
+        [pmRows.map((r) => r[0]), pmRows.map((r) => r[1])],
+      );
+    }
+    if (brandRows.length) {
+      await client.query(
+        `insert into tariff_brands_accepted (tariff_id, brand) select t.tid::uuid, t.brand from unnest($1::text[], $2::text[]) as t(tid, brand) on conflict do nothing`,
+        [brandRows.map((r) => r[0]), brandRows.map((r) => r[1])],
+      );
+    }
+  }
+
+  // ── 6. Cleanup: remove stale charge_points, tariffs, stations ─────────────
+  const stationIdsByCode = [...stationIdMap.values()];
+  if (stationIdsByCode.length) {
     await client.query(
-      `delete from stations
-        where cpo_id = $1
-          and not (station_code = any($2::text[]))`,
-      [feed.cpoId, [...stationCodes]],
+      `delete from charge_points where station_id = any($1::uuid[]) and not (charge_point_code = any($2::text[]))`,
+      [stationIdsByCode, allCps.map((cp) => cp.code)],
+    );
+    await client.query(
+      `delete from tariffs where station_id = any($1::uuid[]) and not (tariff_code = any($2::text[]))`,
+      [stationIdsByCode, tariffRows.map((t) => t.code)],
+    );
+  }
+  if (feed.cpoId && stationIdMap.size) {
+    await client.query(
+      `delete from stations where cpo_id = $1 and not (station_code = any($2::text[]))`,
+      [feed.cpoId, c.map((s) => s.stationCode)],
     );
   }
 

@@ -226,26 +226,49 @@ function parseChargePoint(
   };
 }
 
+type FacilityAddress = {
+  postcode?: string;
+  city?: unknown;
+  countryCode?: string;
+  addressLine?: Array<{
+    type?: { value?: string };
+    text?: { values?: Array<{ value?: string }> };
+  }>;
+};
+
+type LocationBlock = {
+  coordinatesForDisplay?: { latitude?: number; longitude?: number };
+  locLocationExtensionG?: {
+    FacilityLocation?: { address?: FacilityAddress };
+    facilityLocation?: { address?: FacilityAddress };
+  };
+};
+
+function resolveLocationRef(ref?: {
+  locAreaLocation?: LocationBlock;
+  locPointLocation?: LocationBlock;
+  name?: unknown;
+}) {
+  const area = ref?.locAreaLocation;
+  const point = ref?.locPointLocation;
+  const coords =
+    area?.coordinatesForDisplay ??
+    point?.coordinatesForDisplay;
+  const ext =
+    area?.locLocationExtensionG ??
+    point?.locLocationExtensionG;
+  const address =
+    ext?.FacilityLocation?.address ??
+    ext?.facilityLocation?.address;
+  return { coords, address };
+}
+
 function parseStationCatalog(
   site: {
     operator?: { afacAnOrganisation?: { name?: unknown; externalIdentifier?: Array<{ identifier?: string }> } };
     locationReference?: {
-      locAreaLocation?: {
-        coordinatesForDisplay?: { latitude?: number; longitude?: number };
-        locLocationExtensionG?: {
-          FacilityLocation?: {
-            address?: {
-              postcode?: string;
-              city?: unknown;
-              countryCode?: string;
-              addressLine?: Array<{
-                type?: { value?: string };
-                text?: { values?: Array<{ value?: string }> };
-              }>;
-            };
-          };
-        };
-      };
+      locAreaLocation?: LocationBlock;
+      locPointLocation?: LocationBlock;
     };
     energyInfrastructureStation?: Array<{
       idG?: string;
@@ -281,8 +304,7 @@ function parseStationCatalog(
       }>;
     }>;
   }): ParsedStationCatalog[] {
-  const coordinates = site.locationReference?.locAreaLocation?.coordinatesForDisplay;
-  const address = site.locationReference?.locAreaLocation?.locLocationExtensionG?.FacilityLocation?.address;
+  const { coords: coordinates, address } = resolveLocationRef(site.locationReference);
   const latitude = coordinates?.latitude;
   const longitude = coordinates?.longitude;
 

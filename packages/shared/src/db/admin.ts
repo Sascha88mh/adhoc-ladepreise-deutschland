@@ -269,6 +269,18 @@ export async function deleteFeedConfigDb(id: string, client?: PoolClient) {
   return (result.rowCount ?? 0) > 0;
 }
 
+export async function getAppSecret(key: string): Promise<string | null> {
+  try {
+    const result = await getPool().query<{ value: string }>(
+      `select value from app_secrets where key = $1`,
+      [key],
+    );
+    return result.rows[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listSyncRunsDb(feedId?: string, client?: PoolClient) {
   const executor = client ?? getPool();
   const result = await executor.query<Record<string, unknown>>(
