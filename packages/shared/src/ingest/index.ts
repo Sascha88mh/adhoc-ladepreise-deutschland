@@ -11,6 +11,7 @@ import {
   resolveSecretRef,
 } from "../mobilithek/client";
 import {
+  cleanupStuckSyncRunsDb,
   getFeedConfigDb,
   listFeedConfigsDb,
   updateFeedConfigDb,
@@ -859,6 +860,9 @@ export async function runFeedAction(
 }
 
 export async function runDueFeedCycle() {
+  // Clean up any sync runs that got stuck in "running" state (e.g. Lambda timeout)
+  await cleanupStuckSyncRunsDb().catch(() => undefined);
+
   const feeds = await listFeedConfigsDb();
   const dueFeeds = feeds.filter((feed: FeedConfig) => shouldRunFeed(feed));
 

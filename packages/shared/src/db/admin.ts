@@ -281,6 +281,20 @@ export async function getAppSecret(key: string): Promise<string | null> {
   }
 }
 
+export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
+  const executor = client ?? getPool();
+  const result = await executor.query<{ id: string }>(
+    `update sync_runs
+        set status = 'failed',
+            finished_at = now(),
+            message = 'Abgebrochen (Timeout)'
+      where status = 'running'
+        and started_at < now() - interval '5 minutes'
+      returning id::text`,
+  );
+  return result.rowCount ?? 0;
+}
+
 export async function listSyncRunsDb(feedId?: string, client?: PoolClient) {
   const executor = client ?? getPool();
   const result = await executor.query<Record<string, unknown>>(
