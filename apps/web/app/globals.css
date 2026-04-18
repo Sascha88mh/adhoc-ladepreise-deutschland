@@ -53,7 +53,7 @@ select {
   backdrop-filter: blur(16px);
   border: 1px solid var(--line);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.7) inset,
+    0 1px 0 var(--glass-border, rgba(255, 255, 255, 0.7)) inset,
     0 20px 40px rgba(16, 31, 27, 0.08);
 }
 
@@ -62,7 +62,7 @@ select {
   backdrop-filter: blur(18px);
   border: 1px solid rgba(21, 38, 27, 0.09);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.84) inset,
+    0 1px 0 var(--glass-border, rgba(255, 255, 255, 0.84)) inset,
     0 28px 60px rgba(16, 31, 27, 0.1);
 }
 

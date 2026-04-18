@@ -51,6 +51,17 @@ export const tariffSummarySchema = z.object({
 });
 export type TariffSummary = z.infer<typeof tariffSummarySchema>;
 
+export const chargePointStatusSchema = z.enum([
+  "AVAILABLE",
+  "CHARGING",
+  "RESERVED",
+  "BLOCKED",
+  "OUT_OF_SERVICE",
+  "MAINTENANCE",
+  "UNKNOWN",
+]);
+export type ChargePointStatus = z.infer<typeof chargePointStatusSchema>;
+
 export const stationRecordSchema = z.object({
   stationId: z.string(),
   cpoId: z.string(),
@@ -135,6 +146,7 @@ export const stationDetailSchema = stationRecordSchema.extend({
 export type StationDetail = z.infer<typeof stationDetailSchema>;
 
 export const candidateFiltersSchema = z.object({
+  corridorKm: z.number().positive().optional(),
   maxPriceKwh: z.number().positive().optional(),
   minPowerKw: z.number().positive().optional(),
   minChargePointCount: z.number().int().positive().optional(),
@@ -157,6 +169,16 @@ export const routePlanRequestSchema = z.object({
 });
 export type RoutePlanRequest = z.infer<typeof routePlanRequestSchema>;
 
+export const locationSuggestionSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  secondaryLabel: z.string().nullable(),
+  inputLabel: z.string(),
+  query: z.string(),
+  coordinates: coordinateSchema,
+});
+export type LocationSuggestion = z.infer<typeof locationSuggestionSchema>;
+
 export const routeCandidatesRequestSchema = z.object({
   routeId: z.string().optional(),
   polyline: z.array(coordinateSchema).min(2).optional(),
@@ -169,19 +191,29 @@ export type RouteCandidatesRequest = z.infer<typeof routeCandidatesRequestSchema
 
 export const feedConfigSchema = z.object({
   id: z.string(),
+  source: z.enum(["mobilithek"]).default("mobilithek"),
+  cpoId: z.string().nullable(),
   name: z.string(),
   mode: z.enum(["push", "pull", "hybrid"]),
   type: z.enum(["static", "dynamic"]),
   subscriptionId: z.string(),
   urlOverride: z.string().nullable(),
-  pollIntervalMinutes: z.number().int().positive(),
-  reconciliationIntervalMinutes: z.number().int().positive(),
+  pollIntervalMinutes: z.number().int().positive().nullable(),
+  reconciliationIntervalMinutes: z.number().int().positive().nullable(),
   isActive: z.boolean(),
+  ingestCatalog: z.boolean().default(true),
+  ingestPrices: z.boolean().default(true),
+  ingestStatus: z.boolean().default(false),
+  credentialRef: z.string().nullable(),
+  webhookSecretRef: z.string().nullable(),
   notes: z.string(),
   lastSuccessAt: z.string().nullable(),
   lastSnapshotAt: z.string().nullable(),
   lastDeltaCount: z.number().int().nonnegative(),
   errorRate: z.number().min(0).max(1),
+  cursorState: z.record(z.string(), z.unknown()).nullable().default(null),
+  lastErrorMessage: z.string().nullable().default(null),
+  consecutiveFailures: z.number().int().nonnegative().default(0),
 });
 export type FeedConfig = z.infer<typeof feedConfigSchema>;
 
@@ -206,8 +238,49 @@ export const webhookDeliverySchema = z.object({
 });
 export type WebhookDelivery = z.infer<typeof webhookDeliverySchema>;
 
+export const stationOverrideSchema = z.object({
+  stationId: z.string(),
+  displayName: z.string().nullable(),
+  addressLine: z.string().nullable(),
+  city: z.string().nullable(),
+  postalCode: z.string().nullable(),
+  maxPowerKw: z.number().nullable(),
+  isHidden: z.boolean(),
+  adminNote: z.string().nullable(),
+  updatedAt: z.string(),
+});
+export type StationOverride = z.infer<typeof stationOverrideSchema>;
+
+export const adminStationRecordSchema = z.object({
+  stationId: z.string(),
+  stationCode: z.string(),
+  cpoId: z.string(),
+  cpoName: z.string(),
+  sourceName: z.string(),
+  effectiveName: z.string(),
+  sourceAddressLine: z.string(),
+  effectiveAddressLine: z.string(),
+  sourceCity: z.string(),
+  effectiveCity: z.string(),
+  sourcePostalCode: z.string(),
+  effectivePostalCode: z.string(),
+  sourceMaxPowerKw: z.number(),
+  effectiveMaxPowerKw: z.number(),
+  isHidden: z.boolean(),
+  override: stationOverrideSchema.nullable(),
+});
+export type AdminStationRecord = z.infer<typeof adminStationRecordSchema>;
+
 export const publicRoutePlanResponseSchema = z.object({
   data: routePlanSchema,
+});
+
+export const publicLocationSuggestionsResponseSchema = z.object({
+  data: z.array(locationSuggestionSchema),
+});
+
+export const publicReverseLocationResponseSchema = z.object({
+  data: locationSuggestionSchema,
 });
 
 export const publicCandidatesResponseSchema = z.object({
@@ -239,4 +312,8 @@ export const feedConfigResponseSchema = z.object({
 
 export const syncRunsResponseSchema = z.object({
   data: z.array(syncRunSchema),
+});
+
+export const stationOverridesResponseSchema = z.object({
+  data: z.array(adminStationRecordSchema),
 });

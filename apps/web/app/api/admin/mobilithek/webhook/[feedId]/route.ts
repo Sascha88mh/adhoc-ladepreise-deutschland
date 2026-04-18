@@ -1,8 +1,4 @@
-import {
-  appendSyncRun,
-  recordWebhookDelivery,
-  updateFeedConfig,
-} from "@adhoc/shared/store";
+import { processFeedWebhook } from "@adhoc/shared/ingest";
 
 export async function POST(
   request: Request,
@@ -10,29 +6,11 @@ export async function POST(
 ) {
   const payload = await request.text();
   const { feedId } = await params;
-  const timestamp = new Date().toISOString();
-
-  recordWebhookDelivery({
-    feedId,
-    receivedAt: timestamp,
-    status: "accepted",
-    payloadSize: payload.length,
-  });
-
-  updateFeedConfig(feedId, {
-    lastSuccessAt: timestamp,
-    lastDeltaCount: 1,
-  });
-
-  appendSyncRun({
-    feedId,
-    kind: "webhook",
-    status: "success",
-    startedAt: timestamp,
-    finishedAt: new Date().toISOString(),
-    message: `Webhook akzeptiert (${payload.length} bytes)`,
-    deltaCount: 1,
-  });
-
-  return Response.json({ ok: true });
+  try {
+    await processFeedWebhook(feedId, payload, request.headers.get("x-webhook-secret"));
+    return Response.json({ ok: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Webhook processing failed";
+    return Response.json({ error: message }, { status: message === "Feed not found" ? 404 : 500 });
+  }
 }

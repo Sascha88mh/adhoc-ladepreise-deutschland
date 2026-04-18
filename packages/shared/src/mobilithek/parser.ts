@@ -1,5 +1,34 @@
-import type { AvailabilitySummary, StationRecord, TariffSummary } from "../domain/types";
-import type { ParsedDynamicFeed, ParsedStaticFeed } from "./types";
+import type {
+  AvailabilitySummary,
+  ChargePointStatus,
+  CurrentType,
+  StationRecord,
+  TariffSummary,
+} from "../domain/types";
+import type {
+  ParsedChargePoint,
+  ParsedConnector,
+  ParsedDynamicFeed,
+  ParsedDynamicUpdate,
+  ParsedStaticFeed,
+  ParsedStationCatalog,
+  ParsedTariff,
+} from "./types";
+
+function stableId(parts: Array<string | number | null | undefined>) {
+  const input = parts
+    .map((part) => (part == null ? "" : String(part).trim()))
+    .filter(Boolean)
+    .join("|");
+
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(index);
+    hash |= 0;
+  }
+
+  return `mobi-${Math.abs(hash).toString(36)}`;
+}
 
 function readMultilingual(value: unknown) {
   if (!value || typeof value !== "object") {
@@ -22,6 +51,44 @@ function readAddressLine(address: {
   return [street, houseNumber].filter(Boolean).join(" ").trim();
 }
 
+function normalizeCurrentType(value: string | undefined): CurrentType {
+  return value?.toUpperCase() === "AC" ? "AC" : "DC";
+}
+
+function normalizeStatus(value: string | undefined): ChargePointStatus {
+  const normalized = value?.trim().toLowerCase();
+
+  if (!normalized) {
+    return "UNKNOWN";
+  }
+
+  if (["available", "free", "vacant", "idle"].includes(normalized)) {
+    return "AVAILABLE";
+  }
+
+  if (["charging", "inuse", "occupied", "busy"].includes(normalized)) {
+    return "CHARGING";
+  }
+
+  if (["reserved", "booking"].includes(normalized)) {
+    return "RESERVED";
+  }
+
+  if (["blocked", "unavailable"].includes(normalized)) {
+    return "BLOCKED";
+  }
+
+  if (["outofservice", "out_of_service", "faulted", "offline"].includes(normalized)) {
+    return "OUT_OF_SERVICE";
+  }
+
+  if (["maintenance", "plannedmaintenance"].includes(normalized)) {
+    return "MAINTENANCE";
+  }
+
+  return "UNKNOWN";
+}
+
 function parseTariff(rate: {
   idG?: string;
   rateName?: unknown;
@@ -36,9 +103,15 @@ function parseTariff(rate: {
     priceCap?: number;
     timeBasedApplicability?: { fromMinute?: number };
   }>;
-}): TariffSummary {
-  const summary: TariffSummary = {
-    id: rate.idG ?? crypto.randomUUID(),
+}): ParsedTariff {
+  const summary: ParsedTariff = {
+    id:
+      rate.idG ??
+      stableId([
+        readMultilingual(rate.rateName),
+        rate.applicableCurrency?.[0],
+        JSON.stringify(rate.energyPrice ?? []),
+      ]),
     label: readMultilingual(rate.rateName) ?? "Ad-hoc",
     currency: rate.applicableCurrency?.[0] ?? "EUR",
     pricePerKwh: null,
@@ -96,7 +169,64 @@ function emptyAvailability(chargePointCount: number): AvailabilitySummary {
   };
 }
 
-function parseStation(
+function parseChargePoint(
+  point: {
+    idG?: string;
+    currentType?: { value?: string };
+    connector?: Array<{ connectorType?: { value?: string } }>;
+    availableChargingPower?: number[];
+    electricEnergy?: Array<{
+      energyRate?: Array<{
+        idG?: string;
+        rateName?: unknown;
+        applicableCurrency?: string[];
+        payment?: {
+          paymentMeans?: Array<{ value?: string }>;
+          brandsAccepted?: Array<{ value?: string }>;
+        };
+        energyPrice?: Array<{
+          priceType?: { value?: string };
+          value?: number;
+          priceCap?: number;
+          timeBasedApplicability?: { fromMinute?: number };
+        }>;
+      }>;
+    }>;
+  },
+  stationCode: string,
+): ParsedChargePoint {
+  const chargePointCode =
+    point.idG ??
+    stableId([
+      stationCode,
+      point.currentType?.value,
+      JSON.stringify(point.availableChargingPower ?? []),
+    ]);
+
+  const connectors: ParsedConnector[] = (point.connector ?? []).map((connector, index) => ({
+    connectorType: connector.connectorType?.value ?? `UNKNOWN_${index + 1}`,
+    maxPowerKw: point.availableChargingPower?.[index]
+      ? point.availableChargingPower[index]! / 1000
+      : null,
+  }));
+
+  const tariffs = (point.electricEnergy ?? []).flatMap((energy) =>
+    (energy.energyRate ?? []).map((rate) => parseTariff(rate)),
+  );
+
+  return {
+    chargePointCode,
+    currentType: normalizeCurrentType(point.currentType?.value),
+    connectors,
+    maxPowerKw: Math.max(
+      ...((point.availableChargingPower ?? []).map((value) => value / 1000)),
+      0,
+    ),
+    tariffs,
+  };
+}
+
+function parseStationCatalog(
   site: {
     operator?: { afacAnOrganisation?: { name?: unknown; externalIdentifier?: Array<{ identifier?: string }> } };
     locationReference?: {
@@ -150,7 +280,7 @@ function parseStation(
         };
       }>;
     }>;
-  }): StationRecord[] {
+  }): ParsedStationCatalog[] {
   const coordinates = site.locationReference?.locAreaLocation?.coordinatesForDisplay;
   const address = site.locationReference?.locAreaLocation?.locLocationExtensionG?.FacilityLocation?.address;
   const latitude = coordinates?.latitude;
@@ -160,17 +290,24 @@ function parseStation(
     return [];
   }
 
-  return (site.energyInfrastructureStation ?? []).map((station) => {
-    const points = (station.refillPoint ?? [])
+  const cpoId =
+    site.operator?.afacAnOrganisation?.externalIdentifier?.[0]?.identifier ??
+    readMultilingual(site.operator?.afacAnOrganisation?.name) ??
+    "unknown";
+  const cpoName = readMultilingual(site.operator?.afacAnOrganisation?.name) ?? "Unknown CPO";
+
+  return (site.energyInfrastructureStation ?? []).map((station, stationIndex) => {
+    const stationCode =
+      station.idG ??
+      station.externalIdentifier?.[0]?.identifier ??
+      stableId([cpoId, readMultilingual(station.description), stationIndex]);
+
+    const chargePoints = (station.refillPoint ?? [])
       .map((item) => item.aegiElectricChargingPoint)
-      .filter((point): point is NonNullable<typeof point> => Boolean(point));
+      .filter((point): point is NonNullable<typeof point> => Boolean(point))
+      .map((point) => parseChargePoint(point, stationCode));
 
-    const tariffs = points.flatMap((point) =>
-      (point.electricEnergy ?? []).flatMap((energy) =>
-        (energy.energyRate ?? []).map((rate) => parseTariff(rate)),
-      ),
-    );
-
+    const tariffs = chargePoints.flatMap((point) => point.tariffs);
     const paymentMethods = Array.from(
       new Set([
         ...(station.authenticationAndIdentificationMethods ?? []).map((method) => method.value),
@@ -179,38 +316,25 @@ function parseStation(
     );
 
     const connectorTypes = Array.from(
-      new Set(
-        points.flatMap((point) =>
-          (point.connector ?? [])
-            .map((connector) => connector.connectorType?.value)
-            .filter((value): value is string => Boolean(value)),
-        ),
-      ),
+      new Set(chargePoints.flatMap((point) => point.connectors.map((connector) => connector.connectorType))),
     );
 
     const currentTypes = Array.from(
-      new Set(
-        points
-          .map((point) => point.currentType?.value?.toUpperCase())
-          .filter((value): value is "AC" | "DC" => value === "AC" || value === "DC"),
-      ),
+      new Set(chargePoints.map((point) => point.currentType)),
     );
 
     const maxPowerKw = Math.max(
       station.totalMaximumPower ? station.totalMaximumPower / 1000 : 0,
-      ...points.flatMap((point) => (point.availableChargingPower ?? []).map((value) => value / 1000)),
+      ...chargePoints.map((point) => point.maxPowerKw),
       0,
     );
 
-    const chargePointCount = Math.max(1, station.numberOfRefillPoints ?? points.length);
+    const chargePointCount = Math.max(1, station.numberOfRefillPoints ?? chargePoints.length);
 
     return {
-      stationId: station.idG ?? crypto.randomUUID(),
-      cpoId:
-        site.operator?.afacAnOrganisation?.externalIdentifier?.[0]?.identifier ??
-        site.operator?.afacAnOrganisation?.name?.toString() ??
-        "unknown",
-      cpoName: readMultilingual(site.operator?.afacAnOrganisation?.name) ?? "Unknown CPO",
+      stationCode,
+      cpoId,
+      cpoName,
       name: readMultilingual(station.description) ?? "Ladestation",
       addressLine: readAddressLine(address),
       city: readMultilingual(address.city) ?? "Unbekannt",
@@ -225,13 +349,42 @@ function parseStation(
       connectorTypes,
       paymentMethods,
       maxPowerKw,
-      availabilitySummary: emptyAvailability(chargePointCount),
-      lastPriceUpdateAt: new Date().toISOString(),
-      lastStatusUpdateAt: new Date().toISOString(),
-      tariffs,
+      chargePoints,
       notes: [],
-    } satisfies StationRecord;
+    } satisfies ParsedStationCatalog;
   });
+}
+
+function toStationRecord(station: ParsedStationCatalog): StationRecord {
+  const tariffs: TariffSummary[] = Array.from(
+    new Map(
+      station.chargePoints
+        .flatMap((point) => point.tariffs)
+        .map((tariff) => [tariff.id, tariff] as const),
+    ).values(),
+  );
+
+  return {
+    stationId: station.stationCode,
+    cpoId: station.cpoId,
+    cpoName: station.cpoName,
+    name: station.name,
+    addressLine: station.addressLine,
+    city: station.city,
+    postalCode: station.postalCode,
+    countryCode: station.countryCode,
+    coordinates: station.coordinates,
+    chargePointCount: station.chargePointCount,
+    currentTypes: station.currentTypes,
+    connectorTypes: station.connectorTypes,
+    paymentMethods: station.paymentMethods,
+    maxPowerKw: station.maxPowerKw,
+    availabilitySummary: emptyAvailability(station.chargePointCount),
+    lastPriceUpdateAt: new Date().toISOString(),
+    lastStatusUpdateAt: new Date().toISOString(),
+    tariffs,
+    notes: station.notes,
+  };
 }
 
 export function parseStaticMobilithekPayload(payload: string | Record<string, unknown>): ParsedStaticFeed {
@@ -239,17 +392,20 @@ export function parseStaticMobilithekPayload(payload: string | Record<string, un
   const publication = (parsed.payload as {
     aegiEnergyInfrastructureTablePublication?: {
       energyInfrastructureTable?: Array<{
-        energyInfrastructureSite?: Array<Parameters<typeof parseStation>[0]>;
+        energyInfrastructureSite?: Array<Parameters<typeof parseStationCatalog>[0]>;
       }>;
     };
   })?.aegiEnergyInfrastructureTablePublication;
 
-  const stations =
+  const catalog =
     publication?.energyInfrastructureTable?.flatMap((table) =>
-      (table.energyInfrastructureSite ?? []).flatMap((site) => parseStation(site)),
+      (table.energyInfrastructureSite ?? []).flatMap((site) => parseStationCatalog(site)),
     ) ?? [];
 
-  return { stations };
+  return {
+    catalog,
+    stations: catalog.map((station) => toStationRecord(station)),
+  };
 }
 
 export function parseDynamicMobilithekPayload(payload: string | Record<string, unknown>): ParsedDynamicFeed {
@@ -303,10 +459,11 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
             return [
               {
                 chargePointId: point.reference.idG,
-                status: point.status?.value?.toUpperCase() ?? "UNKNOWN",
+                statusRaw: point.status?.value?.toUpperCase() ?? "UNKNOWN",
+                statusCanonical: normalizeStatus(point.status?.value),
                 tariffs,
                 lastUpdatedAt: point.lastUpdated ?? null,
-              },
+              } satisfies ParsedDynamicUpdate,
             ];
           }),
         ),

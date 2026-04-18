@@ -5,7 +5,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
-  const detail = loadStationDetail(id);
+  const detail = await loadStationDetail(id);
 
   if (!detail) {
     return Response.json({ error: "Station not found" }, { status: 404 });

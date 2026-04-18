@@ -38,7 +38,7 @@ export function CandidateList({
   loading,
 }: Props) {
   return (
-    <aside className="glass-panel-strong order-2 flex min-h-[32rem] flex-col rounded-[30px] lg:order-3">
+    <aside className="flex h-full flex-col">
       <div className="border-b border-[var(--line)] px-5 py-4">
         <p className="metric-label mb-2">Ergebnisse entlang der Route</p>
         <div className="flex items-center justify-between gap-3">

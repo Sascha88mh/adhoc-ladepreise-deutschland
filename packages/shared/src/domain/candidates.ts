@@ -10,6 +10,20 @@ import { routeCandidateSchema, stationDetailSchema } from "./types";
 import { DEMO_STATIONS } from "../fixtures/demo-stations";
 import { distanceFromRouteKm } from "../geo/route-corridor";
 
+function normalizePaymentMethod(method: string) {
+  const normalized = method.toLowerCase();
+
+  if (normalized === "eccard" || normalized === "creditcard") {
+    return "emv";
+  }
+
+  if (normalized === "webqr") {
+    return "website";
+  }
+
+  return normalized;
+}
+
 function bestTariff(station: StationRecord) {
   return [...station.tariffs].sort((left, right) => {
     const leftPrice = left.pricePerKwh ?? Number.POSITIVE_INFINITY;
@@ -51,7 +65,7 @@ function includeTariff(tariff: TariffSummary, filters: CandidateFilters) {
 
   if (filters.paymentMethods?.length) {
     const supported = new Set(tariff.paymentMethods.map((method) => method.toLowerCase()));
-    if (!filters.paymentMethods.every((method) => supported.has(method.toLowerCase()))) {
+    if (!filters.paymentMethods.every((method) => supported.has(normalizePaymentMethod(method)))) {
       return false;
     }
   }

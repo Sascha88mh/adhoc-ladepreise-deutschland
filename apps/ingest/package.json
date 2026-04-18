@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bootstrap:tesla": "tsx src/bootstrap-tesla.ts",
     "demo": "tsx src/index.ts demo",
     "sync": "tsx src/index.ts sync"
   },

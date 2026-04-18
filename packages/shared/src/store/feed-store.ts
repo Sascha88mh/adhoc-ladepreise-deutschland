@@ -47,7 +47,21 @@ function readStore(): StoreShape {
   ensureStore();
   const parsed = JSON.parse(readFileSync(storePath(), "utf8")) as StoreShape;
   return {
-    feeds: parsed.feeds.map((item) => feedConfigSchema.parse(item)),
+    feeds: parsed.feeds.map((item) =>
+      feedConfigSchema.parse({
+        ...item,
+        source: item.source ?? "mobilithek",
+        cpoId: item.cpoId ?? null,
+        ingestCatalog: item.ingestCatalog ?? item.type === "static",
+        ingestPrices: item.ingestPrices ?? true,
+        ingestStatus: item.ingestStatus ?? item.type === "dynamic",
+        credentialRef: item.credentialRef ?? null,
+        webhookSecretRef: item.webhookSecretRef ?? null,
+        cursorState: item.cursorState ?? null,
+        lastErrorMessage: item.lastErrorMessage ?? null,
+        consecutiveFailures: item.consecutiveFailures ?? 0,
+      }),
+    ),
     syncRuns: parsed.syncRuns.map((item) => syncRunSchema.parse(item)),
     webhookDeliveries: parsed.webhookDeliveries.map((item) => webhookDeliverySchema.parse(item)),
   };
@@ -65,7 +79,19 @@ export function listSyncRuns() {
   return readStore().syncRuns.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 }
 
-export function createFeedConfig(input: Omit<FeedConfig, "id" | "lastSuccessAt" | "lastSnapshotAt" | "lastDeltaCount" | "errorRate">) {
+export function createFeedConfig(
+  input: Omit<
+    FeedConfig,
+    | "id"
+    | "lastSuccessAt"
+    | "lastSnapshotAt"
+    | "lastDeltaCount"
+    | "errorRate"
+    | "cursorState"
+    | "lastErrorMessage"
+    | "consecutiveFailures"
+  >,
+) {
   const store = readStore();
   const next = feedConfigSchema.parse({
     ...input,
@@ -74,6 +100,9 @@ export function createFeedConfig(input: Omit<FeedConfig, "id" | "lastSuccessAt" 
     lastSnapshotAt: null,
     lastDeltaCount: 0,
     errorRate: 0,
+    cursorState: null,
+    lastErrorMessage: null,
+    consecutiveFailures: 0,
   });
   store.feeds.unshift(next);
   writeStore(store);
@@ -88,9 +117,13 @@ export function updateFeedConfig(id: string, patch: Partial<FeedConfig>) {
     return null;
   }
 
+  const normalizedPatch = Object.fromEntries(
+    Object.entries(patch).filter(([, value]) => value !== undefined),
+  );
+
   const updated = feedConfigSchema.parse({
     ...store.feeds[index],
-    ...patch,
+    ...normalizedPatch,
     id,
   });
   store.feeds[index] = updated;

@@ -1,15 +1,18 @@
-import { getCpoList, planRoute, findCandidatesForRoute } from "@adhoc/shared";
+import { getCpoList, findCandidatesForRoute } from "@adhoc/shared";
 import { RoutePlannerShell } from "@/components/layout/route-planner-shell";
 import { storeRoutePlan } from "@/lib/server/route-cache";
+import { createLocationFocusRoute } from "@/lib/server/public-api";
+
+export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const route = await planRoute("Berlin", "Hamburg", "auto");
+  const route = await createLocationFocusRoute("Berlin");
   storeRoutePlan(route);
   const results = findCandidatesForRoute(route, {});
   const cpos = getCpoList();
 
   return (
-    <main className="min-h-screen px-4 py-4 sm:px-6 lg:px-8">
+    <main className="h-[100dvh] w-[100vw] overflow-hidden">
       <RoutePlannerShell
         initialRoute={route}
         initialResults={{
@@ -20,7 +23,7 @@ export default async function Home() {
           priceBand: results.priceBand,
         }}
         initialCpos={cpos}
-        defaultQuery={{ origin: "Berlin", destination: "Hamburg", profile: "auto" }}
+        defaultQuery={{ origin: "", destination: "" }}
       />
     </main>
   );

@@ -2,7 +2,7 @@ import {
   parseDynamicMobilithekPayload,
   parseStaticMobilithekPayload,
 } from "@adhoc/shared";
-import { appendSyncRun, listFeedConfigs, updateFeedConfig } from "@adhoc/shared/store";
+import { runDueFeedCycle } from "@adhoc/shared/ingest";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -32,9 +32,9 @@ async function runDemo() {
   console.log(
     JSON.stringify(
       {
-        stationsParsed: staticResult.stations.length,
+        stationsParsed: staticResult.catalog.length,
         updatesParsed: dynamicResult.updates.length,
-        firstStation: staticResult.stations[0]?.name,
+        firstStation: staticResult.catalog[0]?.name,
         firstUpdate: dynamicResult.updates[0],
       },
       null,
@@ -44,37 +44,8 @@ async function runDemo() {
 }
 
 async function runSync() {
-  const feeds = listFeedConfigs().filter((feed) => feed.isActive);
-
-  for (const feed of feeds) {
-    const startedAt = new Date().toISOString();
-    appendSyncRun({
-      feedId: feed.id,
-      kind: "manual",
-      status: "running",
-      startedAt,
-      finishedAt: null,
-      message: "Sync gestartet",
-      deltaCount: 0,
-    });
-
-    updateFeedConfig(feed.id, {
-      lastSuccessAt: new Date().toISOString(),
-      lastDeltaCount: feed.type === "dynamic" ? 4 : 1,
-    });
-
-    appendSyncRun({
-      feedId: feed.id,
-      kind: "manual",
-      status: "success",
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      message: `Sync für ${feed.name} simuliert`,
-      deltaCount: feed.type === "dynamic" ? 4 : 1,
-    });
-  }
-
-  console.log(`Synced ${feeds.length} feed(s).`);
+  const processed = await runDueFeedCycle();
+  console.log(`Processed ${processed} due feed(s).`);
 }
 
 const command = process.argv[2] ?? "demo";

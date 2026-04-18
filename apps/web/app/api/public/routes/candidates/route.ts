@@ -15,6 +15,6 @@ export async function POST(request: Request) {
   storeRoutePlan(route);
 
   return Response.json({
-    data: buildCandidateResponse(route, body.filters ?? {}),
+    data: await buildCandidateResponse(route, body.filters ?? {}),
   });
 }

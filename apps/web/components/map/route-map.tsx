@@ -1,12 +1,48 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import maplibregl, { type GeoJSONSource, type Map } from "maplibre-gl";
+import maplibregl, {
+  type GeoJSONSource,
+  type Map,
+  type StyleSpecification,
+} from "maplibre-gl";
 import type { RouteCandidate, RoutePlan } from "@adhoc/shared";
 
-const MAP_STYLE =
-  process.env.NEXT_PUBLIC_MAP_STYLE ??
-  "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+const MAP_STYLES = {
+  light:
+    process.env.NEXT_PUBLIC_MAP_STYLE_LIGHT ??
+    process.env.NEXT_PUBLIC_MAP_STYLE ??
+    "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+  dark:
+    process.env.NEXT_PUBLIC_MAP_STYLE_DARK ??
+    "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+  color:
+    process.env.NEXT_PUBLIC_MAP_STYLE_COLOR ??
+    "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+} as const;
+
+const SATELLITE_STYLE: StyleSpecification = {
+  version: 8,
+  sources: {
+    satellite: {
+      type: "raster",
+      tiles: [
+        "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      ],
+      tileSize: 256,
+      attribution: "Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    },
+  },
+  layers: [
+    {
+      id: "satellite",
+      type: "raster",
+      source: "satellite",
+    },
+  ],
+};
+
+export type MapMode = "light" | "dark" | "color" | "satellite";
 
 type Props = {
   route: RoutePlan;
@@ -14,7 +50,47 @@ type Props = {
   selectedStationId: string | null;
   hoveredStationId: string | null;
   onSelect: (stationId: string) => void;
+  mapMode: MapMode;
 };
+
+function isLocationFocusRoute(route: RoutePlan) {
+  return route.destination.label === "Umgebung";
+}
+
+function mapStyleForMode(mode: MapMode) {
+  if (mode === "satellite") {
+    return SATELLITE_STYLE;
+  }
+
+  return MAP_STYLES[mode];
+}
+
+function emptyCollection() {
+  return {
+    type: "FeatureCollection" as const,
+    features: [],
+  };
+}
+
+function focusCollection(route: RoutePlan) {
+  return {
+    type: "FeatureCollection" as const,
+    features: isLocationFocusRoute(route)
+      ? [
+          {
+            type: "Feature" as const,
+            geometry: {
+              type: "Point" as const,
+              coordinates: [route.origin.coordinates.lng, route.origin.coordinates.lat],
+            },
+            properties: {
+              id: route.routeId,
+            },
+          },
+        ]
+      : [],
+  };
+}
 
 function candidateCollection(candidates: RouteCandidate[]) {
   return {
@@ -53,6 +129,36 @@ function routeCollection(route: RoutePlan) {
   };
 }
 
+function selectedCollection(
+  candidates: RouteCandidate[],
+  selectedStationId: string | null,
+  hoveredStationId: string | null,
+) {
+  const highlighted = candidates.find(
+    (candidate) =>
+      candidate.stationId === selectedStationId ||
+      candidate.stationId === hoveredStationId,
+  );
+
+  return {
+    type: "FeatureCollection" as const,
+    features: highlighted
+      ? [
+          {
+            type: "Feature" as const,
+            geometry: {
+              type: "Point" as const,
+              coordinates: [highlighted.lng, highlighted.lat],
+            },
+            properties: {
+              id: highlighted.stationId,
+            },
+          },
+        ]
+      : [],
+  };
+}
+
 function updateSource(
   map: Map,
   sourceId: string,
@@ -62,20 +168,292 @@ function updateSource(
   source?.setData(data);
 }
 
+function routeFitPadding() {
+  if (typeof window === "undefined") {
+    return 140;
+  }
+
+  if (window.innerWidth < 640) {
+    return {
+      top: 148,
+      right: 28,
+      bottom: 214,
+      left: 28,
+    };
+  }
+
+  return {
+    top: 132,
+    right: 180,
+    bottom: 132,
+    left: 240,
+  };
+}
+
+function routePalette(mode: MapMode) {
+  if (mode === "dark") {
+    return {
+      line: "#6ee7d8",
+      glow: "rgba(110,231,216,0.28)",
+      selectedFill: "#091915",
+      selectedStroke: "#6ee7d8",
+      candidateStroke: "#081410",
+      focusHalo: "rgba(110,231,216,0.18)",
+      focusCore: "#6ee7d8",
+    };
+  }
+
+  if (mode === "satellite") {
+    return {
+      line: "#f7ff78",
+      glow: "rgba(247,255,120,0.36)",
+      selectedFill: "#ffffff",
+      selectedStroke: "#f7ff78",
+      candidateStroke: "#0f172a",
+      focusHalo: "rgba(247,255,120,0.22)",
+      focusCore: "#f7ff78",
+    };
+  }
+
+  if (mode === "color") {
+    return {
+      line: "#156f63",
+      glow: "rgba(21,111,99,0.24)",
+      selectedFill: "#ffffff",
+      selectedStroke: "#156f63",
+      candidateStroke: "#ffffff",
+      focusHalo: "rgba(21,111,99,0.18)",
+      focusCore: "#156f63",
+    };
+  }
+
+  return {
+    line: "#156f63",
+    glow: "rgba(21,111,99,0.2)",
+    selectedFill: "#ffffff",
+    selectedStroke: "#156f63",
+    candidateStroke: "#ffffff",
+    focusHalo: "rgba(21,111,99,0.18)",
+    focusCore: "#156f63",
+  };
+}
+
+function ensureOperationalLayers(map: Map, mapMode: MapMode) {
+  const palette = routePalette(mapMode);
+
+  if (!map.getSource("route")) {
+    map.addSource("route", {
+      type: "geojson",
+      data: emptyCollection(),
+    });
+  }
+
+  if (!map.getSource("candidates")) {
+    map.addSource("candidates", {
+      type: "geojson",
+      data: emptyCollection(),
+    });
+  }
+
+  if (!map.getSource("selected")) {
+    map.addSource("selected", {
+      type: "geojson",
+      data: emptyCollection(),
+    });
+  }
+
+  if (!map.getSource("focus")) {
+    map.addSource("focus", {
+      type: "geojson",
+      data: emptyCollection(),
+    });
+  }
+
+  if (!map.getLayer("route-glow")) {
+    map.addLayer({
+      id: "route-glow",
+      type: "line",
+      source: "route",
+      paint: {
+        "line-color": palette.glow,
+        "line-width": 18,
+        "line-blur": 12,
+      },
+    });
+  }
+
+  if (!map.getLayer("route-line")) {
+    map.addLayer({
+      id: "route-line",
+      type: "line",
+      source: "route",
+      paint: {
+        "line-color": palette.line,
+        "line-width": 5,
+      },
+    });
+  }
+
+  if (!map.getLayer("candidate-circles")) {
+    map.addLayer({
+      id: "candidate-circles",
+      type: "circle",
+      source: "candidates",
+      paint: {
+        "circle-color": [
+          "case",
+          [">", ["get", "available"], 0],
+          "#156f63",
+          "#b96710",
+        ],
+        "circle-radius": [
+          "case",
+          [">=", ["get", "power"], 250],
+          11,
+          [">=", ["get", "power"], 150],
+          9,
+          7,
+        ],
+        "circle-stroke-width": 2.4,
+        "circle-stroke-color": palette.candidateStroke,
+      },
+    });
+  }
+
+  if (!map.getLayer("selected-circle")) {
+    map.addLayer({
+      id: "selected-circle",
+      type: "circle",
+      source: "selected",
+      paint: {
+        "circle-color": palette.selectedFill,
+        "circle-radius": 16,
+        "circle-stroke-width": 4,
+        "circle-stroke-color": palette.selectedStroke,
+        "circle-opacity": 0.78,
+      },
+    });
+  }
+
+  if (!map.getLayer("focus-halo")) {
+    map.addLayer({
+      id: "focus-halo",
+      type: "circle",
+      source: "focus",
+      paint: {
+        "circle-color": palette.focusHalo,
+        "circle-radius": 18,
+        "circle-opacity": 0.75,
+        "circle-stroke-width": 1.5,
+        "circle-stroke-color": palette.focusCore,
+      },
+    });
+  }
+
+  if (!map.getLayer("focus-core")) {
+    map.addLayer({
+      id: "focus-core",
+      type: "circle",
+      source: "focus",
+      paint: {
+        "circle-color": palette.focusCore,
+        "circle-radius": 8,
+        "circle-stroke-width": 3,
+        "circle-stroke-color": "#ffffff",
+      },
+    });
+  }
+
+  map.setPaintProperty("route-glow", "line-color", palette.glow);
+  map.setPaintProperty("route-line", "line-color", palette.line);
+  map.setPaintProperty("candidate-circles", "circle-stroke-color", palette.candidateStroke);
+  map.setPaintProperty("selected-circle", "circle-color", palette.selectedFill);
+  map.setPaintProperty("selected-circle", "circle-stroke-color", palette.selectedStroke);
+  map.setPaintProperty("focus-halo", "circle-color", palette.focusHalo);
+  map.setPaintProperty("focus-halo", "circle-stroke-color", palette.focusCore);
+  map.setPaintProperty("focus-core", "circle-color", palette.focusCore);
+}
+
+function syncMapData(
+  map: Map,
+  route: RoutePlan,
+  candidates: RouteCandidate[],
+  selectedStationId: string | null,
+  hoveredStationId: string | null,
+) {
+  updateSource(
+    map,
+    "route",
+    isLocationFocusRoute(route) ? emptyCollection() : routeCollection(route),
+  );
+  updateSource(map, "candidates", candidateCollection(candidates));
+  updateSource(
+    map,
+    "selected",
+    selectedCollection(candidates, selectedStationId, hoveredStationId),
+  );
+  updateSource(map, "focus", focusCollection(route));
+}
+
+function fitMapToContent(map: Map, route: RoutePlan, candidates: RouteCandidate[]) {
+  if (isLocationFocusRoute(route)) {
+    if (candidates.length > 0) {
+      const bounds = new maplibregl.LngLatBounds();
+      bounds.extend([route.origin.coordinates.lng, route.origin.coordinates.lat]);
+      candidates.forEach((candidate) => bounds.extend([candidate.lng, candidate.lat]));
+      map.fitBounds(bounds, {
+        padding: routeFitPadding(),
+        duration: 700,
+        maxZoom: 13.2,
+      });
+      return;
+    }
+
+    map.easeTo({
+      center: [route.origin.coordinates.lng, route.origin.coordinates.lat],
+      zoom: 14,
+      duration: 700,
+    });
+    return;
+  }
+
+  const bounds = new maplibregl.LngLatBounds();
+  route.geometry.forEach((point) => bounds.extend([point.lng, point.lat]));
+  map.fitBounds(bounds, {
+    padding: routeFitPadding(),
+    duration: 700,
+    maxZoom: 9.6,
+  });
+}
+
 export function RouteMap({
   route,
   candidates,
   selectedStationId,
   hoveredStationId,
   onSelect,
+  mapMode,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
   const onSelectRef = useRef(onSelect);
+  const routeRef = useRef(route);
+  const candidatesRef = useRef(candidates);
+  const selectedStationIdRef = useRef(selectedStationId);
+  const hoveredStationIdRef = useRef(hoveredStationId);
+  const mapModeRef = useRef(mapMode);
 
   useEffect(() => {
     onSelectRef.current = onSelect;
   }, [onSelect]);
+
+  useEffect(() => {
+    routeRef.current = route;
+    candidatesRef.current = candidates;
+    selectedStationIdRef.current = selectedStationId;
+    hoveredStationIdRef.current = hoveredStationId;
+    mapModeRef.current = mapMode;
+  }, [route, candidates, selectedStationId, hoveredStationId, mapMode]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -84,189 +462,113 @@ export function RouteMap({
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: MAP_STYLE,
-      center: [route.origin.coordinates.lng, route.origin.coordinates.lat],
-      zoom: 6,
+      style: mapStyleForMode(mapModeRef.current),
+      center: [
+        routeRef.current.origin.coordinates.lng,
+        routeRef.current.origin.coordinates.lat,
+      ],
+      zoom: isLocationFocusRoute(routeRef.current) ? 14 : 6,
       pitch: 20,
       maxZoom: 16,
       attributionControl: false,
     });
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
+    mapRef.current = map;
 
-    map.on("load", () => {
-      map.addSource("route", {
-        type: "geojson",
-        data: routeCollection(route),
-      });
-      map.addSource("candidates", {
-        type: "geojson",
-        data: candidateCollection(candidates),
-      });
-      map.addSource("selected", {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [],
-        },
-      });
+    const renderCurrentState = () => {
+      const currentRoute = routeRef.current;
+      const currentCandidates = candidatesRef.current;
 
-      map.addLayer({
-        id: "route-glow",
-        type: "line",
-        source: "route",
-        paint: {
-          "line-color": "rgba(21,111,99,0.2)",
-          "line-width": 18,
-          "line-blur": 12,
-        },
-      });
-
-      map.addLayer({
-        id: "route-line",
-        type: "line",
-        source: "route",
-        paint: {
-          "line-color": "#156f63",
-          "line-width": 5,
-        },
-      });
-
-      map.addLayer({
-        id: "candidate-circles",
-        type: "circle",
-        source: "candidates",
-        paint: {
-          "circle-color": [
-            "case",
-            [">", ["get", "available"], 0],
-            "#156f63",
-            "#b96710",
-          ],
-          "circle-radius": [
-            "case",
-            [">=", ["get", "power"], 250],
-            11,
-            [">=", ["get", "power"], 150],
-            9,
-            7,
-          ],
-          "circle-stroke-width": 2.4,
-          "circle-stroke-color": "#ffffff",
-        },
-      });
-
-      map.addLayer({
-        id: "selected-circle",
-        type: "circle",
-        source: "selected",
-        paint: {
-          "circle-color": "#ffffff",
-          "circle-radius": 16,
-          "circle-stroke-width": 4,
-          "circle-stroke-color": "#156f63",
-          "circle-opacity": 0.7,
-        },
-      });
-
-      map.on("click", "candidate-circles", (event) => {
-        const feature = event.features?.[0];
-        const id = feature?.properties?.id;
-
-        if (typeof id === "string") {
-          onSelectRef.current(id);
-        }
-      });
-
-      map.on("mouseenter", "candidate-circles", () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-
-      map.on("mouseleave", "candidate-circles", () => {
-        map.getCanvas().style.cursor = "";
-      });
-
-      const highlighted = candidates.find(
-        (candidate) =>
-          candidate.stationId === selectedStationId ||
-          candidate.stationId === hoveredStationId,
+      ensureOperationalLayers(map, mapModeRef.current);
+      syncMapData(
+        map,
+        currentRoute,
+        currentCandidates,
+        selectedStationIdRef.current,
+        hoveredStationIdRef.current,
       );
 
-      updateSource(map, "selected", {
-        type: "FeatureCollection",
-        features: highlighted
-          ? [
-              {
-                type: "Feature",
-                geometry: {
-                  type: "Point",
-                  coordinates: [highlighted.lng, highlighted.lat],
-                },
-                properties: {
-                  id: highlighted.stationId,
-                },
-              },
-            ]
-          : [],
-      });
+      fitMapToContent(map, currentRoute, currentCandidates);
+    };
 
-      const bounds = new maplibregl.LngLatBounds();
-      route.geometry.forEach((point) => bounds.extend([point.lng, point.lat]));
-      map.fitBounds(bounds, { padding: 90, duration: 700 });
+    map.on("load", renderCurrentState);
+    map.on("click", "candidate-circles", (event) => {
+      const feature = event.features?.[0];
+      const id = feature?.properties?.id;
+
+      if (typeof id === "string") {
+        onSelectRef.current(id);
+      }
     });
-
-    mapRef.current = map;
+    map.on("mouseenter", "candidate-circles", () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", "candidate-circles", () => {
+      map.getCanvas().style.cursor = "";
+    });
 
     return () => {
       map.remove();
       mapRef.current = null;
     };
-  }, [route, candidates, hoveredStationId, selectedStationId]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map?.isStyleLoaded()) {
-      return;
-    }
-
-    updateSource(map, "route", routeCollection(route));
-    updateSource(map, "candidates", candidateCollection(candidates));
-
-    const highlighted = candidates.find(
-      (candidate) => candidate.stationId === selectedStationId || candidate.stationId === hoveredStationId,
-    );
-
-    updateSource(map, "selected", {
-      type: "FeatureCollection",
-      features: highlighted
-        ? [
-            {
-              type: "Feature",
-              geometry: {
-                type: "Point",
-                coordinates: [highlighted.lng, highlighted.lat],
-              },
-              properties: {
-                id: highlighted.stationId,
-              },
-            },
-          ]
-        : [],
-    });
-
-  }, [route, candidates, selectedStationId, hoveredStationId]);
+  }, []);
 
   useEffect(() => {
     const map = mapRef.current;
 
-    if (!map?.isStyleLoaded()) {
+    if (!map) {
       return;
     }
 
-    const bounds = new maplibregl.LngLatBounds();
-    route.geometry.forEach((point) => bounds.extend([point.lng, point.lat]));
-    map.fitBounds(bounds, { padding: 90, duration: 700 });
-  }, [route]);
+    const apply = () => {
+      ensureOperationalLayers(map, mapMode);
+      syncMapData(map, route, candidates, selectedStationId, hoveredStationId);
+
+      fitMapToContent(map, route, candidates);
+    };
+
+    if (!map.isStyleLoaded()) {
+      return;
+    }
+
+    apply();
+  }, [route, candidates, selectedStationId, hoveredStationId, mapMode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+
+    if (!map) {
+      return;
+    }
+
+    mapModeRef.current = mapMode;
+    map.setStyle(mapStyleForMode(mapMode));
+
+    const handleStyleData = () => {
+      if (!map.isStyleLoaded()) {
+        return;
+      }
+
+      ensureOperationalLayers(map, mapModeRef.current);
+      syncMapData(
+        map,
+        routeRef.current,
+        candidatesRef.current,
+        selectedStationIdRef.current,
+        hoveredStationIdRef.current,
+      );
+
+      fitMapToContent(map, routeRef.current, candidatesRef.current);
+      map.off("styledata", handleStyleData);
+    };
+
+    map.on("styledata", handleStyleData);
+
+    return () => {
+      map.off("styledata", handleStyleData);
+    };
+  }, [mapMode]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

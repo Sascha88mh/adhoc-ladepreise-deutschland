@@ -4,6 +4,7 @@ export * from "./domain/candidates";
 export * from "./fixtures/demo-feeds";
 export * from "./fixtures/demo-stations";
 export * from "./fixtures/locations";
+export * from "./geo/geocoder";
 export * from "./geo/haversine";
 export * from "./geo/route-corridor";
 export * from "./mobilithek/parser";

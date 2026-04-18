@@ -17,9 +17,12 @@ describe("Mobilithek parser", () => {
     const result = parseStaticMobilithekPayload(STATIC_FIXTURE);
 
     expect(result.stations.length).toBeGreaterThan(0);
+    expect(result.catalog.length).toBe(result.stations.length);
     expect(result.stations[0].name.length).toBeGreaterThan(0);
     expect(result.stations[0].maxPowerKw).toBeGreaterThan(0);
     expect(result.stations[0].tariffs.length).toBeGreaterThan(0);
+    expect(result.catalog[0]?.stationCode.length).toBeGreaterThan(0);
+    expect(result.catalog[0]?.chargePoints[0]?.chargePointCode.length).toBeGreaterThan(0);
   });
 
   it("extracts complex tariff components like blocking fee caps from the static example", () => {
@@ -39,5 +42,19 @@ describe("Mobilithek parser", () => {
     expect(result.updates.length).toBeGreaterThan(0);
     expect(result.updates[0].chargePointId.length).toBeGreaterThan(0);
     expect(result.updates[0].tariffs[0].pricePerKwh).toBe(0.37);
+    expect(result.updates[0].statusCanonical).toBe("CHARGING");
+  });
+
+  it("keeps externally provided ids stable across repeated parses", () => {
+    const first = parseStaticMobilithekPayload(STATIC_FIXTURE);
+    const second = parseStaticMobilithekPayload(STATIC_FIXTURE);
+
+    expect(first.catalog[0]?.stationCode).toBe(second.catalog[0]?.stationCode);
+    expect(first.catalog[0]?.chargePoints[0]?.chargePointCode).toBe(
+      second.catalog[0]?.chargePoints[0]?.chargePointCode,
+    );
+    expect(first.catalog[0]?.chargePoints[0]?.tariffs[0]?.id).toBe(
+      second.catalog[0]?.chargePoints[0]?.tariffs[0]?.id,
+    );
   });
 });

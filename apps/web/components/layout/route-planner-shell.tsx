@@ -1,20 +1,27 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { motion } from "framer-motion";
-import { ChartColumnIncreasing, LoaderCircle, Router } from "lucide-react";
-import { useDeferredValue, useEffect, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { LoaderCircle, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type {
   CandidateFilters,
   RouteCandidate,
   RoutePlan,
   StationDetail,
 } from "@adhoc/shared";
-import { fetchRouteCandidates, fetchRoutePlan, fetchStationDetail } from "@/lib/client/api";
+import {
+  fetchLocationFocus,
+  fetchIpLocation,
+  fetchReverseLocation,
+  fetchRouteCandidates,
+  fetchRoutePlan,
+  fetchStationDetail,
+} from "@/lib/client/api";
 import { FilterRail } from "@/components/filters/filter-rail";
 import { CandidateList } from "@/components/results/candidate-list";
 import { StationDrawer } from "@/components/results/station-drawer";
-import { RouteSearchBar } from "@/components/search/route-search-bar";
+import { RouteSearchBar, type SearchQueryState } from "@/components/search/route-search-bar";
 
 const RouteMap = dynamic(
   () => import("@/components/map/route-map").then((module) => module.RouteMap),
@@ -27,6 +34,22 @@ const RouteMap = dynamic(
     ),
   },
 );
+
+type MapMode = "light" | "dark" | "color" | "satellite";
+
+const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
+  { id: "light", label: "Klar" },
+  { id: "dark", label: "Dunkel" },
+  { id: "color", label: "Farbe" },
+  { id: "satellite", label: "Satellit" },
+];
+
+function mapTheme(): CSSProperties {
+  return {
+    "--accent-fg": "#ffffff",
+    "--glass-border": "var(--line)",
+  } as CSSProperties;
+}
 
 type Props = {
   initialRoute: RoutePlan;
@@ -41,9 +64,24 @@ type Props = {
   defaultQuery: {
     origin: string;
     destination: string;
-    profile: "auto" | "truck";
   };
 };
+
+function useDebouncedValue<T>(value: T, delayMs: number) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedValue(value);
+    }, delayMs);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [value, delayMs]);
+
+  return debouncedValue;
+}
 
 export function RoutePlannerShell({
   initialRoute,
@@ -51,20 +89,38 @@ export function RoutePlannerShell({
   initialCpos,
   defaultQuery,
 }: Props) {
-  const [query, setQuery] = useState(defaultQuery);
+  const [query, setQuery] = useState<SearchQueryState>({
+    mode: "location",
+    origin: defaultQuery.origin,
+    originLabel: defaultQuery.origin,
+    destination: defaultQuery.destination,
+    destinationLabel: defaultQuery.destination,
+    location: "",
+    locationLabel: "",
+  });
   const [route, setRoute] = useState(initialRoute);
-  const [filters, setFilters] = useState<CandidateFilters>({ maxPriceKwh: 0.6 });
-  const deferredFilters = useDeferredValue(filters);
+  const [mapMode, setMapMode] = useState<MapMode>("light");
+  const [filters, setFilters] = useState<CandidateFilters>({
+    corridorKm: initialRoute.corridorKm,
+    maxPriceKwh: 0.6,
+  });
+  const debouncedFilters = useDebouncedValue(filters, 800);
   const [results, setResults] = useState(initialResults);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(
     initialResults.candidates[0]?.stationId ?? null,
   );
   const [hoveredStationId, setHoveredStationId] = useState<string | null>(null);
   const [detail, setDetail] = useState<StationDetail | null>(null);
+  
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [candidatesOpen, setCandidatesOpen] = useState(false);
+  const [pendingCandidateAutoOpen, setPendingCandidateAutoOpen] = useState(false);
+  
   const [routeLoading, setRouteLoading] = useState(false);
   const [resultsLoading, setResultsLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const autoLocatedRef = useRef(false);
   const [detailOpen, setDetailOpen] = useState(
     Boolean(initialResults.candidates[0]?.stationId),
   );
@@ -87,7 +143,7 @@ export function RoutePlannerShell({
         const next = await fetchRouteCandidates({
           routeId: route.routeId,
           polyline: route.geometry,
-          filters: deferredFilters,
+          filters: debouncedFilters,
         });
 
         if (ignore) {
@@ -95,9 +151,16 @@ export function RoutePlannerShell({
         }
 
         setResults(next);
+        if (next.candidates.length === 0) {
+          setCandidatesOpen(false);
+        } else if (pendingCandidateAutoOpen) {
+          setCandidatesOpen(true);
+        }
+        setPendingCandidateAutoOpen(false);
       } catch (caught) {
         if (!ignore) {
           setError(caught instanceof Error ? caught.message : "Kandidaten konnten nicht geladen werden.");
+          setPendingCandidateAutoOpen(false);
         }
       } finally {
         if (!ignore) {
@@ -111,7 +174,7 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [route, deferredFilters]);
+  }, [route, debouncedFilters, pendingCandidateAutoOpen]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -141,15 +204,137 @@ export function RoutePlannerShell({
     };
   }, [activeStationId]);
 
+  useEffect(() => {
+    if (autoLocatedRef.current) {
+      return;
+    }
+
+    autoLocatedRef.current = true;
+    let ignore = false;
+
+    function requestCurrentPosition(enableHighAccuracy: boolean) {
+      return new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy,
+          timeout: enableHighAccuracy ? 8000 : 6000,
+          maximumAge: enableHighAccuracy ? 60_000 : 300_000,
+        });
+      });
+    }
+
+    async function focusCurrentLocation() {
+      setRouteLoading(true);
+      setError(null);
+      setCandidatesOpen(false);
+      setPendingCandidateAutoOpen(true);
+
+      try {
+        let lat: number | null = null;
+        let lng: number | null = null;
+        let label = "";
+
+        if ("geolocation" in navigator && window.isSecureContext) {
+          try {
+            let position: GeolocationPosition;
+
+            try {
+              position = await requestCurrentPosition(true);
+            } catch (error) {
+              const geoError = error as GeolocationPositionError;
+              if (geoError.code === geoError.TIMEOUT) {
+                position = await requestCurrentPosition(false);
+              } else {
+                throw geoError;
+              }
+            }
+
+            lat = position.coords.latitude;
+            lng = position.coords.longitude;
+
+            try {
+              const suggestion = await fetchReverseLocation(lat, lng);
+              label = suggestion.inputLabel;
+            } catch {
+              label = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+            }
+          } catch {
+            // Fall through to IP fallback below.
+          }
+        }
+
+        if (lat == null || lng == null) {
+          const suggestion = await fetchIpLocation();
+          lat = suggestion.coordinates.lat;
+          lng = suggestion.coordinates.lng;
+          label = suggestion.inputLabel;
+        }
+
+        if (ignore) {
+          return;
+        }
+
+        setQuery((current) => ({
+          ...current,
+          mode: "location",
+          location: `${lat!.toFixed(5)}, ${lng!.toFixed(5)}`,
+          locationLabel: label,
+        }));
+
+        const nextRoute = await fetchLocationFocus(`${lat}, ${lng}`);
+
+        if (ignore) {
+          return;
+        }
+
+        setRoute(nextRoute);
+        setSelectedStationId(null);
+        setDetail(null);
+        setDetailOpen(false);
+      } catch (caught) {
+        if (!ignore) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : "Standort konnte nicht automatisch geladen werden.",
+          );
+          setPendingCandidateAutoOpen(false);
+        }
+      } finally {
+        if (!ignore) {
+          setRouteLoading(false);
+        }
+      }
+    }
+
+    void focusCurrentLocation();
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
   async function handleRoutePlan() {
     setRouteLoading(true);
     setError(null);
+    setCandidatesOpen(false);
+    setPendingCandidateAutoOpen(true);
 
     try {
-      const nextRoute = await fetchRoutePlan(query);
+      const nextRoute =
+        query.mode === "location"
+          ? await fetchLocationFocus(query.location)
+          : await fetchRoutePlan({
+              origin: query.origin,
+              destination: query.destination,
+              profile: "auto",
+            });
       setRoute(nextRoute);
+      setSelectedStationId(null);
+      setDetail(null);
+      setDetailOpen(false);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Route konnte nicht geplant werden.");
+      setPendingCandidateAutoOpen(false);
     } finally {
       setRouteLoading(false);
     }
@@ -161,99 +346,128 @@ export function RoutePlannerShell({
   }
 
   return (
-    <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-[1800px] flex-col gap-4">
-      <RouteSearchBar
-        query={query}
-        onChange={setQuery}
-        onSubmit={handleRoutePlan}
-        pending={routeLoading}
-      />
-
-      <section className="grid flex-1 gap-4 lg:grid-cols-[19rem,minmax(0,1fr),25rem]">
-        <FilterRail
-          filters={filters}
-          onChange={setFilters}
-          hitCount={results.candidates.length}
-          priceBand={results.priceBand}
-          cpos={initialCpos}
-        />
-
-        <div className="glass-panel-strong order-1 relative min-h-[34rem] overflow-hidden rounded-[34px] lg:order-2">
-          <div className="absolute inset-0">
-            <RouteMap
-              route={route}
-              candidates={results.candidates}
-              selectedStationId={activeStationId}
-              hoveredStationId={hoveredStationId}
-              onSelect={handleSelectStation}
-            />
-          </div>
-
-          <div className="pointer-events-none absolute inset-x-4 top-4 z-10 flex flex-wrap gap-3">
-            <motion.div
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="glass-panel rounded-full px-4 py-2 text-sm"
-            >
-              <p className="metric-label mb-1">Route</p>
-              <strong>
-                {route.origin.label} → {route.destination.label}
-              </strong>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.04 }}
-              className="glass-panel rounded-full px-4 py-2 text-sm"
-            >
-              <p className="metric-label mb-1">Fahrzeit</p>
-              <strong>{route.durationMinutes} Min.</strong>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, y: 24 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.08 }}
-              className="glass-panel rounded-full px-4 py-2 text-sm"
-            >
-              <p className="metric-label mb-1">Korridor</p>
-              <strong>{route.corridorKm} km</strong>
-            </motion.div>
-          </div>
-
-          <div className="absolute bottom-4 left-4 right-4 z-10 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-            <div className="glass-panel max-w-xl rounded-[28px] px-4 py-3">
-              <p className="metric-label mb-1 flex items-center gap-2">
-                <Router className="h-3.5 w-3.5" />
-                Route Summary
-              </p>
-              <p className="text-sm text-[var(--muted)]">
-                Kandidaten werden innerhalb eines 5-km-Korridors entlang der geplanten Route bewertet und standardmäßig nach Preis, Detour und Leistung sortiert.
-              </p>
-            </div>
-            <div className="glass-panel flex items-center gap-3 rounded-full px-4 py-3 text-sm">
-              <ChartColumnIncreasing className="h-4 w-4 text-[var(--accent)]" />
-              <span>{results.providerList.length} Anbieter im aktuellen Korridor</span>
-            </div>
-          </div>
-        </div>
-
-        <CandidateList
+    <div
+      className="relative h-full w-full overflow-hidden bg-[var(--background)]"
+      style={mapTheme()}
+    >
+      {/* Background Map layer */}
+      <div className="absolute inset-0 z-0">
+        <RouteMap
+          route={route}
           candidates={results.candidates}
           selectedStationId={activeStationId}
           hoveredStationId={hoveredStationId}
           onSelect={handleSelectStation}
-          onHover={setHoveredStationId}
-          loading={resultsLoading}
+          mapMode={mapMode}
         />
-      </section>
+      </div>
+
+      {/* Top Left Floating Search Bar */}
+      <div className="pointer-events-none absolute left-4 top-4 z-20 w-[min(22rem,calc(100vw-2rem))]">
+        <div className="pointer-events-auto shadow-2xl rounded-[30px] glass-panel-strong">
+          <RouteSearchBar
+            query={query}
+            onChange={setQuery}
+            onSubmit={handleRoutePlan}
+            pending={routeLoading}
+          />
+        </div>
+      </div>
+
+      {/* Bottom Filter Sheet */}
+      <div className="pointer-events-none absolute bottom-4 left-4 z-20 w-[min(25rem,calc(100vw-2rem))]">
+        <div className="pointer-events-auto overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong">
+          <FilterRail
+            filters={filters}
+            onChange={setFilters}
+            hitCount={results.candidates.length}
+            priceBand={results.priceBand}
+            cpos={initialCpos}
+            expanded={filtersOpen}
+            onToggle={() => setFiltersOpen((current) => !current)}
+          />
+        </div>
+      </div>
+
+      {/* Right Floating Candidate List */}
+      <AnimatePresence>
+        {candidatesOpen && (
+          <motion.div
+            initial={{ x: 500, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 500, opacity: 0 }}
+            className="pointer-events-auto absolute bottom-20 right-4 top-32 z-20 flex w-[min(25rem,calc(100vw-2rem))] flex-col overflow-hidden lg:bottom-24"
+          >
+            <div className="flex-1 overflow-hidden relative shadow-2xl rounded-[34px] glass-panel-strong flex flex-col">
+              <CandidateList
+                candidates={results.candidates}
+                selectedStationId={activeStationId}
+                hoveredStationId={hoveredStationId}
+                onSelect={handleSelectStation}
+                onHover={setHoveredStationId}
+                loading={resultsLoading}
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Map Style Switcher */}
+      <div className="pointer-events-none absolute right-[4.8rem] top-3 z-20">
+        <div className="pointer-events-auto flex items-center gap-2 rounded-[22px] p-2 shadow-2xl glass-panel-strong">
+          {MAP_MODE_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => setMapMode(option.id)}
+              className={`rounded-full px-3 py-2 text-xs font-medium transition ${
+                mapMode === option.id
+                  ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_10px_18px_rgba(21,111,99,0.22)]"
+                  : "border border-[var(--line)] bg-white/78 text-[var(--foreground)] hover:bg-white"
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Floating Action Button for Results */}
+      {results.candidates.length > 0 ? (
+        <div className="pointer-events-none absolute bottom-28 right-6 z-20 sm:bottom-6">
+          <button
+            onClick={() => setCandidatesOpen((current) => !current)}
+            className="glass-panel pointer-events-auto flex h-12 w-12 items-center justify-center rounded-full text-[var(--foreground)] shadow-xl transition hover:bg-white/80"
+            title="Ergebnisse umschalten"
+          >
+            {candidatesOpen ? (
+              <PanelRightClose size={20} className="text-[var(--accent)]" />
+            ) : (
+              <PanelRightOpen size={20} className="text-[var(--muted)]" />
+            )}
+          </button>
+        </div>
+      ) : null}
 
       {(routeLoading || resultsLoading || detailLoading || error) && (
-        <div className="glass-panel-strong flex items-center gap-3 rounded-[24px] px-4 py-3 text-sm text-[var(--muted)]">
+        <div className="glass-panel-strong absolute left-1/2 top-40 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full px-5 py-3 text-sm text-[var(--foreground)] shadow-2xl">
           {(routeLoading || resultsLoading || detailLoading) && (
             <LoaderCircle className="h-4 w-4 animate-spin text-[var(--accent)]" />
           )}
-          {routeLoading && <span>Plane Route neu...</span>}
-          {!routeLoading && resultsLoading && <span>Berechne Kandidaten entlang der Route...</span>}
+          {routeLoading && (
+            <span>
+              {query.mode === "location"
+                ? "Fokussiere Standort..."
+                : "Plane Route neu..."}
+            </span>
+          )}
+          {!routeLoading && resultsLoading && (
+            <span>
+              {query.mode === "location"
+                ? "Suche Ladesaeulen in deiner Umgebung..."
+                : "Berechne Kandidaten entlang der Route..."}
+            </span>
+          )}
           {!routeLoading && !resultsLoading && detailLoading && <span>Lade Stationsdetails...</span>}
           {error && <span className="text-[#9c4110]">{error}</span>}
         </div>
