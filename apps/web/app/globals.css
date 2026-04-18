@@ -1,0 +1,97 @@
+@import "maplibre-gl/dist/maplibre-gl.css";
+@import "tailwindcss";
+
+:root {
+  --background: #edf0ea;
+  --foreground: #15261b;
+  --surface: rgba(255, 255, 255, 0.84);
+  --surface-strong: rgba(255, 255, 255, 0.94);
+  --muted: #67806d;
+  --accent: #156f63;
+  --accent-soft: #d5eee7;
+  --warning: #b96710;
+  --line: rgba(21, 38, 27, 0.08);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-body);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background:
+    radial-gradient(circle at top left, rgba(21, 111, 99, 0.16), transparent 28%),
+    radial-gradient(circle at 85% 18%, rgba(185, 103, 16, 0.12), transparent 18%),
+    linear-gradient(180deg, #eef2ea 0%, #edf0ea 55%, #e8ece4 100%);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body), sans-serif;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+.glass-panel {
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--line);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.7) inset,
+    0 20px 40px rgba(16, 31, 27, 0.08);
+}
+
+.glass-panel-strong {
+  background: var(--surface-strong);
+  backdrop-filter: blur(18px);
+  border: 1px solid rgba(21, 38, 27, 0.09);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.84) inset,
+    0 28px 60px rgba(16, 31, 27, 0.1);
+}
+
+.metric-label {
+  color: var(--muted);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+}
+
+.maplibregl-ctrl-group {
+  border-radius: 999px !important;
+  overflow: hidden;
+  border: 1px solid rgba(21, 38, 27, 0.08) !important;
+  box-shadow: 0 10px 25px rgba(21, 38, 27, 0.1);
+}
+
+.maplibregl-popup-content {
+  border-radius: 18px;
+  padding: 0.75rem 0.9rem;
+  font-family: var(--font-body), sans-serif;
+  box-shadow: 0 20px 40px rgba(21, 38, 27, 0.16);
+  border: 1px solid rgba(21, 38, 27, 0.08);
+}
+
+.maplibregl-popup-tip {
+  border-top-color: white !important;
+}
+
+.scroll-shadow {
+  mask-image: linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent);
+}

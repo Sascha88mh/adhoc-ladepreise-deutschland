@@ -1,0 +1,135 @@
+{
+  "feeds": [
+    {
+      "id": "mobilithek-dynamic-enbw",
+      "name": "EnBW Dynamic AFIR",
+      "mode": "hybrid",
+      "type": "dynamic",
+      "subscriptionId": "sub-enbw-dynamic",
+      "urlOverride": null,
+      "pollIntervalMinutes": 2,
+      "reconciliationIntervalMinutes": 2,
+      "isActive": true,
+      "notes": "Push-first, Pull-Reconciliation alle 2 Minuten",
+      "lastSuccessAt": "2026-04-17T18:53:42.771Z",
+      "lastSnapshotAt": "2026-04-17T18:53:42.771Z",
+      "lastDeltaCount": 5,
+      "errorRate": 0.02
+    },
+    {
+      "id": "mobilithek-static-enbw",
+      "name": "EnBW Static AFIR",
+      "mode": "pull",
+      "type": "static",
+      "subscriptionId": "sub-enbw-static",
+      "urlOverride": null,
+      "pollIntervalMinutes": 360,
+      "reconciliationIntervalMinutes": 360,
+      "isActive": true,
+      "notes": "Vollsync alle 6 Stunden",
+      "lastSuccessAt": "2026-04-17T18:53:41.361Z",
+      "lastSnapshotAt": "2026-04-17T18:53:41.361Z",
+      "lastDeltaCount": 5,
+      "errorRate": 0
+    },
+    {
+      "id": "mobilithek-dynamic-tesla",
+      "name": "Tesla Dynamic AFIR",
+      "mode": "push",
+      "type": "dynamic",
+      "subscriptionId": "sub-tesla-dynamic",
+      "urlOverride": null,
+      "pollIntervalMinutes": 2,
+      "reconciliationIntervalMinutes": 5,
+      "isActive": true,
+      "notes": "Webhook only, seltene Fallback-Abfrage",
+      "lastSuccessAt": "2026-04-17T18:53:38.803Z",
+      "lastSnapshotAt": "2026-04-17T18:53:38.803Z",
+      "lastDeltaCount": 5,
+      "errorRate": 0.01
+    }
+  ],
+  "syncRuns": [
+    {
+      "id": "mobilithek-dynamic-enbw-1776452022772",
+      "feedId": "mobilithek-dynamic-enbw",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-17T18:53:42.771Z",
+      "finishedAt": "2026-04-17T18:53:42.771Z",
+      "message": "Manueller Sync abgeschlossen",
+      "deltaCount": 5
+    },
+    {
+      "id": "mobilithek-static-enbw-1776452021362",
+      "feedId": "mobilithek-static-enbw",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-17T18:53:41.361Z",
+      "finishedAt": "2026-04-17T18:53:41.362Z",
+      "message": "Manueller Sync abgeschlossen",
+      "deltaCount": 5
+    },
+    {
+      "id": "mobilithek-dynamic-tesla-1776452018805",
+      "feedId": "mobilithek-dynamic-tesla",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-17T18:53:38.803Z",
+      "finishedAt": "2026-04-17T18:53:38.804Z",
+      "message": "Manueller Sync abgeschlossen",
+      "deltaCount": 5
+    },
+    {
+      "id": "mobilithek-dynamic-tesla-1776452011645",
+      "feedId": "mobilithek-dynamic-tesla",
+      "kind": "test",
+      "status": "success",
+      "startedAt": "2026-04-17T18:53:31.644Z",
+      "finishedAt": "2026-04-17T18:53:31.645Z",
+      "message": "Verbindung und Zugangsdaten erfolgreich geprüft",
+      "deltaCount": 0
+    },
+    {
+      "id": "mobilithek-static-enbw-1776452008435",
+      "feedId": "mobilithek-static-enbw",
+      "kind": "test",
+      "status": "success",
+      "startedAt": "2026-04-17T18:53:28.433Z",
+      "finishedAt": "2026-04-17T18:53:28.434Z",
+      "message": "Verbindung und Zugangsdaten erfolgreich geprüft",
+      "deltaCount": 0
+    },
+    {
+      "id": "run-1",
+      "feedId": "mobilithek-dynamic-enbw",
+      "kind": "webhook",
+      "status": "success",
+      "startedAt": "2026-04-17T20:03:00.000Z",
+      "finishedAt": "2026-04-17T20:03:04.000Z",
+      "message": "14 Delta-Updates verarbeitet",
+      "deltaCount": 14
+    },
+    {
+      "id": "run-2",
+      "feedId": "mobilithek-static-enbw",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-17T18:00:00.000Z",
+      "finishedAt": "2026-04-17T18:00:12.000Z",
+      "message": "Snapshot neu aufgebaut",
+      "deltaCount": 1
+    },
+    {
+      "id": "run-3",
+      "feedId": "mobilithek-dynamic-tesla",
+      "kind": "reconciliation",
+      "status": "running",
+      "startedAt": "2026-04-17T20:05:00.000Z",
+      "finishedAt": null,
+      "message": "Warte auf Delta-Sequenz",
+      "deltaCount": 0
+    }
+  ],
+  "webhookDeliveries": []
+}
