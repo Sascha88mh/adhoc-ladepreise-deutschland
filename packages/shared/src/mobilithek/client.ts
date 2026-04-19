@@ -39,6 +39,10 @@ function fixturePath(filename: string) {
   return join(workspaceRoot(), "db", "fixtures", filename);
 }
 
+function defaultLocalP12Path() {
+  return join(workspaceRoot(), "certs", "mobilithek.p12");
+}
+
 function readFixture(type: FeedConfig["type"]) {
   return readFileSync(
     fixturePath(type === "static" ? "mobilithek-static.sample.json" : "mobilithek-dynamic.sample.json"),
@@ -78,6 +82,7 @@ async function buildAgent(feed: FeedConfig): Promise<https.Agent> {
   const key = await resolveCredentialValue(credentialRef, "CLIENT_KEY");
   const p12 = await resolveCredentialValue(credentialRef, "CERT_P12_BASE64");
   const password = (await resolveCredentialValue(credentialRef, "CERT_PASSWORD")) ?? "";
+  const localP12Path = process.env.MOBILITHEK_CERT_P12_PATH ?? defaultLocalP12Path();
 
   if (cert && key) {
     return new https.Agent({
@@ -95,6 +100,14 @@ async function buildAgent(feed: FeedConfig): Promise<https.Agent> {
     });
   }
 
+  if (existsSync(localP12Path)) {
+    return new https.Agent({
+      pfx: readFileSync(localP12Path),
+      passphrase: password,
+      keepAlive: true,
+    });
+  }
+
   // No cert configured. Mobilithek m2m endpoints enforce mTLS at the Azure
   // gateway and reject cert-less requests with "400 No required SSL certificate
   // was sent". Fail fast with an actionable message instead of producing that
@@ -105,7 +118,8 @@ async function buildAgent(feed: FeedConfig): Promise<https.Agent> {
       `Erwartet: env var ${refHint}_CERT_P12_BASE64 (+ ${refHint}_CERT_PASSWORD) ` +
       `oder ${refHint}_CLIENT_CERT + ${refHint}_CLIENT_KEY, ` +
       `oder global MOBILITHEK_CERT_P12_BASE64, ` +
-      `oder ein gleichnamiger Eintrag in der Tabelle app_secrets.`,
+      `oder ein gleichnamiger Eintrag in der Tabelle app_secrets, ` +
+      `oder lokal ${process.env.MOBILITHEK_CERT_P12_PATH ?? "certs/mobilithek.p12"}.`,
   );
 }
 

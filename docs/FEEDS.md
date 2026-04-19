@@ -130,12 +130,13 @@ Wenn das Zertifikat abläuft oder rotiert wird: neues `.p12` nach
 `certs/mobilithek.p12` legen, diese Tabelle aktualisieren, Schritt unten
 (Base64 → `app_secrets` UPSERT) erneut ausführen.
 
-**Reihenfolge der Auflösung** (in `resolveCredentialValue`, [client.ts:62](../packages/shared/src/mobilithek/client.ts)):
+**Reihenfolge der Auflösung** (in `resolveCredentialValue` / `buildAgent`, [client.ts](../packages/shared/src/mobilithek/client.ts)):
 
 1. `env[{REF}_{SUFFIX}]` — z.B. `VAYLENS_CERT_P12_BASE64`
 2. `env[MOBILITHEK_{SUFFIX}]` — globaler Env-Fallback
 3. `app_secrets[{REF}_{SUFFIX}]` — DB-spezifisch
 4. `app_secrets[MOBILITHEK_{SUFFIX}]` — DB-global
+5. lokal `MOBILITHEK_CERT_P12_PATH` oder Default `certs/mobilithek.p12` — nur für Local Dev / Test-Syncs
 
 `{REF}` ist `feed_configs.credential_ref` uppercased, nicht-alphanumerisch → `_`. Beispiele:
 
@@ -188,7 +189,9 @@ base64 -w0 consumer-cert.p12 | xclip     # Linux
 > **Wichtig:** Ohne gültiges Zertifikat wirft `buildAgent` jetzt **sofort** einen
 > sprechenden Fehler (`Kein Mobilithek-Client-Zertifikat für Feed "X" konfiguriert`).
 > Früher gab es einen kryptischen 400 von Azure. Wenn du diesen Fehler siehst:
-> Credentials fehlen, nicht Netzwerk / Cert-Validität.
+> Credentials fehlen, nicht Netzwerk / Cert-Validität. Lokal reicht jetzt auch
+> die Repo-Datei `certs/mobilithek.p12` (bzw. `MOBILITHEK_CERT_P12_PATH`), sofern
+> die Passphrase als `MOBILITHEK_CERT_PASSWORD` oder via `app_secrets` verfügbar ist.
 
 ### 3.4 Feed-Row anlegen
 
