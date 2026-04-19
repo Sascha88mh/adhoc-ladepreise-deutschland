@@ -304,7 +304,7 @@ Manuell pruefen:
 
 ### 10. Betriebsregeln
 
-- Ohne `APP_DATA_SOURCE=db` bleibt die App im Demo-Modus
+- In Production ist Demo-Fallback gesperrt: `APP_DATA_SOURCE=db` plus `DATABASE_URL` oder `SUPABASE_DB_URL` sind Pflicht. Demo-Daten sind nur noch mit explizitem `ALLOW_DEMO_DATA=1` erlaubt.
 - Ohne erfolgreichen initialen Static-Sync sind Public-Daten unvollstaendig
 - Ohne Scheduler gibt es keine automatische Aktualisierung
 - Ohne Credentials kann nur mit `MOBILITHEK_USE_FIXTURES=1` getestet werden

@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
+import { Database, Activity, MapPin, Search, HardDrive, Edit2, X, RotateCcw, Save, Trash2 } from "lucide-react";
 import type { AdminStationRecord, FeedConfig, SyncRun } from "@adhoc/shared";
 import {
   createAdminFeed,
   deleteAdminFeed,
   deleteStationOverride,
+  fetchAdminFeeds,
   fetchSyncRuns,
   saveStationOverride,
   searchAdminStations,
@@ -44,6 +46,11 @@ type FeedHealth = {
   detail: string;
 };
 
+type FeedActionState = {
+  kind: "create" | "save" | "delete" | "test" | "sync";
+  label: string;
+};
+
 const EMPTY_FORM: FeedFormState = {
   source: "mobilithek",
   cpoId: "",
@@ -62,6 +69,24 @@ const EMPTY_FORM: FeedFormState = {
   webhookSecretRef: "",
   notes: "",
 };
+
+const FEED_FIELD_DESCRIPTIONS = {
+  cpoId: "Interne oder externe CPO-Kennung. Leer lassen, wenn der Feed mehrere Betreiber enthält oder der CPO erst aus der Payload kommt.",
+  name: "Freier Anzeigename für die Admin-Oberfläche. Am besten Betreiber + Feed-Art, damit du ihn sofort wiederfindest.",
+  subscriptionId: "Die Mobilithek-Subscription-ID oder eindeutige Feed-ID. Dieser Wert identifiziert den Feed technisch.",
+  urlOverride: "Optionaler direkter Feed-Endpunkt. Nur setzen, wenn der Standard-Endpunkt aus der Subscription nicht verwendet werden soll.",
+  type: "Static für Stammdaten, Dynamic für Live-Status oder Preise. Davon hängen sinnvolle Ingest-Toggles und Intervalle ab.",
+  mode: "Push = nur Webhook, Pull = nur Abruf, Hybrid = Webhook plus Fallback-Abruf/Reconciliation.",
+  pollIntervalMinutes: "Abrufintervall in Minuten für Pull-Feeds. Leer bedeutet: kein automatischer Pull.",
+  reconciliationIntervalMinutes: "Fallback-Intervall in Minuten für Push/Hybrid-Feeds. Leer bedeutet: kein zusätzlicher Abgleich.",
+  credentialRef: "Schlüssel für Zertifikat oder Zugangsdaten. Muss zu den hinterlegten Secrets passen, z. B. ENBW oder TESLA.",
+  webhookSecretRef: "Schlüssel für die Validierung eingehender Webhooks. Nur nötig, wenn der Feed per Push Daten sendet.",
+  ingestCatalog: "Aktiviert die Übernahme von Standort- und Stammdaten.",
+  ingestPrices: "Aktiviert die Übernahme von Tarifen und Preisständen.",
+  ingestStatus: "Aktiviert die Übernahme von Verfügbarkeiten und Live-Status.",
+  isActive: "Nur aktive Feeds werden automatisch verarbeitet.",
+  notes: "Freie Admin-Notiz für Besonderheiten, Credentials, offene Punkte oder Betriebsdetails.",
+} as const;
 
 function formatDateTime(value: string | null) {
   if (!value) {
@@ -218,35 +243,366 @@ function stationOverridePayload(station: AdminStationRecord) {
   };
 }
 
+function toggleFeedExpansion(currentId: string | null, nextId: string) {
+  return currentId === nextId ? null : nextId;
+}
+
+function loadingLabel(kind: FeedActionState["kind"]) {
+  switch (kind) {
+    case "create":
+      return "Feed wird angelegt";
+    case "save":
+      return "Änderungen werden gespeichert";
+    case "delete":
+      return "Feed wird entfernt";
+    case "test":
+      return "Test läuft";
+    case "sync":
+      return "Sync läuft";
+    default:
+      return "Läuft";
+  }
+}
+
+function ActionSpinner() {
+  return (
+    <span className="inline-flex items-center gap-2">
+      <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent" />
+      läuft
+    </span>
+  );
+}
+
+function FieldHint({ children }: { children: string }) {
+  return <span className="text-xs leading-5 text-[var(--muted)]">{children}</span>;
+}
+
+function InfoCell({
+  children,
+  interactive = false,
+}: {
+  children: ReactNode;
+  interactive?: boolean;
+}) {
+  return (
+    <div
+      className={
+        interactive
+          ? "rounded-[14px] border border-slate-200 bg-white px-3 py-2 shadow-sm"
+          : "px-2 py-1 flex flex-col justify-center"
+      }
+    >
+      {children}
+    </div>
+  );
+}
+
+type FeedEditorProps = {
+  feed: FeedConfig;
+  busy: FeedActionState | null;
+  latestRun: SyncRun | undefined;
+  onChange: (feedId: string, patch: Partial<FeedConfig>) => void;
+  onSave: (feed: FeedConfig) => Promise<void>;
+  onAction: (feedId: string, action: "test" | "sync") => Promise<void>;
+  onDelete: (feedId: string) => Promise<void>;
+};
+
+function FeedEditor({
+  feed,
+  busy,
+  latestRun,
+  onChange,
+  onSave,
+  onAction,
+  onDelete,
+}: FeedEditorProps) {
+  const disabled = busy != null;
+
+  return (
+    <div className="grid gap-4 rounded-[24px] border border-slate-300 bg-slate-100/95 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.65)]">
+      <div className="grid gap-4 xl:grid-cols-2">
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          CPO-ID
+          <input
+            value={feed.cpoId ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, { cpoId: parseNullableText(event.target.value) })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.cpoId}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Subscription-ID
+          <input
+            value={feed.subscriptionId}
+            onChange={(event) => onChange(feed.id, { subscriptionId: event.target.value })}
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.subscriptionId}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Feed-Typ
+          <select
+            value={feed.type}
+            onChange={(event) =>
+              onChange(feed.id, {
+                type: event.target.value as FeedConfig["type"],
+              })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="dynamic">dynamic</option>
+            <option value="static">static</option>
+          </select>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.type}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Modus
+          <select
+            value={feed.mode}
+            onChange={(event) =>
+              onChange(feed.id, { mode: event.target.value as FeedConfig["mode"] })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="push">push</option>
+            <option value="pull">pull</option>
+            <option value="hybrid">hybrid</option>
+          </select>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.mode}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Pull-Intervall
+          <input
+            type="number"
+            value={feed.pollIntervalMinutes ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, {
+                pollIntervalMinutes: parseNullableInt(event.target.value),
+              })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.pollIntervalMinutes}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Reconciliation
+          <input
+            type="number"
+            value={feed.reconciliationIntervalMinutes ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, {
+                reconciliationIntervalMinutes: parseNullableInt(event.target.value),
+              })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.reconciliationIntervalMinutes}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          URL-Override
+          <input
+            value={feed.urlOverride ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, { urlOverride: parseNullableText(event.target.value) })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.urlOverride}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Credential-Ref
+          <input
+            value={feed.credentialRef ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, { credentialRef: parseNullableText(event.target.value) })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.credentialRef}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+          Webhook-Secret-Ref
+          <input
+            value={feed.webhookSecretRef ?? ""}
+            onChange={(event) =>
+              onChange(feed.id, { webhookSecretRef: parseNullableText(event.target.value) })
+            }
+            className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.webhookSecretRef}</FieldHint>
+        </label>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+          <span className="flex items-center justify-between gap-3">
+            Feed aktiv
+            <input
+              type="checkbox"
+              checked={feed.isActive}
+              onChange={(event) => onChange(feed.id, { isActive: event.target.checked })}
+              className="accent-[var(--accent)] h-4 w-4"
+            />
+          </span>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.isActive}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+          <span className="flex items-center justify-between gap-3">
+            Catalog ingest
+            <input
+              type="checkbox"
+              checked={feed.ingestCatalog}
+              onChange={(event) => onChange(feed.id, { ingestCatalog: event.target.checked })}
+              className="accent-[var(--accent)] h-4 w-4"
+            />
+          </span>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestCatalog}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+          <span className="flex items-center justify-between gap-3">
+            Preis ingest
+            <input
+              type="checkbox"
+              checked={feed.ingestPrices}
+              onChange={(event) => onChange(feed.id, { ingestPrices: event.target.checked })}
+              className="accent-[var(--accent)] h-4 w-4"
+            />
+          </span>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestPrices}</FieldHint>
+        </label>
+
+        <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+          <span className="flex items-center justify-between gap-3">
+            Status ingest
+            <input
+              type="checkbox"
+              checked={feed.ingestStatus}
+              onChange={(event) => onChange(feed.id, { ingestStatus: event.target.checked })}
+              className="accent-[var(--accent)] h-4 w-4"
+            />
+          </span>
+          <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestStatus}</FieldHint>
+        </label>
+      </div>
+
+      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+        Notizen
+        <textarea
+          value={feed.notes}
+          onChange={(event) => onChange(feed.id, { notes: event.target.value })}
+          className="w-full min-h-[100px] rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+        />
+        <FieldHint>{FEED_FIELD_DESCRIPTIONS.notes}</FieldHint>
+      </label>
+
+      <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_auto]">
+        <div className="grid gap-3 text-sm md:grid-cols-3">
+          <div className="rounded-2xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
+            <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
+              Letzte Fehlermeldung
+            </div>
+            <div className="mt-1 text-slate-700">{feed.lastErrorMessage ?? "Keine"}</div>
+          </div>
+          <div className="rounded-2xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
+            <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
+              Cursor State
+            </div>
+            <div className="mt-1 break-all font-mono text-xs text-slate-700">
+              {feed.cursorState ? JSON.stringify(feed.cursorState) : "leer"}
+            </div>
+          </div>
+          <div className="rounded-2xl border border-slate-300 bg-white px-4 py-3 shadow-sm">
+            <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
+              Letzter Lauf
+            </div>
+            <div className="mt-1 text-slate-700">
+              {latestRun ? `${latestRun.kind} · ${latestRun.message}` : "Noch kein Lauf"}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-start gap-2 text-sm">
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSave(feed)}
+            className="rounded-full bg-[var(--accent)] px-4 py-2 text-white disabled:opacity-60"
+          >
+            {busy?.kind === "save" ? "Speichert..." : "Speichern"}
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onAction(feed.id, "test")}
+            className="rounded-full border border-[var(--line)] px-4 py-2 disabled:opacity-60"
+          >
+            {busy?.kind === "test" ? "Test läuft..." : "Testen"}
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onAction(feed.id, "sync")}
+            className="rounded-full border border-[var(--line)] px-4 py-2 disabled:opacity-60"
+          >
+            {busy?.kind === "sync" ? "Sync läuft..." : "Sync"}
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onDelete(feed.id)}
+            className="rounded-full border border-[#d8b3a0] px-4 py-2 text-[#9c4110] disabled:opacity-60"
+          >
+            {busy?.kind === "delete" ? "Entfernt..." : "Entfernen"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Props) {
   const [feeds, setFeeds] = useState(initialFeeds);
   const [syncRuns, setSyncRuns] = useState(initialSyncRuns);
   const [form, setForm] = useState(EMPTY_FORM);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [selectedFeedId, setSelectedFeedId] = useState<string | null>(
-    initialFeeds[0]?.id ?? null,
-  );
+  const [expandedFeedId, setExpandedFeedId] = useState<string | null>(null);
+  const [createFormOpen, setCreateFormOpen] = useState(false);
   const [uiError, setUiError] = useState<string | null>(null);
   const [stationQuery, setStationQuery] = useState("");
   const [stationResults, setStationResults] = useState<AdminStationRecord[]>([]);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
   const [stationError, setStationError] = useState<string | null>(null);
   const [overrideBusy, setOverrideBusy] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"feeds" | "runs" | "overrides">("feeds");
+  const [feedActions, setFeedActions] = useState<Record<string, FeedActionState>>({});
   const [, startTransition] = useTransition();
 
   const runsByFeed = useMemo(() => {
     return syncRuns.reduce<Record<string, SyncRun[]>>((acc, run) => {
       acc[run.feedId] ??= [];
       acc[run.feedId].push(run);
+      acc[run.feedId].sort(
+        (left, right) =>
+          new Date(right.startedAt).getTime() - new Date(left.startedAt).getTime(),
+      );
       return acc;
     }, {});
   }, [syncRuns]);
 
-  const selectedFeed =
-    feeds.find((feed) => feed.id === selectedFeedId) ?? feeds[0] ?? null;
-  const selectedFeedRuns = selectedFeed ? runsByFeed[selectedFeed.id] ?? [] : [];
   const selectedStation =
     stationResults.find((station) => station.stationId === selectedStationId) ?? null;
+  const hasRunningRuns = syncRuns.some((run) => run.status === "running");
 
   useEffect(() => {
     if (dataSource !== "db") {
@@ -272,12 +628,54 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
     return () => window.clearTimeout(timer);
   }, [dataSource, selectedStationId, startTransition, stationQuery]);
 
-  async function refreshSyncRuns() {
-    setSyncRuns(await fetchSyncRuns());
+  useEffect(() => {
+    if (dataSource !== "db" || !hasRunningRuns) {
+      return;
+    }
+
+    const interval = window.setInterval(async () => {
+      try {
+        const [nextFeeds, nextRuns] = await Promise.all([fetchAdminFeeds(), fetchSyncRuns()]);
+        setFeeds(nextFeeds);
+        setSyncRuns(nextRuns);
+      } catch (error) {
+        console.error("[admin] polling failed", error);
+      }
+    }, 2500);
+
+    return () => window.clearInterval(interval);
+  }, [dataSource, hasRunningRuns]);
+
+  function setFeedAction(feedId: string, action: FeedActionState | null) {
+    setFeedActions((current) => {
+      if (!action) {
+        const next = { ...current };
+        delete next[feedId];
+        return next;
+      }
+
+      return {
+        ...current,
+        [feedId]: action,
+      };
+    });
+  }
+
+  async function refreshAdminData() {
+    const [nextFeeds, nextRuns] = await Promise.all([fetchAdminFeeds(), fetchSyncRuns()]);
+    setFeeds(nextFeeds);
+    setSyncRuns(nextRuns);
+  }
+
+  function patchFeed(feedId: string, patch: Partial<FeedConfig>) {
+    setFeeds((current) =>
+      current.map((entry) => (entry.id === feedId ? { ...entry, ...patch } : entry)),
+    );
   }
 
   async function handleCreate() {
     setUiError(null);
+    setFeedAction("__create__", { kind: "create", label: "Feed wird angelegt" });
     try {
       const created = await createAdminFeed({
         ...form,
@@ -287,17 +685,20 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
         webhookSecretRef: parseNullableText(form.webhookSecretRef ?? ""),
       });
       setFeeds((current) => [created, ...current]);
-      setSelectedFeedId(created.id);
+      setExpandedFeedId(created.id);
+      setCreateFormOpen(false);
       setForm(EMPTY_FORM);
-      await refreshSyncRuns();
+      await refreshAdminData();
     } catch (error) {
       setUiError(error instanceof Error ? error.message : "Feed konnte nicht angelegt werden.");
+    } finally {
+      setFeedAction("__create__", null);
     }
   }
 
   async function handleSave(feed: FeedConfig) {
-    setBusyId(feed.id);
     setUiError(null);
+    setFeedAction(feed.id, { kind: "save", label: "Änderungen werden gespeichert" });
     try {
       const updated = await updateAdminFeed(feed.id, feed);
       setFeeds((current) =>
@@ -306,60 +707,48 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
     } catch (error) {
       setUiError(error instanceof Error ? error.message : "Feed konnte nicht gespeichert werden.");
     } finally {
-      setBusyId(null);
+      setFeedAction(feed.id, null);
     }
   }
 
   async function handleDelete(feedId: string) {
-    setBusyId(feedId);
     setUiError(null);
+    setFeedAction(feedId, { kind: "delete", label: "Feed wird entfernt" });
     try {
       await deleteAdminFeed(feedId);
-      const nextFeeds = feeds.filter((feed) => feed.id !== feedId);
-      setFeeds(nextFeeds);
-      if (selectedFeedId === feedId) {
-        setSelectedFeedId(nextFeeds[0]?.id ?? null);
-      }
+      setFeeds((current) => current.filter((feed) => feed.id !== feedId));
+      setSyncRuns((current) => current.filter((run) => run.feedId !== feedId));
     } catch (error) {
       setUiError(error instanceof Error ? error.message : "Feed konnte nicht entfernt werden.");
     } finally {
-      setBusyId(null);
+      setFeedAction(feedId, null);
     }
   }
 
   async function handleAction(feedId: string, action: "test" | "sync") {
-    setBusyId(feedId);
     setUiError(null);
-    const startedAt = Date.now();
+    setFeedAction(feedId, {
+      kind: action,
+      label: action === "test" ? "Test läuft" : "Sync läuft",
+    });
+
     try {
       const run = await triggerFeedAction(feedId, action);
-      setSyncRuns((current) => [run, ...current]);
-      try {
-        await refreshSyncRuns();
-      } catch (error) {
-        console.error("[admin] refreshSyncRuns failed after action", error);
-      }
-    } catch (error) {
-      if (action === "sync") {
-        try {
-          const runs = await fetchSyncRuns();
-          setSyncRuns(runs);
+      setSyncRuns((current) => [run, ...current.filter((entry) => entry.id !== run.id)]);
 
-          const latestForFeed = runs.find((run) => run.feedId === feedId);
-          if (
-            latestForFeed &&
-            new Date(latestForFeed.startedAt).getTime() >= startedAt - 5_000
-          ) {
-            return;
-          }
+      if (run.status === "running") {
+        await refreshAdminData();
+      } else {
+        try {
+          await refreshAdminData();
         } catch (refreshError) {
-          console.error("[admin] sync fallback refresh failed", refreshError);
+          console.error("[admin] refresh after action failed", refreshError);
         }
       }
-
+    } catch (error) {
       setUiError(error instanceof Error ? error.message : "Aktion konnte nicht ausgeführt werden.");
     } finally {
-      setBusyId(null);
+      setFeedAction(feedId, null);
     }
   }
 
@@ -424,549 +813,619 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
   }
 
   return (
-    <div className="mx-auto flex max-w-[1600px] flex-col gap-4">
+    <div className="mx-auto flex max-w-[1600px] gap-6 items-start lg:flex-row flex-col">
+      {/* Sidebar Navigation */}
+      <nav className="sticky top-6 flex w-full flex-col gap-2 rounded-[30px] p-5 glass-panel-strong shadow-[0_20px_40px_rgba(16,31,27,0.08)] lg:w-72 lg:shrink-0">
+        <div className="mb-6 px-2">
+          <h1 className="font-[var(--font-heading)] text-2xl font-bold tracking-[-0.04em] text-slate-800">
+            Adhoc Admin
+          </h1>
+          <p className="mt-1 flex items-center gap-2 text-xs text-[var(--muted)]">
+            <HardDrive className="h-3.5 w-3.5" />
+            {dataSource === "db" ? "Production / Postgres" : "Demo Mode"}
+          </p>
+        </div>
+
+        <button
+          onClick={() => setActiveTab("feeds")}
+          className={`flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold transition ${
+            activeTab === "feeds"
+              ? "bg-[var(--accent)] text-white shadow-md"
+              : "text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          <Database className="h-4 w-4" />
+          Data Feeds
+          <span className={`ml-auto rounded-full px-2 py-0.5 text-xs ${activeTab === "feeds" ? 'bg-white/25' : 'bg-slate-200'}`}>
+            {feeds.length}
+          </span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab("runs")}
+          className={`flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold transition ${
+            activeTab === "runs"
+              ? "bg-[var(--accent)] text-white shadow-md"
+              : "text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          <Activity className="h-4 w-4" />
+          Sync Läufe
+          {hasRunningRuns && (
+             <span className="ml-auto flex h-2 w-2 rounded-full bg-[#f59e0b] animate-pulse" />
+          )}
+        </button>
+
+        <button
+          onClick={() => setActiveTab("overrides")}
+          className={`flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold transition ${
+            activeTab === "overrides"
+              ? "bg-[var(--accent)] text-white shadow-md"
+              : "text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          <MapPin className="h-4 w-4" />
+          Overrides
+        </button>
+      </nav>
+
+      {/* Main Content Area */}
+      <div className="flex-1 min-w-0 flex flex-col gap-5 w-full">
+        {uiError ? (
+          <div className="rounded-[24px] border border-[#fca5a5] bg-[#fef2f2] px-5 py-4 text-sm font-medium text-[#b91c1c] shadow-sm">
+            {uiError}
+          </div>
+        ) : null}
+
+        {/* FEED TAB */}
+        {activeTab === "feeds" && (
+          <div className="flex flex-col gap-5 flex-1 animate-in fade-in slide-in-from-bottom-2 duration-300">
+
       <section className="glass-panel-strong rounded-[30px] p-5">
-        <div className="flex flex-wrap items-start justify-between gap-4">
+        <button
+          type="button"
+          onClick={() => setCreateFormOpen((current) => !current)}
+          className="flex w-full items-start justify-between gap-4 rounded-[24px] border border-slate-300 bg-white px-4 py-4 text-left shadow-sm transition hover:border-slate-400 hover:bg-slate-50"
+        >
           <div>
-            <p className="metric-label mb-2">Control Plane</p>
-            <h1 className="font-[var(--font-heading)] text-3xl font-semibold tracking-[-0.04em]">
-              Mobilithek Feed-Management
-            </h1>
+            <p className="metric-label">Neuer Feed</p>
+            <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
+              Feed anlegen
+            </h2>
             <p className="mt-2 max-w-3xl text-sm text-[var(--muted)]">
-              Feeds, automatische Syncs, Fehlerdiagnose und kuratierte Stations-Overrides.
+              Neues Feed-Setup oben aufklappen, Felder direkt mit Kurzbeschreibung ausfüllen und
+              danach sofort testen.
             </p>
           </div>
-          <div className="rounded-full bg-white/80 px-4 py-2 text-sm text-[var(--muted)]">
-            Datenquelle: {dataSource === "db" ? "Supabase / Postgres" : "Demo / Fixture"}
-          </div>
-        </div>
-        {uiError ? (
-          <div className="mt-4 rounded-2xl border border-[#e6b8a7] bg-[#fff3ee] px-4 py-3 text-sm text-[#9a3f1b]">
-            {uiError}
+          <span className="rounded-full border border-slate-300 bg-slate-100 px-3 py-2 text-sm font-medium text-slate-700">
+            {createFormOpen ? "eingeklappt anzeigen" : "aufklappen"}
+          </span>
+        </button>
+
+        {createFormOpen ? (
+          <div className="mt-5 grid gap-4 rounded-[26px] border border-[var(--line)] bg-white/70 p-4">
+            <div className="grid gap-4 xl:grid-cols-2">
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                CPO-ID
+                <input
+                  value={form.cpoId ?? ""}
+                  onChange={(event) => setForm({ ...form, cpoId: event.target.value })}
+                  placeholder="z. B. ENBW"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.cpoId}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Feed-Name
+                <input
+                  value={form.name}
+                  onChange={(event) => setForm({ ...form, name: event.target.value })}
+                  placeholder="z. B. EnBW Dynamic AFIR"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.name}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Subscription-ID
+                <input
+                  value={form.subscriptionId}
+                  onChange={(event) => setForm({ ...form, subscriptionId: event.target.value })}
+                  placeholder="Technische Feed-ID von Mobilithek"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.subscriptionId}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                URL-Override
+                <input
+                  value={form.urlOverride ?? ""}
+                  onChange={(event) => setForm({ ...form, urlOverride: event.target.value })}
+                  placeholder="Optionaler Direktlink"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.urlOverride}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Feed-Typ
+                <select
+                  value={form.type}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      type: event.target.value as FeedConfig["type"],
+                      ingestCatalog: event.target.value === "static",
+                      ingestStatus: event.target.value === "dynamic",
+                    })
+                  }
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                >
+                  <option value="dynamic">dynamic</option>
+                  <option value="static">static</option>
+                </select>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.type}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Modus
+                <select
+                  value={form.mode}
+                  onChange={(event) =>
+                    setForm({ ...form, mode: event.target.value as FeedConfig["mode"] })
+                  }
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                >
+                  <option value="push">push</option>
+                  <option value="pull">pull</option>
+                  <option value="hybrid">hybrid</option>
+                </select>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.mode}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Pull-Intervall
+                <input
+                  type="number"
+                  value={form.pollIntervalMinutes ?? ""}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      pollIntervalMinutes: parseNullableInt(event.target.value),
+                    })
+                  }
+                  placeholder="z. B. 2"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.pollIntervalMinutes}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Reconciliation
+                <input
+                  type="number"
+                  value={form.reconciliationIntervalMinutes ?? ""}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      reconciliationIntervalMinutes: parseNullableInt(event.target.value),
+                    })
+                  }
+                  placeholder="z. B. 15"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.reconciliationIntervalMinutes}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Credential-Ref
+                <input
+                  value={form.credentialRef ?? ""}
+                  onChange={(event) => setForm({ ...form, credentialRef: event.target.value })}
+                  placeholder="z. B. ENBW"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.credentialRef}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                Webhook-Secret-Ref
+                <input
+                  value={form.webhookSecretRef ?? ""}
+                  onChange={(event) => setForm({ ...form, webhookSecretRef: event.target.value })}
+                  placeholder="z. B. ENBW_WEBHOOK"
+                  className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                />
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.webhookSecretRef}</FieldHint>
+              </label>
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+                <span className="flex items-center justify-between gap-3">
+                  Catalog ingest
+                  <input
+                    type="checkbox"
+                    checked={form.ingestCatalog}
+                    onChange={(event) => setForm({ ...form, ingestCatalog: event.target.checked })}
+                    className="accent-[var(--accent)] h-4 w-4"
+                  />
+                </span>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestCatalog}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+                <span className="flex items-center justify-between gap-3">
+                  Preis ingest
+                  <input
+                    type="checkbox"
+                    checked={form.ingestPrices}
+                    onChange={(event) => setForm({ ...form, ingestPrices: event.target.checked })}
+                    className="accent-[var(--accent)] h-4 w-4"
+                  />
+                </span>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestPrices}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+                <span className="flex items-center justify-between gap-3">
+                  Status ingest
+                  <input
+                    type="checkbox"
+                    checked={form.ingestStatus}
+                    onChange={(event) => setForm({ ...form, ingestStatus: event.target.checked })}
+                    className="accent-[var(--accent)] h-4 w-4"
+                  />
+                </span>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.ingestStatus}</FieldHint>
+              </label>
+
+              <label className="grid gap-1.5 rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+                <span className="flex items-center justify-between gap-3">
+                  Feed aktiv
+                  <input
+                    type="checkbox"
+                    checked={form.isActive}
+                    onChange={(event) => setForm({ ...form, isActive: event.target.checked })}
+                    className="accent-[var(--accent)] h-4 w-4"
+                  />
+                </span>
+                <FieldHint>{FEED_FIELD_DESCRIPTIONS.isActive}</FieldHint>
+              </label>
+            </div>
+
+            <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+              Notizen
+              <textarea
+                value={form.notes}
+                onChange={(event) => setForm({ ...form, notes: event.target.value })}
+                placeholder="Besonderheiten, Zertifikats-Hinweise, offene To-dos"
+                className="w-full min-h-[100px] rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+              />
+              <FieldHint>{FEED_FIELD_DESCRIPTIONS.notes}</FieldHint>
+            </label>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleCreate}
+                disabled={Boolean(feedActions.__create__)}
+                className="rounded-2xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+              >
+                {feedActions.__create__ ? "Legt an..." : "Feed anlegen"}
+              </button>
+              {feedActions.__create__ ? (
+                <span className="text-sm text-[var(--muted)]">
+                  <ActionSpinner />
+                </span>
+              ) : null}
+            </div>
           </div>
         ) : null}
       </section>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.25fr),minmax(360px,0.75fr)]">
-        <section className="space-y-4">
-          <div className="glass-panel-strong rounded-[30px] p-5">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div>
-                <p className="metric-label">Feeds</p>
-                <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
-                  Datenfeed-Liste
-                </h2>
-              </div>
-              <div className="rounded-full bg-white/80 px-3 py-2 text-sm text-[var(--muted)]">
-                {feeds.length} Feed{feeds.length === 1 ? "" : "s"}
-              </div>
-            </div>
+      <section className="glass-panel-strong rounded-[30px] p-5">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="metric-label">Feeds</p>
+            <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
+              Datenfeed-Liste
+            </h2>
+            <p className="mt-2 max-w-3xl text-sm text-[var(--muted)]">
+              Kompakte Übersicht wie eine Tabelle. Klick auf eine Zeile öffnet die Details direkt darunter.
+            </p>
+          </div>
+          <div className="rounded-full bg-white/80 px-3 py-2 text-sm text-[var(--muted)]">
+            {feeds.length} Feed{feeds.length === 1 ? "" : "s"}
+          </div>
+        </div>
 
-            <div className="space-y-3">
-              {feeds.map((feed) => {
-                const latestRun = runsByFeed[feed.id]?.[0];
-                const health = healthForFeed(feed, latestRun);
+        <div className="overflow-hidden rounded-[26px] border shadow-sm border-slate-200 bg-white">
+          <div className="hidden gap-3 border-b border-slate-100 bg-slate-50/80 px-5 py-3.5 text-[11px] font-bold uppercase tracking-[0.2em] text-slate-500 lg:grid lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.8fr)_minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,1.2fr)_300px]">
+            <span className="px-2">Feed</span>
+            <span className="px-2">Typ</span>
+            <span className="px-2">Intervall</span>
+            <span className="px-2">Letzter Erfolg</span>
+            <span className="px-2">Letztes Ergebnis</span>
+            <span className="px-2 text-right">Aktionen</span>
+          </div>
 
-                return (
-                  <button
-                    key={feed.id}
-                    type="button"
-                    onClick={() => setSelectedFeedId(feed.id)}
-                    className={`w-full rounded-[26px] border px-4 py-4 text-left transition ${
-                      selectedFeed?.id === feed.id
-                        ? "border-[var(--accent)] bg-white shadow-[0_20px_60px_rgba(15,23,42,0.08)]"
-                        : "border-[var(--line)] bg-white/80"
-                    }`}
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <div className="mb-2 flex flex-wrap items-center gap-2">
-                          <span className="metric-label">
-                            {feed.type} · {feed.mode}
+          <div className="divide-y divide-slate-100">
+            {feeds.map((feed) => {
+              const latestRun = runsByFeed[feed.id]?.[0];
+              const health = healthForFeed(feed, latestRun);
+              const isExpanded = expandedFeedId === feed.id;
+              const busy = feedActions[feed.id] ?? null;
+              const actionStatusText = busy?.label ?? latestRun?.message ?? health.detail;
+              const latestRunLabel = latestRun?.status ?? health.label;
+              const latestRunTone = latestRun ? statusTone(latestRun.status) : health.tone;
+
+              return (
+                <div key={feed.id} className={`transition-colors duration-200 ${isExpanded ? "bg-slate-50/50" : "bg-white hover:bg-slate-50/30"}`}>
+                  <div className="px-4 py-4 lg:px-5">
+                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.8fr)_minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,1.2fr)_300px] lg:items-center">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedFeedId((current) => toggleFeedExpansion(current, feed.id))}
+                        className="flex min-w-0 items-start gap-4 rounded-[18px] border border-transparent px-2 py-2 text-left transition hover:border-[var(--accent)]/30 hover:bg-[var(--accent)]/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]/30"
+                      >
+                        <span className="mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-100/80 text-[10px] font-bold text-slate-600">
+                          {isExpanded ? <X className="h-3 w-3" /> : <Edit2 className="h-3 w-3" />}
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block truncate font-[var(--font-heading)] text-lg font-semibold tracking-[-0.03em] text-slate-900">
+                            {feed.name}
                           </span>
-                          <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${health.tone}`}>
-                            {health.label}
+                          <span className="mt-1 block truncate text-sm text-[var(--muted)]">
+                            {feed.subscriptionId}
                           </span>
-                          <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[var(--muted)]">
-                            {feed.cpoId ?? "ohne CPO"}
+                          <span className="mt-2 flex flex-wrap items-center gap-2">
+                            <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${health.tone}`}>
+                              {health.label}
+                            </span>
+                            <span className="rounded-full bg-slate-200 px-2.5 py-1 text-xs text-slate-700">
+                              {feed.cpoId ?? "ohne CPO"}
+                            </span>
+                          </span>
+                        </span>
+                      </button>
+
+                      <InfoCell>
+                        <div className="flex flex-col items-start gap-1.5 text-sm">
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] text-slate-600">
+                            {feed.type}
+                          </span>
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] text-slate-600">
+                            {feed.mode}
                           </span>
                         </div>
-                        <h3 className="font-[var(--font-heading)] text-xl font-semibold tracking-[-0.03em]">
-                          {feed.name}
-                        </h3>
-                        <p className="mt-1 text-sm text-[var(--muted)]">
-                          {feed.subscriptionId}
-                        </p>
-                      </div>
-                      <div className="text-right text-xs text-[var(--muted)]">
-                        <div>Letzter Erfolg</div>
-                        <div className="mt-1 font-medium text-slate-700">
-                          {formatDateTime(feed.lastSuccessAt)}
+                      </InfoCell>
+
+                      <InfoCell>
+                        <div className="text-sm text-slate-700">{intervalLabel(feed)}</div>
+                      </InfoCell>
+
+                      <InfoCell>
+                        <div className="text-sm text-slate-700">
+                          <div>{formatDateTime(feed.lastSuccessAt)}</div>
+                          <div className="mt-1 text-xs text-[var(--muted)]">
+                            {formatRelativeMinutes(feed.lastSuccessAt)}
+                          </div>
                         </div>
+                      </InfoCell>
+
+                      <InfoCell>
+                        <div className="text-sm text-slate-700">
+                          <div className="flex items-center gap-2">
+                            <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${latestRunTone}`}>
+                              {busy?.kind === "test" || busy?.kind === "sync" ? (
+                                <ActionSpinner />
+                              ) : (
+                                latestRunLabel
+                              )}
+                            </span>
+                            <span className="truncate text-xs text-[var(--muted)]">
+                              {latestRun ? new Date(latestRun.startedAt).toLocaleTimeString("de-DE") : ""}
+                            </span>
+                          </div>
+                          <div className="mt-2 line-clamp-2 text-sm">
+                            {busy ? loadingLabel(busy.kind) : actionStatusText}
+                          </div>
+                        </div>
+                      </InfoCell>
+
+                      <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+                        <button
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={() => void handleAction(feed.id, "test")}
+                          className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-60 flex items-center gap-2"
+                        >
+                          <Activity className="h-3.5 w-3.5 text-slate-400" />
+                          Testen
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={() => void handleAction(feed.id, "sync")}
+                          className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-60 flex items-center gap-2"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5 text-slate-400" />
+                          Sync
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(busy)}
+                          onClick={() => void handleDelete(feed.id)}
+                          className="rounded-full border border-[#fca5a5] bg-white px-4 py-2 text-sm font-semibold text-[#ef4444] shadow-sm transition hover:bg-[#fef2f2] disabled:opacity-60"
+                        >
+                          Entfernen
+                        </button>
                       </div>
                     </div>
 
-                    <div className="mt-4 grid gap-3 text-sm md:grid-cols-4">
-                      <div className="rounded-2xl bg-[var(--surface)] px-3 py-2">
-                        <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                          Health
-                        </div>
-                        <div className="mt-1 font-medium text-slate-700">{health.detail}</div>
+                    {isExpanded ? (
+                      <div className="mt-4 rounded-[26px] bg-slate-50 p-4 border border-slate-200 shadow-inner">
+                        <FeedEditor
+                          feed={feed}
+                          busy={busy}
+                          latestRun={latestRun}
+                          onChange={patchFeed}
+                          onSave={handleSave}
+                          onAction={handleAction}
+                          onDelete={handleDelete}
+                        />
                       </div>
-                      <div className="rounded-2xl bg-[var(--surface)] px-3 py-2">
-                        <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                          Intervall
-                        </div>
-                        <div className="mt-1 font-medium text-slate-700">{intervalLabel(feed)}</div>
-                      </div>
-                      <div className="rounded-2xl bg-[var(--surface)] px-3 py-2">
-                        <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                          Toggles
-                        </div>
-                        <div className="mt-1 font-medium text-slate-700">
-                          {[feed.ingestCatalog && "Catalog", feed.ingestPrices && "Preis", feed.ingestStatus && "Status"]
-                            .filter(Boolean)
-                            .join(" · ") || "keine"}
-                        </div>
-                      </div>
-                      <div className="rounded-2xl bg-[var(--surface)] px-3 py-2">
-                        <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                          Fehler
-                        </div>
-                        <div className="mt-1 font-medium text-slate-700">
-                          {feed.lastErrorMessage ?? "Keine"}
-                        </div>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="glass-panel-strong rounded-[30px] p-5">
-            <p className="metric-label mb-3">Neuen Feed anlegen</p>
-            <div className="grid gap-3 md:grid-cols-2">
-              <input
-                value={form.cpoId ?? ""}
-                onChange={(event) => setForm({ ...form, cpoId: event.target.value })}
-                placeholder="CPO-ID"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                value={form.name}
-                onChange={(event) => setForm({ ...form, name: event.target.value })}
-                placeholder="Feed Name"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                value={form.subscriptionId}
-                onChange={(event) => setForm({ ...form, subscriptionId: event.target.value })}
-                placeholder="Subscription-ID"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                value={form.urlOverride ?? ""}
-                onChange={(event) => setForm({ ...form, urlOverride: event.target.value })}
-                placeholder="URL Override (optional)"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <select
-                value={form.type}
-                onChange={(event) =>
-                  setForm({
-                    ...form,
-                    type: event.target.value as FeedConfig["type"],
-                    ingestCatalog: event.target.value === "static",
-                    ingestStatus: event.target.value === "dynamic",
-                  })
-                }
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              >
-                <option value="dynamic">dynamic</option>
-                <option value="static">static</option>
-              </select>
-              <select
-                value={form.mode}
-                onChange={(event) =>
-                  setForm({ ...form, mode: event.target.value as FeedConfig["mode"] })
-                }
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              >
-                <option value="push">push</option>
-                <option value="pull">pull</option>
-                <option value="hybrid">hybrid</option>
-              </select>
-              <input
-                type="number"
-                value={form.pollIntervalMinutes ?? ""}
-                onChange={(event) =>
-                  setForm({
-                    ...form,
-                    pollIntervalMinutes: parseNullableInt(event.target.value),
-                  })
-                }
-                placeholder="Pull-Intervall"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                type="number"
-                value={form.reconciliationIntervalMinutes ?? ""}
-                onChange={(event) =>
-                  setForm({
-                    ...form,
-                    reconciliationIntervalMinutes: parseNullableInt(event.target.value),
-                  })
-                }
-                placeholder="Reconciliation"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                value={form.credentialRef ?? ""}
-                onChange={(event) =>
-                  setForm({ ...form, credentialRef: event.target.value })
-                }
-                placeholder="Credential-Ref"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <input
-                value={form.webhookSecretRef ?? ""}
-                onChange={(event) =>
-                  setForm({ ...form, webhookSecretRef: event.target.value })
-                }
-                placeholder="Webhook-Secret-Ref"
-                className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
-              />
-              <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                Catalog ingest
-                <input
-                  type="checkbox"
-                  checked={form.ingestCatalog}
-                  onChange={(event) =>
-                    setForm({ ...form, ingestCatalog: event.target.checked })
-                  }
-                  className="accent-[var(--accent)]"
-                />
-              </label>
-              <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                Preis ingest
-                <input
-                  type="checkbox"
-                  checked={form.ingestPrices}
-                  onChange={(event) =>
-                    setForm({ ...form, ingestPrices: event.target.checked })
-                  }
-                  className="accent-[var(--accent)]"
-                />
-              </label>
-              <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                Status ingest
-                <input
-                  type="checkbox"
-                  checked={form.ingestStatus}
-                  onChange={(event) =>
-                    setForm({ ...form, ingestStatus: event.target.checked })
-                  }
-                  className="accent-[var(--accent)]"
-                />
-              </label>
-              <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                Feed aktiv
-                <input
-                  type="checkbox"
-                  checked={form.isActive}
-                  onChange={(event) => setForm({ ...form, isActive: event.target.checked })}
-                  className="accent-[var(--accent)]"
-                />
-              </label>
-              <textarea
-                value={form.notes}
-                onChange={(event) => setForm({ ...form, notes: event.target.value })}
-                placeholder="Notizen"
-                className="min-h-24 rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 md:col-span-2"
-              />
-            </div>
-
-            <button
-              type="button"
-              onClick={handleCreate}
-              className="mt-4 rounded-2xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white"
-            >
-              Feed anlegen
-            </button>
-          </div>
-
-          <div className="glass-panel-strong rounded-[30px] p-5">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div>
-                <p className="metric-label">Overrides</p>
-                <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
-                  Stations-Korrekturen
-                </h2>
-              </div>
-              {dataSource !== "db" ? (
-                <div className="rounded-full bg-[#fff3ee] px-3 py-2 text-sm text-[#9a3f1b]">
-                  Nur in DB-Modus aktiv
+                    ) : null}
+                  </div>
                 </div>
-              ) : null}
-            </div>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+        </div>
+        )}
 
-            {dataSource === "db" ? (
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr),minmax(0,1.1fr)]">
-                <div className="space-y-3">
+        {/* RUNS TAB */}
+        {activeTab === "runs" && (
+          <div className="flex flex-col gap-5 flex-1 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <section className="glass-panel-strong rounded-[30px] p-5 flex-1">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div>
+              <p className="metric-label">Status & Fehler</p>
+              <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
+                Letzte Läufe
+              </h2>
+            </div>
+            {hasRunningRuns ? (
+              <div className="rounded-full bg-[#fff8df] px-3 py-2 text-sm text-[#7a5f00]">
+                <ActionSpinner />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-3">
+            {syncRuns.slice(0, 12).map((run) => (
+              <div
+                key={run.id}
+                className="rounded-[16px] border border-slate-200 bg-white p-4 shadow-sm"
+              >
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div>
+                    <strong>{run.kind}</strong>
+                    <p className="text-xs text-[var(--muted)]">{run.feedId}</p>
+                  </div>
+                  <span className={`rounded-full px-3 py-1 text-xs ${statusTone(run.status)}`}>
+                    {run.status === "running" ? <ActionSpinner /> : run.status}
+                  </span>
+                </div>
+                <p className="text-sm text-slate-700">{run.message}</p>
+                <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
+                  <span>{new Date(run.startedAt).toLocaleString("de-DE")}</span>
+                  <span>Delta {run.deltaCount}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+            </section>
+          </div>
+        )}
+
+        {/* OVERRIDES TAB */}
+        {activeTab === "overrides" && (
+          <div className="flex flex-col gap-5 flex-1 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <section className="glass-panel-strong rounded-[30px] p-5 flex-1">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div>
+              <p className="metric-label">Overrides</p>
+              <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
+                Stations-Korrekturen
+              </h2>
+            </div>
+            {dataSource !== "db" ? (
+              <div className="rounded-full bg-[#fff3ee] px-3 py-2 text-sm text-[#9a3f1b]">
+                Nur in DB-Modus aktiv
+              </div>
+            ) : null}
+          </div>
+
+          {dataSource === "db" ? (
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+              <div className="space-y-3">
+                <div className="relative">
+                  <Search className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                   <input
                     value={stationQuery}
                     onChange={(event) => setStationQuery(event.target.value)}
                     placeholder="Station, CPO, Adresse oder Code suchen"
-                    className="w-full rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2"
+                    className="w-full rounded-[14px] border border-slate-200 bg-white py-2.5 pl-10 pr-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
                   />
-                  <div className="max-h-[28rem] space-y-2 overflow-y-auto pr-1">
-                    {stationResults.map((station) => (
-                      <button
-                        key={station.stationId}
-                        type="button"
-                        onClick={() => setSelectedStationId(station.stationId)}
-                        className={`w-full rounded-2xl border px-4 py-3 text-left ${
-                          selectedStation?.stationId === station.stationId
-                            ? "border-[var(--accent)] bg-white"
-                            : "border-[var(--line)] bg-white/80"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <div className="font-medium text-slate-800">{station.effectiveName}</div>
-                            <div className="text-sm text-[var(--muted)]">
-                              {station.cpoName} · {station.stationCode}
-                            </div>
-                          </div>
-                          {station.override ? (
-                            <span className="rounded-full bg-[#efe7cb] px-2.5 py-1 text-xs text-[#7a5f00]">
-                              Override
-                            </span>
-                          ) : null}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
                 </div>
-
-                <div className="space-y-3">
-                  {selectedStation ? (
-                    <>
-                      <div className="rounded-[24px] border border-[var(--line)] bg-white/80 p-4">
-                        <div className="font-semibold text-slate-800">{selectedStation.sourceName}</div>
-                        <div className="mt-1 text-sm text-[var(--muted)]">
-                          Quelle: {selectedStation.cpoName} · {selectedStation.stationCode}
+                <div className="max-h-[28rem] space-y-2 overflow-y-auto pr-1">
+                  {stationResults.map((station) => (
+                    <button
+                      key={station.stationId}
+                      type="button"
+                      onClick={() => setSelectedStationId(station.stationId)}
+                      className={`w-full rounded-[14px] border px-4 py-3 text-left transition ${
+                        selectedStation?.stationId === station.stationId
+                          ? "border-[var(--accent)] bg-[var(--accent)]/5 shadow-sm"
+                          : "border-slate-200 bg-white hover:border-slate-300"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="font-medium text-slate-800">{station.effectiveName}</div>
+                          <div className="text-sm text-[var(--muted)]">
+                            {station.cpoName} · {station.stationCode}
+                          </div>
                         </div>
+                        {station.override ? (
+                          <span className="rounded-full bg-[#efe7cb] px-2.5 py-1 text-xs text-[#7a5f00]">
+                            Override
+                          </span>
+                        ) : null}
                       </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <label className="grid gap-1 text-sm text-[var(--muted)]">
-                          Display Name
-                          <input
-                            value={selectedStation.override?.displayName ?? ""}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        effectiveName: event.target.value || entry.sourceName,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: parseNullableText(event.target.value),
-                                          addressLine: entry.override?.addressLine ?? null,
-                                          city: entry.override?.city ?? null,
-                                          postalCode: entry.override?.postalCode ?? null,
-                                          maxPowerKw: entry.override?.maxPowerKw ?? null,
-                                          isHidden: entry.override?.isHidden ?? false,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                          />
-                        </label>
-                        <label className="grid gap-1 text-sm text-[var(--muted)]">
-                          Adresse
-                          <input
-                            value={selectedStation.override?.addressLine ?? ""}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        effectiveAddressLine:
-                                          event.target.value || entry.sourceAddressLine,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: entry.override?.displayName ?? null,
-                                          addressLine: parseNullableText(event.target.value),
-                                          city: entry.override?.city ?? null,
-                                          postalCode: entry.override?.postalCode ?? null,
-                                          maxPowerKw: entry.override?.maxPowerKw ?? null,
-                                          isHidden: entry.override?.isHidden ?? false,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                          />
-                        </label>
-                        <label className="grid gap-1 text-sm text-[var(--muted)]">
-                          Stadt
-                          <input
-                            value={selectedStation.override?.city ?? ""}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        effectiveCity: event.target.value || entry.sourceCity,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: entry.override?.displayName ?? null,
-                                          addressLine: entry.override?.addressLine ?? null,
-                                          city: parseNullableText(event.target.value),
-                                          postalCode: entry.override?.postalCode ?? null,
-                                          maxPowerKw: entry.override?.maxPowerKw ?? null,
-                                          isHidden: entry.override?.isHidden ?? false,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                          />
-                        </label>
-                        <label className="grid gap-1 text-sm text-[var(--muted)]">
-                          PLZ
-                          <input
-                            value={selectedStation.override?.postalCode ?? ""}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        effectivePostalCode:
-                                          event.target.value || entry.sourcePostalCode,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: entry.override?.displayName ?? null,
-                                          addressLine: entry.override?.addressLine ?? null,
-                                          city: entry.override?.city ?? null,
-                                          postalCode: parseNullableText(event.target.value),
-                                          maxPowerKw: entry.override?.maxPowerKw ?? null,
-                                          isHidden: entry.override?.isHidden ?? false,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                          />
-                        </label>
-                        <label className="grid gap-1 text-sm text-[var(--muted)]">
-                          Max kW
-                          <input
-                            type="number"
-                            value={selectedStation.override?.maxPowerKw ?? ""}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        effectiveMaxPowerKw:
-                                          parseNullableInt(event.target.value) ?? entry.sourceMaxPowerKw,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: entry.override?.displayName ?? null,
-                                          addressLine: entry.override?.addressLine ?? null,
-                                          city: entry.override?.city ?? null,
-                                          postalCode: entry.override?.postalCode ?? null,
-                                          maxPowerKw: parseNullableInt(event.target.value),
-                                          isHidden: entry.override?.isHidden ?? false,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                          />
-                        </label>
-                        <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                          Verstecken
-                          <input
-                            type="checkbox"
-                            checked={selectedStation.override?.isHidden ?? false}
-                            onChange={(event) =>
-                              setStationResults((current) =>
-                                current.map((entry) =>
-                                  entry.stationId === selectedStation.stationId
-                                    ? {
-                                        ...entry,
-                                        isHidden: event.target.checked,
-                                        override: {
-                                          stationId: entry.stationId,
-                                          displayName: entry.override?.displayName ?? null,
-                                          addressLine: entry.override?.addressLine ?? null,
-                                          city: entry.override?.city ?? null,
-                                          postalCode: entry.override?.postalCode ?? null,
-                                          maxPowerKw: entry.override?.maxPowerKw ?? null,
-                                          isHidden: event.target.checked,
-                                          adminNote: entry.override?.adminNote ?? null,
-                                          updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
-                                        },
-                                      }
-                                    : entry,
-                                ),
-                              )
-                            }
-                            className="accent-[var(--accent)]"
-                          />
-                        </label>
+              <div className="space-y-3">
+                {selectedStation ? (
+                  <>
+                    <div className="rounded-[16px] border border-slate-200 bg-white p-5 shadow-sm">
+                      <div className="font-[var(--font-heading)] text-lg font-semibold text-slate-800">{selectedStation.sourceName}</div>
+                      <div className="mt-1 flex items-center gap-2 text-sm text-[var(--muted)]">
+                        <Database className="h-3 w-3" />
+                        Quelle: {selectedStation.cpoName} · {selectedStation.stationCode}
                       </div>
+                    </div>
 
-                      <label className="grid gap-1 text-sm text-[var(--muted)]">
-                        Admin Note
-                        <textarea
-                          value={selectedStation.override?.adminNote ?? ""}
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                        Display Name
+                        <input
+                          value={selectedStation.override?.displayName ?? ""}
                           onChange={(event) =>
                             setStationResults((current) =>
                               current.map((entry) =>
                                 entry.stationId === selectedStation.stationId
                                   ? {
                                       ...entry,
+                                      effectiveName: event.target.value || entry.sourceName,
                                       override: {
                                         stationId: entry.stationId,
-                                        displayName: entry.override?.displayName ?? null,
+                                        displayName: parseNullableText(event.target.value),
                                         addressLine: entry.override?.addressLine ?? null,
                                         city: entry.override?.city ?? null,
                                         postalCode: entry.override?.postalCode ?? null,
                                         maxPowerKw: entry.override?.maxPowerKw ?? null,
                                         isHidden: entry.override?.isHidden ?? false,
-                                        adminNote: parseNullableText(event.target.value),
+                                        adminNote: entry.override?.adminNote ?? null,
                                         updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
                                       },
                                     }
@@ -974,376 +1433,238 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
                               ),
                             )
                           }
-                          className="min-h-24 rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
+                          className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
                         />
                       </label>
+                      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                        Adresse
+                        <input
+                          value={selectedStation.override?.addressLine ?? ""}
+                          onChange={(event) =>
+                            setStationResults((current) =>
+                              current.map((entry) =>
+                                entry.stationId === selectedStation.stationId
+                                  ? {
+                                      ...entry,
+                                      effectiveAddressLine:
+                                        event.target.value || entry.sourceAddressLine,
+                                      override: {
+                                        stationId: entry.stationId,
+                                        displayName: entry.override?.displayName ?? null,
+                                        addressLine: parseNullableText(event.target.value),
+                                        city: entry.override?.city ?? null,
+                                        postalCode: entry.override?.postalCode ?? null,
+                                        maxPowerKw: entry.override?.maxPowerKw ?? null,
+                                        isHidden: entry.override?.isHidden ?? false,
+                                        adminNote: entry.override?.adminNote ?? null,
+                                        updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                      },
+                                    }
+                                  : entry,
+                              ),
+                            )
+                          }
+                          className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                      </label>
+                      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                        Stadt
+                        <input
+                          value={selectedStation.override?.city ?? ""}
+                          onChange={(event) =>
+                            setStationResults((current) =>
+                              current.map((entry) =>
+                                entry.stationId === selectedStation.stationId
+                                  ? {
+                                      ...entry,
+                                      effectiveCity: event.target.value || entry.sourceCity,
+                                      override: {
+                                        stationId: entry.stationId,
+                                        displayName: entry.override?.displayName ?? null,
+                                        addressLine: entry.override?.addressLine ?? null,
+                                        city: parseNullableText(event.target.value),
+                                        postalCode: entry.override?.postalCode ?? null,
+                                        maxPowerKw: entry.override?.maxPowerKw ?? null,
+                                        isHidden: entry.override?.isHidden ?? false,
+                                        adminNote: entry.override?.adminNote ?? null,
+                                        updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                      },
+                                    }
+                                  : entry,
+                              ),
+                            )
+                          }
+                          className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                      </label>
+                      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                        PLZ
+                        <input
+                          value={selectedStation.override?.postalCode ?? ""}
+                          onChange={(event) =>
+                            setStationResults((current) =>
+                              current.map((entry) =>
+                                entry.stationId === selectedStation.stationId
+                                  ? {
+                                      ...entry,
+                                      effectivePostalCode:
+                                        event.target.value || entry.sourcePostalCode,
+                                      override: {
+                                        stationId: entry.stationId,
+                                        displayName: entry.override?.displayName ?? null,
+                                        addressLine: entry.override?.addressLine ?? null,
+                                        city: entry.override?.city ?? null,
+                                        postalCode: parseNullableText(event.target.value),
+                                        maxPowerKw: entry.override?.maxPowerKw ?? null,
+                                        isHidden: entry.override?.isHidden ?? false,
+                                        adminNote: entry.override?.adminNote ?? null,
+                                        updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                      },
+                                    }
+                                  : entry,
+                              ),
+                            )
+                          }
+                          className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                      </label>
+                      <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                        Max kW
+                        <input
+                          type="number"
+                          value={selectedStation.override?.maxPowerKw ?? ""}
+                          onChange={(event) =>
+                            setStationResults((current) =>
+                              current.map((entry) =>
+                                entry.stationId === selectedStation.stationId
+                                  ? {
+                                      ...entry,
+                                      effectiveMaxPowerKw:
+                                        parseNullableInt(event.target.value) ?? entry.sourceMaxPowerKw,
+                                      override: {
+                                        stationId: entry.stationId,
+                                        displayName: entry.override?.displayName ?? null,
+                                        addressLine: entry.override?.addressLine ?? null,
+                                        city: entry.override?.city ?? null,
+                                        postalCode: entry.override?.postalCode ?? null,
+                                        maxPowerKw: parseNullableInt(event.target.value),
+                                        isHidden: entry.override?.isHidden ?? false,
+                                        adminNote: entry.override?.adminNote ?? null,
+                                        updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                      },
+                                    }
+                                  : entry,
+                              ),
+                            )
+                          }
+                          className="w-full rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                        />
+                      </label>
+                      <label className="flex items-center justify-between rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-800 shadow-sm transition hover:border-[var(--accent)] cursor-pointer">
+                        Verstecken (Nicht anzeigen)
+                        <input
+                          type="checkbox"
+                          checked={selectedStation.override?.isHidden ?? false}
+                          onChange={(event) =>
+                            setStationResults((current) =>
+                              current.map((entry) =>
+                                entry.stationId === selectedStation.stationId
+                                  ? {
+                                      ...entry,
+                                      isHidden: event.target.checked,
+                                      override: {
+                                        stationId: entry.stationId,
+                                        displayName: entry.override?.displayName ?? null,
+                                        addressLine: entry.override?.addressLine ?? null,
+                                        city: entry.override?.city ?? null,
+                                        postalCode: entry.override?.postalCode ?? null,
+                                        maxPowerKw: entry.override?.maxPowerKw ?? null,
+                                        isHidden: event.target.checked,
+                                        adminNote: entry.override?.adminNote ?? null,
+                                        updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                      },
+                                    }
+                                  : entry,
+                              ),
+                            )
+                          }
+                          className="accent-[var(--accent)] h-4 w-4"
+                        />
+                      </label>
+                    </div>
 
-                      {stationError ? (
-                        <div className="rounded-2xl border border-[#e6b8a7] bg-[#fff3ee] px-4 py-3 text-sm text-[#9a3f1b]">
-                          {stationError}
-                        </div>
-                      ) : null}
+                    <label className="grid gap-1.5 text-sm font-medium text-slate-700">
+                      Admin Note
+                      <textarea
+                        value={selectedStation.override?.adminNote ?? ""}
+                        onChange={(event) =>
+                          setStationResults((current) =>
+                            current.map((entry) =>
+                              entry.stationId === selectedStation.stationId
+                                ? {
+                                    ...entry,
+                                    override: {
+                                      stationId: entry.stationId,
+                                      displayName: entry.override?.displayName ?? null,
+                                      addressLine: entry.override?.addressLine ?? null,
+                                      city: entry.override?.city ?? null,
+                                      postalCode: entry.override?.postalCode ?? null,
+                                      maxPowerKw: entry.override?.maxPowerKw ?? null,
+                                      isHidden: entry.override?.isHidden ?? false,
+                                      adminNote: parseNullableText(event.target.value),
+                                      updatedAt: entry.override?.updatedAt ?? new Date().toISOString(),
+                                    },
+                                  }
+                                : entry,
+                            ),
+                          )
+                        }
+                        className="w-full min-h-[100px] rounded-[14px] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+                      />
+                    </label>
 
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          disabled={overrideBusy === selectedStation.stationId}
-                          onClick={handleSaveOverride}
-                          className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm text-white disabled:opacity-60"
-                        >
-                          Override speichern
-                        </button>
-                        <button
-                          type="button"
-                          disabled={overrideBusy === selectedStation.stationId}
-                          onClick={handleClearOverride}
-                          className="rounded-full border border-[var(--line)] px-4 py-2 text-sm"
-                        >
-                          Override entfernen
-                        </button>
+                    {stationError ? (
+                      <div className="rounded-[14px] border border-[#fca5a5] bg-[#fef2f2] px-4 py-3 text-sm font-medium text-[#b91c1c] shadow-sm">
+                        {stationError}
                       </div>
-                    </>
-                  ) : (
-                    <div className="rounded-[24px] border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
-                      Eine Station aus der Suche auswählen, um kuratierte Overrides zu setzen.
+                    ) : null}
+
+                    <div className="flex flex-wrap gap-3 mt-2">
+                      <button
+                        type="button"
+                        disabled={overrideBusy === selectedStation.stationId}
+                        onClick={handleSaveOverride}
+                        className="flex items-center gap-2 rounded-full bg-[var(--accent)] px-5 py-2.5 text-sm font-semibold text-white shadow-md transition hover:bg-[var(--accent-hover)] hover:shadow-lg disabled:opacity-60"
+                      >
+                        <Save className="h-4 w-4" />
+                        Override speichern
+                      </button>
+                      <button
+                        type="button"
+                        disabled={overrideBusy === selectedStation.stationId}
+                        onClick={handleClearOverride}
+                        className="flex items-center gap-2 rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        <Trash2 className="h-4 w-4 text-slate-400" />
+                        Override entfernen
+                      </button>
                     </div>
-                  )}
-                </div>
+                  </>
+                ) : (
+                  <div className="rounded-[24px] border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
+                    Eine Station aus der Suche auswählen, um kuratierte Overrides zu setzen.
+                  </div>
+                )}
               </div>
-            ) : (
-              <div className="rounded-[24px] border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
-                Overrides sind nur aktiv, wenn `APP_DATA_SOURCE=db` gesetzt ist und eine Datenbank verbunden ist.
-              </div>
-            )}
-          </div>
-        </section>
-
-        <aside className="space-y-4">
-          <section className="glass-panel-strong rounded-[30px] p-5">
-            <p className="metric-label mb-2">Ausgewählter Feed</p>
-            {selectedFeed ? (
-              <>
-                <div className="mb-4">
-                  <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
-                    {selectedFeed.name}
-                  </h2>
-                  <p className="mt-1 text-sm text-[var(--muted)]">
-                    {selectedFeed.subscriptionId}
-                  </p>
-                </div>
-
-                <div className="grid gap-3">
-                  <label className="grid gap-1 text-sm text-[var(--muted)]">
-                    CPO-ID
-                    <input
-                      value={selectedFeed.cpoId ?? ""}
-                      onChange={(event) =>
-                        setFeeds((current) =>
-                          current.map((entry) =>
-                            entry.id === selectedFeed.id
-                              ? { ...entry, cpoId: parseNullableText(event.target.value) }
-                              : entry,
-                          ),
-                        )
-                      }
-                      className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                    />
-                  </label>
-
-                  <label className="grid gap-1 text-sm text-[var(--muted)]">
-                    Modus
-                    <select
-                      value={selectedFeed.mode}
-                      onChange={(event) =>
-                        setFeeds((current) =>
-                          current.map((entry) =>
-                            entry.id === selectedFeed.id
-                              ? {
-                                  ...entry,
-                                  mode: event.target.value as FeedConfig["mode"],
-                                }
-                              : entry,
-                          ),
-                        )
-                      }
-                      className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                    >
-                      <option value="push">push</option>
-                      <option value="pull">pull</option>
-                      <option value="hybrid">hybrid</option>
-                    </select>
-                  </label>
-
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label className="grid gap-1 text-sm text-[var(--muted)]">
-                      Pull-Intervall
-                      <input
-                        type="number"
-                        value={selectedFeed.pollIntervalMinutes ?? ""}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? {
-                                    ...entry,
-                                    pollIntervalMinutes: parseNullableInt(event.target.value),
-                                  }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                      />
-                    </label>
-
-                    <label className="grid gap-1 text-sm text-[var(--muted)]">
-                      Reconciliation
-                      <input
-                        type="number"
-                        value={selectedFeed.reconciliationIntervalMinutes ?? ""}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? {
-                                    ...entry,
-                                    reconciliationIntervalMinutes: parseNullableInt(
-                                      event.target.value,
-                                    ),
-                                  }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label className="grid gap-1 text-sm text-[var(--muted)]">
-                      Credential-Ref
-                      <input
-                        value={selectedFeed.credentialRef ?? ""}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? { ...entry, credentialRef: parseNullableText(event.target.value) }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                      />
-                    </label>
-
-                    <label className="grid gap-1 text-sm text-[var(--muted)]">
-                      Webhook-Secret-Ref
-                      <input
-                        value={selectedFeed.webhookSecretRef ?? ""}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? {
-                                    ...entry,
-                                    webhookSecretRef: parseNullableText(event.target.value),
-                                  }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                      Feed aktiv
-                      <input
-                        type="checkbox"
-                        checked={selectedFeed.isActive}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? { ...entry, isActive: event.target.checked }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="accent-[var(--accent)]"
-                      />
-                    </label>
-
-                    <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                      Catalog ingest
-                      <input
-                        type="checkbox"
-                        checked={selectedFeed.ingestCatalog}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? { ...entry, ingestCatalog: event.target.checked }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="accent-[var(--accent)]"
-                      />
-                    </label>
-
-                    <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                      Preis ingest
-                      <input
-                        type="checkbox"
-                        checked={selectedFeed.ingestPrices}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? { ...entry, ingestPrices: event.target.checked }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="accent-[var(--accent)]"
-                      />
-                    </label>
-
-                    <label className="flex items-center justify-between rounded-2xl border border-[var(--line)] bg-white/80 px-4 py-3 text-sm">
-                      Status ingest
-                      <input
-                        type="checkbox"
-                        checked={selectedFeed.ingestStatus}
-                        onChange={(event) =>
-                          setFeeds((current) =>
-                            current.map((entry) =>
-                              entry.id === selectedFeed.id
-                                ? { ...entry, ingestStatus: event.target.checked }
-                                : entry,
-                            ),
-                          )
-                        }
-                        className="accent-[var(--accent)]"
-                      />
-                    </label>
-                  </div>
-
-                  <label className="grid gap-1 text-sm text-[var(--muted)]">
-                    Notizen
-                    <textarea
-                      value={selectedFeed.notes}
-                      onChange={(event) =>
-                        setFeeds((current) =>
-                          current.map((entry) =>
-                            entry.id === selectedFeed.id
-                              ? { ...entry, notes: event.target.value }
-                              : entry,
-                          ),
-                        )
-                      }
-                      className="min-h-24 rounded-2xl border border-[var(--line)] bg-white/90 px-3 py-2 text-slate-900"
-                    />
-                  </label>
-                </div>
-
-                <div className="mt-4 grid gap-3 text-sm">
-                  <div className="rounded-2xl bg-[var(--surface)] px-4 py-3">
-                    <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                      Letzte Fehlermeldung
-                    </div>
-                    <div className="mt-1 text-slate-700">
-                      {selectedFeed.lastErrorMessage ?? "Keine"}
-                    </div>
-                  </div>
-                  <div className="rounded-2xl bg-[var(--surface)] px-4 py-3">
-                    <div className="text-xs uppercase tracking-[0.18em] text-[var(--muted)]">
-                      Cursor State
-                    </div>
-                    <div className="mt-1 break-all font-mono text-xs text-slate-700">
-                      {selectedFeed.cursorState
-                        ? JSON.stringify(selectedFeed.cursorState)
-                        : "leer"}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 flex flex-wrap gap-2 text-sm">
-                  <button
-                    type="button"
-                    disabled={busyId === selectedFeed.id}
-                    onClick={() => handleSave(selectedFeed)}
-                    className="rounded-full bg-[var(--accent)] px-4 py-2 text-white disabled:opacity-60"
-                  >
-                    Speichern
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyId === selectedFeed.id}
-                    onClick={() => handleAction(selectedFeed.id, "test")}
-                    className="rounded-full border border-[var(--line)] px-4 py-2"
-                  >
-                    Testen
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyId === selectedFeed.id}
-                    onClick={() => handleAction(selectedFeed.id, "sync")}
-                    className="rounded-full border border-[var(--line)] px-4 py-2"
-                  >
-                    Sync
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busyId === selectedFeed.id}
-                    onClick={() => handleDelete(selectedFeed.id)}
-                    className="rounded-full border border-[#d8b3a0] px-4 py-2 text-[#9c4110]"
-                  >
-                    Entfernen
-                  </button>
-                </div>
-              </>
-            ) : (
-              <p className="text-sm text-[var(--muted)]">
-                Wähle links einen Feed aus, um Details zu bearbeiten.
-              </p>
-            )}
-          </section>
-
-          <section className="glass-panel-strong rounded-[30px] p-5">
-            <p className="metric-label mb-2">Status & Fehler</p>
-            <h2 className="font-[var(--font-heading)] text-2xl font-semibold tracking-[-0.04em]">
-              Letzte Läufe
-            </h2>
-            <div className="mt-4 space-y-3">
-              {(selectedFeedRuns.length ? selectedFeedRuns : syncRuns.slice(0, 8)).map((run) => (
-                <div
-                  key={run.id}
-                  className="rounded-[24px] border border-[var(--line)] bg-white/80 p-4"
-                >
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <div>
-                      <strong>{run.kind}</strong>
-                      <p className="text-xs text-[var(--muted)]">{run.feedId}</p>
-                    </div>
-                    <span className={`rounded-full px-3 py-1 text-xs ${statusTone(run.status)}`}>
-                      {run.status}
-                    </span>
-                  </div>
-                  <p className="text-sm text-slate-700">{run.message}</p>
-                  <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
-                    <span>{new Date(run.startedAt).toLocaleString("de-DE")}</span>
-                    <span>Delta {run.deltaCount}</span>
-                  </div>
-                </div>
-              ))}
             </div>
-          </section>
-        </aside>
+          ) : (
+            <div className="rounded-[24px] border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
+              Overrides sind nur aktiv, wenn `APP_DATA_SOURCE=db` gesetzt ist und eine Datenbank verbunden ist.
+            </div>
+          )}
+        </section>
+          </div>
+        )}
       </div>
     </div>
   );
