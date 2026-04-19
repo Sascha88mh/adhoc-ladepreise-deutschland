@@ -309,6 +309,11 @@ function parseStationCatalog(
       authenticationAndIdentificationMethods?: Array<{ value?: string }>;
       numberOfRefillPoints?: number;
       totalMaximumPower?: number;
+      // Vaylens puts locationReference here instead of at the site level
+      locationReference?: {
+        locAreaLocation?: LocationBlock;
+        locPointLocation?: LocationBlock;
+      };
       refillPoint?: Array<{
         aegiElectricChargingPoint?: {
           idG?: string;
@@ -336,7 +341,15 @@ function parseStationCatalog(
       }>;
     }>;
   }): ParsedStationCatalog[] {
-  const { coords: coordinates, address } = resolveLocationRef(site.locationReference);
+  // Tesla-style: locationReference on the site itself.
+  // Vaylens-style: locationReference on each energyInfrastructureStation instead.
+  const siteLocation = resolveLocationRef(site.locationReference);
+  const firstStation = site.energyInfrastructureStation?.[0];
+  const { coords: coordinates, address } =
+    siteLocation.coords != null && siteLocation.address != null
+      ? siteLocation
+      : resolveLocationRef(firstStation?.locationReference);
+
   const latitude = coordinates?.latitude;
   const longitude = coordinates?.longitude;
 

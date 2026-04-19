@@ -321,8 +321,22 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 ### `Unexpected token … in JSON`
 → Payload kam truncated an. Historisch: `maxContentLength` zu klein. Aktueller Default 200 MB; falls das überschritten wird, in `client.ts` anpassen.
 
-### Parser produziert keine/leere `catalog`-Einträge
-→ Adressen fehlen oder Koordinaten fehlen. `parser.ts:parseStationCatalog` überspringt Sites ohne `coordinates` oder `address`. Raw-Payload in `raw_feed_payloads` ansehen (bei Truncation die Preview) und DATEX-II-Struktur mit den erwarteten Pfaden vergleichen.
+### Parser produziert keine/leere `catalog`-Einträge (0 Stationen verarbeitet)
+→ Koordinaten oder Adresse fehlen. Zwei häufige Ursachen:
+
+**a) `locationReference` auf Station-Ebene statt Site-Ebene (Vaylens-Muster)**
+
+Tesla legt `locationReference` direkt auf `energyInfrastructureSite`. Vaylens legt es auf `energyInfrastructureStation` (eine Ebene tiefer). Der Parser (ab 2026-04-19) prüft automatisch beide Stellen — falls ein neuer CPO weiterhin 0 Stationen liefert, zuerst in `raw_feed_payloads.__preview_head` prüfen ob `locationReference` in der Payload existiert und auf welcher Ebene.
+
+```sql
+SELECT payload->>'__preview_head' FROM raw_feed_payloads rfp
+JOIN feed_configs fc ON fc.id = rfp.feed_id
+WHERE fc.name ILIKE '%<cpo>%' ORDER BY rfp.id DESC LIMIT 1;
+```
+
+**b) `locLocationExtensionG` hat falsch-benanntes Adress-Feld**
+
+Der Parser sucht `FacilityLocation` (Großbuchstabe) und `facilityLocation` (klein). Wenn ein CPO einen anderen Key verwendet, muss `resolveLocationRef` in [parser.ts](../packages/shared/src/mobilithek/parser.ts) erweitert werden.
 
 ### Test-Sync grün, produktiver Sync schreibt keine Stationen
 → Fast immer: `is_active = false` oder `ingest_catalog = false` und/oder der CPO existiert nicht in `cpos`. FK-Constraint würde sonst werfen.
@@ -337,6 +351,42 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 
 ---
 
-## 9. Änderungshistorie dieser Doku
+## 9. CPO-spezifische Besonderheiten
 
-- **2026-04-19** — Initiale Fassung nach Vaylens-Onboarding und Tesla-Stale-Vorfall. Fail-Fast-Cert, Parallel-Cycle, Payload-Truncation, `app_secrets`-Migration.
+Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für jeden CPO.
+
+### Tesla
+- Credentials: PEM-Paar (`TESLA_CLIENT_CERT` + `TESLA_CLIENT_KEY`) in `app_secrets`. **Nicht** die globale `.p12`.
+- `locationReference` liegt auf `energyInfrastructureSite`-Ebene (Standard).
+- Static-Interval: 1440 Min (täglich). Dynamic: Push + Fallback 5 Min.
+
+### Vaylens
+- Credentials: globale `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` in `app_secrets`.
+- **`locationReference` liegt auf `energyInfrastructureStation`-Ebene**, nicht auf Site-Ebene. Parser fällt automatisch dorthin zurück.
+- Payload-Größe: ~75 MB (Stand April 2026). Wird im Ingest-Cycle auf 512 KB Preview gekürzt, der Parser bekommt aber die volle Payload.
+- Vaylens ist ein NAP (National Access Point) und liefert Daten **vieler CPOs** (enercity, iSE, …) unter einer einzigen Subscription. `cpo_id` kommt aus `externalIdentifier[0].identifier` des Operators im Feed.
+- Dynamic-Feed: Push-only (kein Fallback-Interval) — läuft nur, wenn Mobilithek aktiv pusht.
+- `unsupported Unicode escape sequence`: Vaylens-Payloads enthielten ungültige `\u`-Escapes. Sanitizer in `parser.ts` behebt das seit 2026-04-19 automatisch.
+
+### EnBW / EAAZE
+- Noch nicht in Produktion. Beim Einpflegen §3 folgen; vermutlich globales `MOBILITHEK_*`-Cert ausreichend.
+
+---
+
+## 10. Bekannte Fallen für neue Agenten
+
+| Falle | Symptom | Lösung |
+|-------|---------|--------|
+| `app_secrets`-INSERT vergessen | „Kein Mobilithek-Client-Zertifikat" für Feeds ohne Netlify-Env-Var | INSERT für `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` — Werte in §3.3 |
+| `description`-Spalte fehlt in `app_secrets` | SQL-Fehler beim INSERT mit `description` | Die Spalte existiert nur wenn Migration 002 mit der aktuellen Datei lief. INSERT ohne `description` funktioniert immer |
+| Advisory Lock hängt (pgBouncer Transaction Mode) | Feed stale, FEHLER=Keine, Lock-belegt-Einträge in sync_runs | Seit 2026-04-19 `pg_try_advisory_xact_lock` — Locks lösen sich beim Commit/Rollback |
+| `0 Stationen verarbeitet` bei neuem CPO | Feed sync grün, aber keine Marker auf Karte | `locationReference` prüfen — ist sie auf Site- oder Station-Ebene? Troubleshooting §7 |
+| Payload > 200 MB | axios-Timeout oder silent truncation | `MAX_RESPONSE_BYTES` in `client.ts` hochsetzen (aktuell 200 MB) |
+| `APP_DATA_SOURCE` nicht gesetzt | DB-Fallback für Credentials wird übersprungen | Netlify Env: `APP_DATA_SOURCE=db` setzen |
+
+---
+
+## 11. Änderungshistorie dieser Doku
+
+- **2026-04-19 v2** — CPO-Besonderheiten (§9), Fallen-Tabelle (§10), Troubleshooting für Vaylens `locationReference`-Muster und `app_secrets`-Fallen.
+- **2026-04-19 v1** — Initiale Fassung nach Vaylens-Onboarding und Tesla-Stale-Vorfall. Fail-Fast-Cert, Parallel-Cycle, Payload-Truncation, `app_secrets`-Migration.
