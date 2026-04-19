@@ -5,3 +5,12 @@ dist
 coverage
 *.tsbuildinfo
 .DS_Store
+
+# Local Netlify folder
+.netlify
+
+# Secrets — never commit certificates
+certs/
+*.p12
+*.pem
+*.key

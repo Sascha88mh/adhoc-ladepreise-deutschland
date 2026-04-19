@@ -18,9 +18,9 @@
       "credentialRef": "TESLA",
       "webhookSecretRef": null,
       "notes": "Tesla static AFIR Feed mit echter Subscription-ID aus Mobilithek. Pull-Zugriff ueber den von Mobilithek angezeigten Subscription-Endpunkt.",
-      "lastSuccessAt": "2026-04-18T12:18:41.488Z",
-      "lastSnapshotAt": null,
-      "lastDeltaCount": 0,
+      "lastSuccessAt": "2026-04-18T13:29:27.777Z",
+      "lastSnapshotAt": "2026-04-18T13:29:27.777Z",
+      "lastDeltaCount": 5,
       "errorRate": 0,
       "cursorState": null,
       "lastErrorMessage": null,
@@ -44,9 +44,9 @@
       "credentialRef": "TESLA",
       "webhookSecretRef": null,
       "notes": "Tesla dynamic AFIR Feed mit echter Subscription-ID aus Mobilithek. Aktuell ist der Push in Mobilithek noch auf die alte Netlify-Webhook-URL konfiguriert und muss fuer echte Live-Tests auf die aktuelle Admin-Webhook-Route umgestellt werden.",
-      "lastSuccessAt": "2026-04-18T12:18:41.482Z",
-      "lastSnapshotAt": null,
-      "lastDeltaCount": 0,
+      "lastSuccessAt": "2026-04-18T13:32:42.315Z",
+      "lastSnapshotAt": "2026-04-18T13:32:42.315Z",
+      "lastDeltaCount": 5,
       "errorRate": 0,
       "cursorState": null,
       "lastErrorMessage": null,
@@ -158,6 +158,26 @@
     }
   ],
   "syncRuns": [
+    {
+      "id": "tesla-dynamic-afir-1776514631989-1776519162318",
+      "feedId": "tesla-dynamic-afir-1776514631989",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-18T13:32:42.315Z",
+      "finishedAt": "2026-04-18T13:32:42.318Z",
+      "message": "Manueller Sync abgeschlossen",
+      "deltaCount": 5
+    },
+    {
+      "id": "tesla-static-afir-1776514631996-1776518967782",
+      "feedId": "tesla-static-afir-1776514631996",
+      "kind": "manual",
+      "status": "success",
+      "startedAt": "2026-04-18T13:29:27.777Z",
+      "finishedAt": "2026-04-18T13:29:27.781Z",
+      "message": "Manueller Sync abgeschlossen",
+      "deltaCount": 5
+    },
     {
       "id": "tesla-static-afir-1776514631996-1776514721489",
       "feedId": "tesla-static-afir-1776514631996",

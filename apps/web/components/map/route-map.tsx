@@ -47,9 +47,16 @@ export type MapMode = "light" | "dark" | "color" | "satellite";
 type Props = {
   route: RoutePlan;
   candidates: RouteCandidate[];
+  browseCandidates: RouteCandidate[];
   selectedStationId: string | null;
   hoveredStationId: string | null;
-  onSelect: (stationId: string) => void;
+  onSelect: (stationId: string | null) => void;
+  onViewportChange?: (bounds: {
+    minLat: number;
+    minLng: number;
+    maxLat: number;
+    maxLng: number;
+  }) => void;
   mapMode: MapMode;
 };
 
@@ -111,6 +118,29 @@ function candidateCollection(candidates: RouteCandidate[]) {
   };
 }
 
+function browseCollection(
+  browseCandidates: RouteCandidate[],
+  highlightedIds: Set<string>,
+) {
+  return {
+    type: "FeatureCollection" as const,
+    features: browseCandidates
+      .filter((candidate) => !highlightedIds.has(candidate.stationId))
+      .map((candidate) => ({
+        type: "Feature" as const,
+        geometry: {
+          type: "Point" as const,
+          coordinates: [candidate.lng, candidate.lat],
+        },
+        properties: {
+          id: candidate.stationId,
+          available: candidate.availabilitySummary.available,
+          power: candidate.maxPowerKw,
+        },
+      })),
+  };
+}
+
 function routeCollection(route: RoutePlan) {
   return {
     type: "FeatureCollection" as const,
@@ -131,10 +161,11 @@ function routeCollection(route: RoutePlan) {
 
 function selectedCollection(
   candidates: RouteCandidate[],
+  browseCandidates: RouteCandidate[],
   selectedStationId: string | null,
   hoveredStationId: string | null,
 ) {
-  const highlighted = candidates.find(
+  const highlighted = [...candidates, ...browseCandidates].find(
     (candidate) =>
       candidate.stationId === selectedStationId ||
       candidate.stationId === hoveredStationId,
@@ -255,6 +286,13 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
     });
   }
 
+  if (!map.getSource("browse")) {
+    map.addSource("browse", {
+      type: "geojson",
+      data: emptyCollection(),
+    });
+  }
+
   if (!map.getSource("selected")) {
     map.addSource("selected", {
       type: "geojson",
@@ -290,6 +328,33 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
       paint: {
         "line-color": palette.line,
         "line-width": 5,
+      },
+    });
+  }
+
+  if (!map.getLayer("browse-circles")) {
+    map.addLayer({
+      id: "browse-circles",
+      type: "circle",
+      source: "browse",
+      paint: {
+        "circle-color": [
+          "case",
+          [">", ["get", "available"], 0],
+          "#2f8577",
+          "#d09a4a",
+        ],
+        "circle-radius": [
+          "case",
+          [">=", ["get", "power"], 250],
+          8,
+          [">=", ["get", "power"], 150],
+          7,
+          5.5,
+        ],
+        "circle-opacity": 0.72,
+        "circle-stroke-width": 1.6,
+        "circle-stroke-color": palette.candidateStroke,
       },
     });
   }
@@ -366,6 +431,7 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
 
   map.setPaintProperty("route-glow", "line-color", palette.glow);
   map.setPaintProperty("route-line", "line-color", palette.line);
+  map.setPaintProperty("browse-circles", "circle-stroke-color", palette.candidateStroke);
   map.setPaintProperty("candidate-circles", "circle-stroke-color", palette.candidateStroke);
   map.setPaintProperty("selected-circle", "circle-color", palette.selectedFill);
   map.setPaintProperty("selected-circle", "circle-stroke-color", palette.selectedStroke);
@@ -378,6 +444,7 @@ function syncMapData(
   map: Map,
   route: RoutePlan,
   candidates: RouteCandidate[],
+  browseCandidates: RouteCandidate[],
   selectedStationId: string | null,
   hoveredStationId: string | null,
 ) {
@@ -389,8 +456,21 @@ function syncMapData(
   updateSource(map, "candidates", candidateCollection(candidates));
   updateSource(
     map,
+    "browse",
+    browseCollection(
+      browseCandidates,
+      new Set(candidates.map((candidate) => candidate.stationId)),
+    ),
+  );
+  updateSource(
+    map,
     "selected",
-    selectedCollection(candidates, selectedStationId, hoveredStationId),
+    selectedCollection(
+      candidates,
+      browseCandidates,
+      selectedStationId,
+      hoveredStationId,
+    ),
   );
   updateSource(map, "focus", focusCollection(route));
 }
@@ -429,9 +509,11 @@ function fitMapToContent(map: Map, route: RoutePlan, candidates: RouteCandidate[
 export function RouteMap({
   route,
   candidates,
+  browseCandidates,
   selectedStationId,
   hoveredStationId,
   onSelect,
+  onViewportChange,
   mapMode,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -439,21 +521,28 @@ export function RouteMap({
   const onSelectRef = useRef(onSelect);
   const routeRef = useRef(route);
   const candidatesRef = useRef(candidates);
+  const browseCandidatesRef = useRef(browseCandidates);
   const selectedStationIdRef = useRef(selectedStationId);
   const hoveredStationIdRef = useRef(hoveredStationId);
   const mapModeRef = useRef(mapMode);
+  const onViewportChangeRef = useRef(onViewportChange);
 
   useEffect(() => {
     onSelectRef.current = onSelect;
   }, [onSelect]);
 
   useEffect(() => {
+    onViewportChangeRef.current = onViewportChange;
+  }, [onViewportChange]);
+
+  useEffect(() => {
     routeRef.current = route;
     candidatesRef.current = candidates;
+    browseCandidatesRef.current = browseCandidates;
     selectedStationIdRef.current = selectedStationId;
     hoveredStationIdRef.current = hoveredStationId;
     mapModeRef.current = mapMode;
-  }, [route, candidates, selectedStationId, hoveredStationId, mapMode]);
+  }, [route, candidates, browseCandidates, selectedStationId, hoveredStationId, mapMode]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -485,6 +574,7 @@ export function RouteMap({
         map,
         currentRoute,
         currentCandidates,
+        browseCandidatesRef.current,
         selectedStationIdRef.current,
         hoveredStationIdRef.current,
       );
@@ -493,6 +583,15 @@ export function RouteMap({
     };
 
     map.on("load", renderCurrentState);
+    map.on("load", () => {
+      const bounds = map.getBounds();
+      onViewportChangeRef.current?.({
+        minLat: bounds.getSouth(),
+        minLng: bounds.getWest(),
+        maxLat: bounds.getNorth(),
+        maxLng: bounds.getEast(),
+      });
+    });
     map.on("click", "candidate-circles", (event) => {
       const feature = event.features?.[0];
       const id = feature?.properties?.id;
@@ -506,6 +605,38 @@ export function RouteMap({
     });
     map.on("mouseleave", "candidate-circles", () => {
       map.getCanvas().style.cursor = "";
+    });
+    map.on("click", "browse-circles", (event) => {
+      const feature = event.features?.[0];
+      const id = feature?.properties?.id;
+
+      if (typeof id === "string") {
+        onSelectRef.current(id);
+      }
+    });
+    map.on("click", (event) => {
+      const features = map.queryRenderedFeatures(event.point, {
+        layers: ["candidate-circles", "browse-circles"],
+      });
+
+      if (features.length === 0) {
+        onSelectRef.current(null);
+      }
+    });
+    map.on("mouseenter", "browse-circles", () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", "browse-circles", () => {
+      map.getCanvas().style.cursor = "";
+    });
+    map.on("moveend", () => {
+      const bounds = map.getBounds();
+      onViewportChangeRef.current?.({
+        minLat: bounds.getSouth(),
+        minLng: bounds.getWest(),
+        maxLat: bounds.getNorth(),
+        maxLng: bounds.getEast(),
+      });
     });
 
     return () => {
@@ -523,9 +654,14 @@ export function RouteMap({
 
     const apply = () => {
       ensureOperationalLayers(map, mapMode);
-      syncMapData(map, route, candidates, selectedStationId, hoveredStationId);
-
-      fitMapToContent(map, route, candidates);
+      syncMapData(
+        map,
+        route,
+        candidates,
+        browseCandidates,
+        selectedStationId,
+        hoveredStationId,
+      );
     };
 
     if (!map.isStyleLoaded()) {
@@ -533,7 +669,7 @@ export function RouteMap({
     }
 
     apply();
-  }, [route, candidates, selectedStationId, hoveredStationId, mapMode]);
+  }, [route, candidates, browseCandidates, selectedStationId, hoveredStationId, mapMode]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -544,9 +680,15 @@ export function RouteMap({
 
     mapModeRef.current = mapMode;
     map.setStyle(mapStyleForMode(mapMode));
+    let cancelled = false;
 
-    const handleStyleData = () => {
+    const rehydrateStyle = () => {
+      if (cancelled) {
+        return;
+      }
+
       if (!map.isStyleLoaded()) {
+        requestAnimationFrame(rehydrateStyle);
         return;
       }
 
@@ -555,20 +697,28 @@ export function RouteMap({
         map,
         routeRef.current,
         candidatesRef.current,
+        browseCandidatesRef.current,
         selectedStationIdRef.current,
         hoveredStationIdRef.current,
       );
-
-      fitMapToContent(map, routeRef.current, candidatesRef.current);
-      map.off("styledata", handleStyleData);
     };
 
-    map.on("styledata", handleStyleData);
+    requestAnimationFrame(rehydrateStyle);
 
     return () => {
-      map.off("styledata", handleStyleData);
+      cancelled = true;
     };
   }, [mapMode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+
+    if (!map || !map.isStyleLoaded()) {
+      return;
+    }
+
+    fitMapToContent(map, route, candidates);
+  }, [route.routeId]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

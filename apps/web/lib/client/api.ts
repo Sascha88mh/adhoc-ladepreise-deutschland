@@ -1,6 +1,7 @@
 import {
   adminStationRecordSchema,
   publicLocationSuggestionsResponseSchema,
+  publicMapStationsResponseSchema,
   publicCandidatesResponseSchema,
   publicReverseLocationResponseSchema,
   publicRoutePlanResponseSchema,
@@ -96,6 +97,18 @@ export async function fetchRouteCandidates(payload: {
   });
 
   return publicCandidatesResponseSchema.parse(response).data;
+}
+
+export async function fetchMapStations(payload: {
+  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number };
+  filters: CandidateFilters;
+}) {
+  const response = await requestJson<unknown>("/api/public/stations/map", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  return publicMapStationsResponseSchema.parse(response).data;
 }
 
 export async function fetchStationDetail(stationId: string): Promise<StationDetail> {

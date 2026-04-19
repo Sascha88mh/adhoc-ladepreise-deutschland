@@ -32,6 +32,24 @@ function bestTariff(station: StationRecord) {
   })[0];
 }
 
+function fallbackTariff(station: StationRecord): TariffSummary {
+  return {
+    id: `${station.stationId}-no-tariff`,
+    label: "Preis nicht gemeldet",
+    currency: "EUR",
+    pricePerKwh: null,
+    pricePerMinute: null,
+    sessionFee: null,
+    preauthAmount: null,
+    blockingFeePerMinute: null,
+    blockingFeeStartsAfterMinutes: null,
+    caps: [],
+    paymentMethods: station.paymentMethods,
+    brandsAccepted: [],
+    isComplete: false,
+  };
+}
+
 function isFreshEnough(isoTimestamp: string, limitMinutes?: number) {
   if (!limitMinutes) {
     return true;
@@ -78,6 +96,93 @@ function detourMinutes(distanceKm: number, maxPowerKw: number) {
   return maxPowerKw >= 250 ? Math.max(2, base - 1) : base;
 }
 
+function hasPriceSensitiveFilters(filters: CandidateFilters) {
+  return (
+    filters.maxPriceKwh !== undefined ||
+    filters.onlyCompletePrices === true ||
+    (filters.paymentMethods?.length ?? 0) > 0 ||
+    filters.allowSessionFee === false ||
+    filters.allowBlockingFee === false
+  );
+}
+
+function matchingTariff(station: StationRecord, filters: CandidateFilters) {
+  return (
+    station.tariffs.find((tariff) => includeTariff(tariff, filters)) ??
+    (!hasPriceSensitiveFilters(filters) ? fallbackTariff(station) : null)
+  );
+}
+
+function stationMatchesFilters(
+  station: StationRecord,
+  filters: CandidateFilters,
+  candidateTariff: TariffSummary | null,
+) {
+  if (!candidateTariff) {
+    return false;
+  }
+
+  if (filters.currentTypes?.length) {
+    const set = new Set(station.currentTypes);
+    if (!filters.currentTypes.every((type) => set.has(type))) {
+      return false;
+    }
+  }
+
+  if (filters.cpoIds?.length && !filters.cpoIds.includes(station.cpoId)) {
+    return false;
+  }
+
+  if (filters.minPowerKw && station.maxPowerKw < filters.minPowerKw) {
+    return false;
+  }
+
+  if (filters.minChargePointCount && station.chargePointCount < filters.minChargePointCount) {
+    return false;
+  }
+
+  if (filters.availableOnly && station.availabilitySummary.available === 0) {
+    return false;
+  }
+
+  return (
+    isFreshEnough(station.lastStatusUpdateAt, filters.freshWithinMinutes) &&
+    isFreshEnough(station.lastPriceUpdateAt, filters.freshWithinMinutes)
+  );
+}
+
+function mapStationCandidate(
+  station: StationRecord,
+  tariff: TariffSummary,
+  overrides?: Partial<Pick<RouteCandidate, "distanceFromRouteKm" | "detourMinutes">>,
+) {
+  return routeCandidateSchema.parse({
+    stationId: station.stationId,
+    stationName: station.name,
+    cpoId: station.cpoId,
+    cpoName: station.cpoName,
+    lat: station.coordinates.lat,
+    lng: station.coordinates.lng,
+    addressLine: station.addressLine,
+    city: station.city,
+    distanceFromRouteKm: overrides?.distanceFromRouteKm ?? 0,
+    detourMinutes: overrides?.detourMinutes ?? 0,
+    maxPowerKw: station.maxPowerKw,
+    chargePointCount: station.chargePointCount,
+    currentTypes: station.currentTypes,
+    connectorTypes: station.connectorTypes,
+    availabilitySummary: station.availabilitySummary,
+    tariffSummary: tariff,
+    paymentMethods: Array.from(new Set([...station.paymentMethods, ...tariff.paymentMethods])),
+    lastPriceUpdateAt: station.lastPriceUpdateAt,
+    lastStatusUpdateAt: station.lastStatusUpdateAt,
+    freshnessMinutes: Math.max(
+      0,
+      Math.round((Date.now() - new Date(station.lastStatusUpdateAt).getTime()) / 60_000),
+    ),
+  });
+}
+
 export function findCandidatesForRoute(
   route: RoutePlan,
   filters: CandidateFilters = {},
@@ -86,7 +191,7 @@ export function findCandidatesForRoute(
   const candidates = stations
     .map((station) => {
       const distanceKm = distanceFromRouteKm(route.geometry, station.coordinates);
-      const candidateTariff = station.tariffs.find((tariff) => includeTariff(tariff, filters)) ?? null;
+      const candidateTariff = matchingTariff(station, filters);
 
       return {
         station,
@@ -99,69 +204,12 @@ export function findCandidatesForRoute(
         return false;
       }
 
-      if (!candidateTariff) {
-        return false;
-      }
-
-      if (filters.currentTypes?.length) {
-        const set = new Set(station.currentTypes);
-        if (!filters.currentTypes.every((type) => set.has(type))) {
-          return false;
-        }
-      }
-
-      if (filters.cpoIds?.length && !filters.cpoIds.includes(station.cpoId)) {
-        return false;
-      }
-
-      if (filters.minPowerKw && station.maxPowerKw < filters.minPowerKw) {
-        return false;
-      }
-
-      if (filters.minChargePointCount && station.chargePointCount < filters.minChargePointCount) {
-        return false;
-      }
-
-      if (filters.availableOnly && station.availabilitySummary.available === 0) {
-        return false;
-      }
-
-      return (
-        isFreshEnough(station.lastStatusUpdateAt, filters.freshWithinMinutes) &&
-        isFreshEnough(station.lastPriceUpdateAt, filters.freshWithinMinutes)
-      );
+      return stationMatchesFilters(station, filters, candidateTariff);
     })
     .map(({ station, distanceKm, candidateTariff }) => {
-      const tariff = candidateTariff!;
-
-      return routeCandidateSchema.parse({
-        stationId: station.stationId,
-        stationName: station.name,
-        cpoId: station.cpoId,
-        cpoName: station.cpoName,
-        lat: station.coordinates.lat,
-        lng: station.coordinates.lng,
-        addressLine: station.addressLine,
-        city: station.city,
+      return mapStationCandidate(station, candidateTariff!, {
         distanceFromRouteKm: Number(distanceKm.toFixed(1)),
         detourMinutes: detourMinutes(distanceKm, station.maxPowerKw),
-        maxPowerKw: station.maxPowerKw,
-        chargePointCount: station.chargePointCount,
-        currentTypes: station.currentTypes,
-        connectorTypes: station.connectorTypes,
-        availabilitySummary: station.availabilitySummary,
-        tariffSummary: tariff,
-        paymentMethods: Array.from(
-          new Set([...station.paymentMethods, ...tariff.paymentMethods]),
-        ),
-        lastPriceUpdateAt: station.lastPriceUpdateAt,
-        lastStatusUpdateAt: station.lastStatusUpdateAt,
-        freshnessMinutes: Math.max(
-          0,
-          Math.round(
-            (Date.now() - new Date(station.lastStatusUpdateAt).getTime()) / 60_000,
-          ),
-        ),
       });
     });
 
@@ -209,6 +257,41 @@ export function findCandidatesForRoute(
       max: pricePoints.length ? Math.max(...pricePoints) : null,
     },
   };
+}
+
+export function findStationsInView(
+  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
+  filters: CandidateFilters = {},
+  stations: StationRecord[] = DEMO_STATIONS,
+) {
+  return stations
+    .filter((station) => {
+      const { lat, lng } = station.coordinates;
+      return (
+        lat >= bounds.minLat &&
+        lat <= bounds.maxLat &&
+        lng >= bounds.minLng &&
+        lng <= bounds.maxLng
+      );
+    })
+    .map((station) => {
+      const candidateTariff = matchingTariff(station, filters);
+      return {
+        station,
+        candidateTariff,
+      };
+    })
+    .filter(({ station, candidateTariff }) =>
+      stationMatchesFilters(station, filters, candidateTariff),
+    )
+    .map(({ station, candidateTariff }) => mapStationCandidate(station, candidateTariff!))
+    .sort((left, right) => {
+      if (filters.sort === "power") {
+        return right.maxPowerKw - left.maxPowerKw;
+      }
+
+      return left.stationName.localeCompare(right.stationName);
+    });
 }
 
 export function getStationDetail(stationId: string, stations: StationRecord[] = DEMO_STATIONS): StationDetail | null {

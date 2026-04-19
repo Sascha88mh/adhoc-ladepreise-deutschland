@@ -11,6 +11,7 @@ import type {
   StationDetail,
 } from "@adhoc/shared";
 import {
+  fetchMapStations,
   fetchLocationFocus,
   fetchIpLocation,
   fetchReverseLocation,
@@ -89,6 +90,15 @@ export function RoutePlannerShell({
   initialCpos,
   defaultQuery,
 }: Props) {
+  function effectiveFilters(source: CandidateFilters, mode: SearchQueryState["mode"]) {
+    if (mode === "location") {
+      const { corridorKm, ...rest } = source;
+      return rest;
+    }
+
+    return source;
+  }
+
   const [query, setQuery] = useState<SearchQueryState>({
     mode: "location",
     origin: defaultQuery.origin,
@@ -100,12 +110,10 @@ export function RoutePlannerShell({
   });
   const [route, setRoute] = useState(initialRoute);
   const [mapMode, setMapMode] = useState<MapMode>("light");
-  const [filters, setFilters] = useState<CandidateFilters>({
-    corridorKm: initialRoute.corridorKm,
-    maxPriceKwh: 0.6,
-  });
+  const [filters, setFilters] = useState<CandidateFilters>({});
   const debouncedFilters = useDebouncedValue(filters, 800);
   const [results, setResults] = useState(initialResults);
+  const [browseCandidates, setBrowseCandidates] = useState<RouteCandidate[]>([]);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(
     initialResults.candidates[0]?.stationId ?? null,
   );
@@ -124,13 +132,17 @@ export function RoutePlannerShell({
   const [detailOpen, setDetailOpen] = useState(
     Boolean(initialResults.candidates[0]?.stationId),
   );
-  const activeStationId =
-    (selectedStationId &&
-      results.candidates.some((candidate) => candidate.stationId === selectedStationId)
-      ? selectedStationId
-      : null) ?? results.candidates[0]?.stationId ?? null;
+  const [mapBounds, setMapBounds] = useState<{
+    minLat: number;
+    minLng: number;
+    maxLat: number;
+    maxLng: number;
+  } | null>(null);
+  const mapCandidates = query.mode === "route" ? results.candidates : [];
+  const activeStationId = selectedStationId;
   const activeDetail =
     detail?.stationId === activeStationId ? detail : null;
+  const showRouteCandidatesUi = query.mode === "route";
 
   useEffect(() => {
     let ignore = false;
@@ -140,10 +152,11 @@ export function RoutePlannerShell({
       setError(null);
 
       try {
+        const nextFilters = effectiveFilters(debouncedFilters, query.mode);
         const next = await fetchRouteCandidates({
           routeId: route.routeId,
           polyline: route.geometry,
-          filters: debouncedFilters,
+          filters: nextFilters,
         });
 
         if (ignore) {
@@ -151,7 +164,7 @@ export function RoutePlannerShell({
         }
 
         setResults(next);
-        if (next.candidates.length === 0) {
+        if (!showRouteCandidatesUi || next.candidates.length === 0) {
           setCandidatesOpen(false);
         } else if (pendingCandidateAutoOpen) {
           setCandidatesOpen(true);
@@ -174,7 +187,39 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [route, debouncedFilters, pendingCandidateAutoOpen]);
+  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, showRouteCandidatesUi]);
+
+  useEffect(() => {
+    if (!mapBounds) {
+      return;
+    }
+
+    let ignore = false;
+    const currentBounds = mapBounds;
+
+    async function updateBrowseStations() {
+      try {
+        const next = await fetchMapStations({
+          bounds: currentBounds,
+          filters: effectiveFilters(debouncedFilters, query.mode),
+        });
+
+        if (!ignore) {
+          setBrowseCandidates(next);
+        }
+      } catch {
+        if (!ignore) {
+          setBrowseCandidates([]);
+        }
+      }
+    }
+
+    void updateBrowseStations();
+
+    return () => {
+      ignore = true;
+    };
+  }, [mapBounds, debouncedFilters, query.mode]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -182,11 +227,12 @@ export function RoutePlannerShell({
     }
 
     let ignore = false;
+    const stationId = activeStationId;
 
     async function loadDetail() {
       setDetailLoading(true);
       try {
-        const next = await fetchStationDetail(activeStationId);
+        const next = await fetchStationDetail(stationId);
         if (!ignore) {
           setDetail(next);
         }
@@ -340,9 +386,12 @@ export function RoutePlannerShell({
     }
   }
 
-  function handleSelectStation(stationId: string) {
+  function handleSelectStation(stationId: string | null) {
     setSelectedStationId(stationId);
-    setDetailOpen(true);
+    setDetailOpen(Boolean(stationId));
+    if (!stationId) {
+      setHoveredStationId(null);
+    }
   }
 
   return (
@@ -354,10 +403,12 @@ export function RoutePlannerShell({
       <div className="absolute inset-0 z-0">
         <RouteMap
           route={route}
-          candidates={results.candidates}
+          candidates={mapCandidates}
+          browseCandidates={browseCandidates}
           selectedStationId={activeStationId}
           hoveredStationId={hoveredStationId}
           onSelect={handleSelectStation}
+          onViewportChange={setMapBounds}
           mapMode={mapMode}
         />
       </div>
@@ -385,13 +436,14 @@ export function RoutePlannerShell({
             cpos={initialCpos}
             expanded={filtersOpen}
             onToggle={() => setFiltersOpen((current) => !current)}
+            showCorridorFilter={query.mode === "route"}
           />
         </div>
       </div>
 
       {/* Right Floating Candidate List */}
       <AnimatePresence>
-        {candidatesOpen && (
+        {showRouteCandidatesUi && candidatesOpen && (
           <motion.div
             initial={{ x: 500, opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
@@ -433,7 +485,7 @@ export function RoutePlannerShell({
       </div>
 
       {/* Floating Action Button for Results */}
-      {results.candidates.length > 0 ? (
+      {showRouteCandidatesUi && results.candidates.length > 0 ? (
         <div className="pointer-events-none absolute bottom-28 right-6 z-20 sm:bottom-6">
           <button
             onClick={() => setCandidatesOpen((current) => !current)}
@@ -476,7 +528,11 @@ export function RoutePlannerShell({
       <StationDrawer
         detail={activeDetail}
         open={detailOpen && Boolean(activeStationId)}
-        onClose={() => setDetailOpen(false)}
+        onClose={() => {
+          setDetailOpen(false);
+          setSelectedStationId(null);
+          setHoveredStationId(null);
+        }}
       />
     </div>
   );

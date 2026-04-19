@@ -12,6 +12,7 @@ type Props = {
   cpos: Array<{ id: string; name: string; stations: number }>;
   expanded: boolean;
   onToggle: () => void;
+  showCorridorFilter?: boolean;
 };
 
 const MAX_POWER_KW = 350;
@@ -70,6 +71,7 @@ export function FilterRail({
   cpos,
   expanded,
   onToggle,
+  showCorridorFilter = true,
 }: Props) {
   const summaryChips = [
     ...(filters.currentTypes?.includes("AC") ? ["AC"] : []),
@@ -139,51 +141,56 @@ export function FilterRail({
             className="overflow-hidden"
           >
             <div className="space-y-5 pt-5">
-              <section>
-                <p className="metric-label mb-2">Korridor entlang der Route</p>
-                <input
-                  type="range"
-                  min={1}
-                  max={MAX_CORRIDOR_KM}
-                  step={1}
-                  value={filters.corridorKm ?? DEFAULT_CORRIDOR_KM}
-                  onChange={(event) =>
-                    onChange({
-                      ...filters,
-                      corridorKm: Number(event.target.value),
-                    })
-                  }
-                  className="w-full accent-[var(--accent)]"
-                />
-                <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                  <span>1 km</span>
-                  <strong className="text-[var(--foreground)]">
-                    {(filters.corridorKm ?? DEFAULT_CORRIDOR_KM).toFixed(0)} km
-                  </strong>
-                  <span>{MAX_CORRIDOR_KM} km</span>
-                </div>
-              </section>
+              {showCorridorFilter ? (
+                <section>
+                  <p className="metric-label mb-2">Korridor entlang der Route</p>
+                  <input
+                    type="range"
+                    min={1}
+                    max={MAX_CORRIDOR_KM}
+                    step={1}
+                    value={filters.corridorKm ?? DEFAULT_CORRIDOR_KM}
+                    onChange={(event) =>
+                      onChange({
+                        ...filters,
+                        corridorKm: Number(event.target.value),
+                      })
+                    }
+                    className="w-full accent-[var(--accent)]"
+                  />
+                  <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
+                    <span>1 km</span>
+                    <strong className="text-[var(--foreground)]">
+                      {(filters.corridorKm ?? DEFAULT_CORRIDOR_KM).toFixed(0)} km
+                    </strong>
+                    <span>{MAX_CORRIDOR_KM} km</span>
+                  </div>
+                </section>
+              ) : null}
 
               <section>
                 <p className="metric-label mb-2">Preis pro kWh</p>
                 <input
                   type="range"
-                  min={35}
+                  min={0}
                   max={80}
                   step={1}
-                  value={(filters.maxPriceKwh ?? 60) * 100}
-                  onChange={(event) =>
+                  value={filters.maxPriceKwh != null ? filters.maxPriceKwh * 100 : 0}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
                     onChange({
                       ...filters,
-                      maxPriceKwh: Number(event.target.value) / 100,
-                    })
-                  }
+                      maxPriceKwh: value > 0 ? value / 100 : undefined,
+                    });
+                  }}
                   className="w-full accent-[var(--accent)]"
                 />
                 <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                  <span>0,35 €</span>
+                  <span>egal</span>
                   <strong className="text-[var(--foreground)]">
-                    max. {(filters.maxPriceKwh ?? 0.6).toFixed(2).replace(".", ",")} €
+                    {filters.maxPriceKwh != null
+                      ? `max. ${filters.maxPriceKwh.toFixed(2).replace(".", ",")} €`
+                      : "kein Preislimit"}
                   </strong>
                   <span>0,80 €</span>
                 </div>
@@ -374,8 +381,7 @@ export function FilterRail({
                 type="button"
                 onClick={() =>
                   onChange({
-                    corridorKm: DEFAULT_CORRIDOR_KM,
-                    maxPriceKwh: 0.6,
+                    ...(showCorridorFilter ? { corridorKm: DEFAULT_CORRIDOR_KM } : {}),
                   })
                 }
                 className="w-full rounded-2xl border border-[var(--line)] px-3 py-2 text-sm text-[var(--muted)] transition hover:bg-white/80"

@@ -330,11 +330,33 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
   async function handleAction(feedId: string, action: "test" | "sync") {
     setBusyId(feedId);
     setUiError(null);
+    const startedAt = Date.now();
     try {
       const run = await triggerFeedAction(feedId, action);
       setSyncRuns((current) => [run, ...current]);
-      await refreshSyncRuns();
+      try {
+        await refreshSyncRuns();
+      } catch (error) {
+        console.error("[admin] refreshSyncRuns failed after action", error);
+      }
     } catch (error) {
+      if (action === "sync") {
+        try {
+          const runs = await fetchSyncRuns();
+          setSyncRuns(runs);
+
+          const latestForFeed = runs.find((run) => run.feedId === feedId);
+          if (
+            latestForFeed &&
+            new Date(latestForFeed.startedAt).getTime() >= startedAt - 5_000
+          ) {
+            return;
+          }
+        } catch (refreshError) {
+          console.error("[admin] sync fallback refresh failed", refreshError);
+        }
+      }
+
       setUiError(error instanceof Error ? error.message : "Aktion konnte nicht ausgeführt werden.");
     } finally {
       setBusyId(null);

@@ -55,6 +55,32 @@ function normalizeCurrentType(value: string | undefined): CurrentType {
   return value?.toUpperCase() === "AC" ? "AC" : "DC";
 }
 
+export function sanitizeMobilithekJsonPayload(payload: string) {
+  return payload
+    .replace(/\u0000/g, "")
+    .replace(/\\u0000/gi, "")
+    .replace(/\\u\{([0-9a-fA-F]+)\}/g, (_, hex) => {
+      const codePoint = Number.parseInt(hex, 16);
+      return Number.isNaN(codePoint) ? "" : String.fromCodePoint(codePoint);
+    })
+    .replace(/\\uD[89AB][0-9A-F]{2}(?!\\uD[CDEF][0-9A-F]{2})/gi, "\\uFFFD")
+    .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
+}
+
+function parseMobilithekJson(payload: string): Record<string, unknown> {
+  try {
+    return JSON.parse(payload) as Record<string, unknown>;
+  } catch (error) {
+    const sanitized = sanitizeMobilithekJsonPayload(payload);
+
+    if (sanitized !== payload) {
+      return JSON.parse(sanitized) as Record<string, unknown>;
+    }
+
+    throw error;
+  }
+}
+
 function normalizeStatus(value: string | undefined): ChargePointStatus {
   const normalized = value?.trim().toLowerCase();
 
@@ -410,7 +436,7 @@ function toStationRecord(station: ParsedStationCatalog): StationRecord {
 }
 
 export function parseStaticMobilithekPayload(payload: string | Record<string, unknown>): ParsedStaticFeed {
-  const parsed = typeof payload === "string" ? (JSON.parse(payload) as Record<string, unknown>) : payload;
+  const parsed = typeof payload === "string" ? parseMobilithekJson(payload) : payload;
   const publication = (parsed.payload as {
     aegiEnergyInfrastructureTablePublication?: {
       energyInfrastructureTable?: Array<{
@@ -431,7 +457,7 @@ export function parseStaticMobilithekPayload(payload: string | Record<string, un
 }
 
 export function parseDynamicMobilithekPayload(payload: string | Record<string, unknown>): ParsedDynamicFeed {
-  const parsed = typeof payload === "string" ? (JSON.parse(payload) as Record<string, unknown>) : payload;
+  const parsed = typeof payload === "string" ? parseMobilithekJson(payload) : payload;
   const messageContainer = parsed.messageContainer as
     | {
         payload?: Array<{

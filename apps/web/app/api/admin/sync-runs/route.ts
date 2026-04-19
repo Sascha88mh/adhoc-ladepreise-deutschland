@@ -1,8 +1,18 @@
-import { cleanupStuckSyncRunsDb, usingDatabase } from "@adhoc/shared/db";
+import { cleanupStuckSyncRunsDb, isRetryableDbError, resetPool, usingDatabase } from "@adhoc/shared/db";
 import { listAdminSyncRuns } from "@/lib/server/admin-data";
 
 export async function GET() {
-  return Response.json({ data: await listAdminSyncRuns() });
+  try {
+    return Response.json({ data: await listAdminSyncRuns() });
+  } catch (error) {
+    if (isRetryableDbError(error)) {
+      await resetPool();
+      return Response.json({ data: await listAdminSyncRuns() });
+    }
+
+    const message = error instanceof Error ? error.message : "Sync runs could not be loaded";
+    return Response.json({ error: message }, { status: 500 });
+  }
 }
 
 export async function DELETE() {

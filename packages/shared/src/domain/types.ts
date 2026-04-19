@@ -302,6 +302,10 @@ export const publicCandidatesResponseSchema = z.object({
   }),
 });
 
+export const publicMapStationsResponseSchema = z.object({
+  data: z.array(routeCandidateSchema),
+});
+
 export const stationDetailResponseSchema = z.object({
   data: stationDetailSchema,
 });

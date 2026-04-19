@@ -1,5 +1,6 @@
 import {
   findCandidatesForRoute,
+  findStationsInView,
   getCpoList,
   resolveLocation,
   getStationDetail,
@@ -106,4 +107,11 @@ export async function listCpos() {
 
 export async function loadStationDetail(stationId: string) {
   return getStationDetail(stationId, (await stationRecords()) ?? undefined);
+}
+
+export async function listMapStations(
+  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
+  filters: CandidateFilters,
+) {
+  return findStationsInView(bounds, filters, (await stationRecords()) ?? undefined);
 }

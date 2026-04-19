@@ -11,6 +11,13 @@ type PullResult = {
   lastModified: string | null;
 };
 
+/**
+ * Mobilithek endpoints can return payloads up to ~80 MB (Vaylens static AFIR).
+ * axios defaults to 10 MB which silently truncates big responses, producing
+ * "Unexpected end of JSON" errors downstream. We size generously.
+ */
+const MAX_RESPONSE_BYTES = 200 * 1024 * 1024;
+
 function normalizeRef(ref: string | null) {
   return ref?.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").toUpperCase() ?? null;
 }
@@ -48,7 +55,7 @@ function envValue(ref: string | null, suffix: string) {
   return process.env[`MOBILITHEK_${suffix}`] ?? null;
 }
 
-/** Resolve a credential value: env var first, DB app_secrets table as fallback. */
+/** Resolve a credential value: env var first, then `app_secrets` row (ref-specific → MOBILITHEK_ fallback). */
 async function resolveCredentialValue(ref: string | null, suffix: string): Promise<string | null> {
   const fromEnv = envValue(ref, suffix);
   if (fromEnv) return fromEnv;
@@ -65,7 +72,8 @@ async function resolveCredentialValue(ref: string | null, suffix: string): Promi
   return null;
 }
 
-async function buildAgent(credentialRef: string | null): Promise<https.Agent> {
+async function buildAgent(feed: FeedConfig): Promise<https.Agent> {
+  const credentialRef = feed.credentialRef;
   const cert = await resolveCredentialValue(credentialRef, "CLIENT_CERT");
   const key = await resolveCredentialValue(credentialRef, "CLIENT_KEY");
   const p12 = await resolveCredentialValue(credentialRef, "CERT_P12_BASE64");
@@ -75,6 +83,7 @@ async function buildAgent(credentialRef: string | null): Promise<https.Agent> {
     return new https.Agent({
       cert: cert.replace(/\\n/g, "\n"),
       key: key.replace(/\\n/g, "\n"),
+      keepAlive: true,
     });
   }
 
@@ -82,10 +91,22 @@ async function buildAgent(credentialRef: string | null): Promise<https.Agent> {
     return new https.Agent({
       pfx: Buffer.from(p12, "base64"),
       passphrase: password,
+      keepAlive: true,
     });
   }
 
-  return new https.Agent();
+  // No cert configured. Mobilithek m2m endpoints enforce mTLS at the Azure
+  // gateway and reject cert-less requests with "400 No required SSL certificate
+  // was sent". Fail fast with an actionable message instead of producing that
+  // cryptic error at request time.
+  const refHint = normalizeRef(credentialRef) ?? "MOBILITHEK";
+  throw new Error(
+    `Kein Mobilithek-Client-Zertifikat für Feed "${feed.name}" konfiguriert. ` +
+      `Erwartet: env var ${refHint}_CERT_P12_BASE64 (+ ${refHint}_CERT_PASSWORD) ` +
+      `oder ${refHint}_CLIENT_CERT + ${refHint}_CLIENT_KEY, ` +
+      `oder global MOBILITHEK_CERT_P12_BASE64, ` +
+      `oder ein gleichnamiger Eintrag in der Tabelle app_secrets.`,
+  );
 }
 
 function baseUrl() {
@@ -107,12 +128,18 @@ export function resolveSecretRef(ref: string | null) {
 async function createHttpClient(feed: FeedConfig) {
   return axios.create({
     baseURL: baseUrl(),
-    httpsAgent: await buildAgent(feed.credentialRef),
+    httpsAgent: await buildAgent(feed),
     headers: {
       accept: "application/json",
+      // Per OpenAPI_Spec_982312651690225664.yaml: Accept-Encoding: gzip is REQUIRED
+      // by Mobilithek. Responses are always gzip-compressed; axios/node auto-decompresses.
+      "accept-encoding": "gzip",
       "user-agent": process.env.MOBILITHEK_USER_AGENT ?? "AdhocPlattform/1.0",
     },
-    timeout: 30_000,
+    timeout: Number(process.env.MOBILITHEK_TIMEOUT_MS ?? 60_000),
+    maxContentLength: MAX_RESPONSE_BYTES,
+    maxBodyLength: MAX_RESPONSE_BYTES,
+    decompress: true,
   });
 }
 
@@ -157,9 +184,10 @@ export async function fetchStaticMobilithekPayload(feed: FeedConfig): Promise<st
   try {
     const response = await http.get<string>(target, {
       responseType: "text",
+      transitional: { forcedJSONParsing: false },
     });
 
-    return response.data;
+    return typeof response.data === "string" ? response.data : JSON.stringify(response.data);
   } catch (error) {
     throw mobilithekRequestError(error, target, feed);
   }
@@ -182,10 +210,18 @@ export async function pullDynamicMobilithekPayload(
     const response = await http.get<string>(target, {
       headers: lastModified ? { "if-modified-since": lastModified } : undefined,
       responseType: "text",
+      transitional: { forcedJSONParsing: false },
+      // 204 (no packet) and 304 (not modified) must NOT throw.
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
     });
 
+    // 204 No Content — buffer empty right now, treat same as "no change".
+    if (response.status === 204 || !response.data) {
+      return null;
+    }
+
     return {
-      payload: response.data,
+      payload: typeof response.data === "string" ? response.data : JSON.stringify(response.data),
       lastModified: response.headers["last-modified"] ?? null,
     };
   } catch (error) {

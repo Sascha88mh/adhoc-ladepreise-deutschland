@@ -81,47 +81,53 @@ export function StationDrawer({ detail, open, onClose }: Props) {
             </div>
 
             <div className="mb-5 space-y-3">
-              {detail.tariffs.map((tariff) => (
-                <div key={tariff.id} className="rounded-[24px] border border-[var(--line)] p-4">
-                  <div className="mb-3 flex items-start justify-between gap-3">
-                    <div>
-                      <p className="metric-label mb-1">Tarif</p>
-                      <h4 className="font-semibold">{tariff.label}</h4>
-                    </div>
-                    <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 text-xs text-[var(--accent)]">
-                      {tariff.isComplete ? "vollständig" : "teilweise"}
-                    </span>
-                  </div>
-                  <div className="grid gap-2 text-sm text-[var(--muted)] sm:grid-cols-2">
-                    <p>kWh: {money(tariff.pricePerKwh)}</p>
-                    <p>Minute: {money(tariff.pricePerMinute)}</p>
-                    <p>Start: {money(tariff.sessionFee)}</p>
-                    <p>Preauth: {money(tariff.preauthAmount)}</p>
-                    <p>
-                      Blockiergebühr:{" "}
-                      {tariff.blockingFeePerMinute != null
-                        ? `${money(tariff.blockingFeePerMinute)} / Min.`
-                        : "nicht gemeldet"}
-                    </p>
-                    <p>
-                      Startet nach:{" "}
-                      {tariff.blockingFeeStartsAfterMinutes != null
-                        ? `${tariff.blockingFeeStartsAfterMinutes} Min.`
-                        : "keine Angabe"}
-                    </p>
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                    {tariff.paymentMethods.map((method) => (
-                      <span
-                        key={method}
-                        className="rounded-full bg-white px-2.5 py-1 text-[var(--muted)] shadow-sm"
-                      >
-                        {method}
+              {detail.tariffs.length ? (
+                detail.tariffs.map((tariff) => (
+                  <div key={tariff.id} className="rounded-[24px] border border-[var(--line)] p-4">
+                    <div className="mb-3 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="metric-label mb-1">Tarif</p>
+                        <h4 className="font-semibold">{tariff.label}</h4>
+                      </div>
+                      <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 text-xs text-[var(--accent)]">
+                        {tariff.isComplete ? "vollständig" : "teilweise"}
                       </span>
-                    ))}
+                    </div>
+                    <div className="grid gap-2 text-sm text-[var(--muted)] sm:grid-cols-2">
+                      <p>kWh: {money(tariff.pricePerKwh)}</p>
+                      <p>Minute: {money(tariff.pricePerMinute)}</p>
+                      <p>Start: {money(tariff.sessionFee)}</p>
+                      <p>Preauth: {money(tariff.preauthAmount)}</p>
+                      <p>
+                        Blockiergebühr:{" "}
+                        {tariff.blockingFeePerMinute != null
+                          ? `${money(tariff.blockingFeePerMinute)} / Min.`
+                          : "nicht gemeldet"}
+                      </p>
+                      <p>
+                        Startet nach:{" "}
+                        {tariff.blockingFeeStartsAfterMinutes != null
+                          ? `${tariff.blockingFeeStartsAfterMinutes} Min.`
+                          : "keine Angabe"}
+                      </p>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                      {tariff.paymentMethods.map((method) => (
+                        <span
+                          key={method}
+                          className="rounded-full bg-white px-2.5 py-1 text-[var(--muted)] shadow-sm"
+                        >
+                          {method}
+                        </span>
+                      ))}
+                    </div>
                   </div>
+                ))
+              ) : (
+                <div className="rounded-[24px] border border-dashed border-[var(--line)] bg-white/72 p-4 text-sm text-[var(--muted)]">
+                  Für diesen Standort wurden bisher noch keine Tarifdaten synchronisiert.
                 </div>
-              ))}
+              )}
             </div>
 
             <div className="mb-5 rounded-[24px] border border-[var(--line)] p-4">

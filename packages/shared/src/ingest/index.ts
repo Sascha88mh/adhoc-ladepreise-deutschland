@@ -3,6 +3,7 @@ import type { FeedConfig, SyncRun, TariffSummary } from "../domain/types";
 import {
   parseDynamicMobilithekPayload,
   parseStaticMobilithekPayload,
+  sanitizeMobilithekJsonPayload,
 } from "../mobilithek/parser";
 import type { ParsedStaticFeed, ParsedTariff } from "../mobilithek/types";
 import {
@@ -92,9 +93,27 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unbekannter Fehler";
 }
 
-async function withFeedLock<T>(feedId: string, work: (client: PoolClient) => Promise<T>) {
+function parsePayloadJson(payload: string) {
+  try {
+    return JSON.parse(payload) as Record<string, unknown>;
+  } catch (error) {
+    const sanitized = sanitizeMobilithekJsonPayload(payload);
+
+    if (sanitized !== payload) {
+      return JSON.parse(sanitized) as Record<string, unknown>;
+    }
+
+    throw error;
+  }
+}
+
+async function withFeedLock<T>(
+  feedId: string,
+  work: (client: PoolClient) => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; reason: "busy" }> {
   const client = await getPool().connect();
   const lockKey = hashLockKey(feedId);
+  let acquired = false;
 
   try {
     const lock = await client.query<{ locked: boolean }>(
@@ -103,12 +122,16 @@ async function withFeedLock<T>(feedId: string, work: (client: PoolClient) => Pro
     );
 
     if (!lock.rows[0]?.locked) {
-      throw new Error("Feed wird bereits verarbeitet");
+      return { ok: false, reason: "busy" };
     }
+    acquired = true;
 
-    return await work(client);
+    const value = await work(client);
+    return { ok: true, value };
   } finally {
-    await client.query(`select pg_advisory_unlock($1)`, [lockKey]).catch(() => undefined);
+    if (acquired) {
+      await client.query(`select pg_advisory_unlock($1)`, [lockKey]).catch(() => undefined);
+    }
     client.release();
   }
 }
@@ -156,6 +179,25 @@ async function finishRun(
   );
 }
 
+/**
+ * Maximum raw-payload size (bytes) we persist in full. Bigger payloads are
+ * summarised to avoid blowing up the jsonb column (Vaylens static is ~40 MB).
+ * Override via RAW_PAYLOAD_MAX_BYTES (0 = no limit).
+ */
+const RAW_PAYLOAD_MAX_BYTES = Number(process.env.RAW_PAYLOAD_MAX_BYTES ?? 512 * 1024);
+
+function summarizeLargePayload(payload: string, parsed: Record<string, unknown> | null) {
+  const head = payload.slice(0, 4_000);
+  const tail = payload.length > 8_000 ? payload.slice(-2_000) : "";
+  return {
+    __truncated: true,
+    __size_bytes: Buffer.byteLength(payload, "utf8"),
+    __top_level_keys: parsed ? Object.keys(parsed) : [],
+    __preview_head: head,
+    __preview_tail: tail,
+  };
+}
+
 async function recordPayload(
   client: PoolClient,
   input: {
@@ -165,12 +207,27 @@ async function recordPayload(
     payload: string;
   },
 ) {
-  let value: Record<string, unknown>;
+  const sizeBytes = Buffer.byteLength(input.payload, "utf8");
+  const tooBig = RAW_PAYLOAD_MAX_BYTES > 0 && sizeBytes > RAW_PAYLOAD_MAX_BYTES;
 
-  try {
-    value = JSON.parse(input.payload) as Record<string, unknown>;
-  } catch {
-    value = { raw: input.payload };
+  let storedValue: Record<string, unknown>;
+  let truncated = false;
+
+  if (tooBig) {
+    let parsedTop: Record<string, unknown> | null = null;
+    try {
+      parsedTop = parsePayloadJson(input.payload);
+    } catch {
+      parsedTop = null;
+    }
+    storedValue = summarizeLargePayload(input.payload, parsedTop);
+    truncated = true;
+  } else {
+    try {
+      storedValue = parsePayloadJson(input.payload);
+    } catch {
+      storedValue = { raw: input.payload };
+    }
   }
 
   await client.query(
@@ -179,9 +236,11 @@ async function recordPayload(
         feed_id,
         payload_kind,
         content_type,
-        payload
-      ) values ($1::uuid, $2::uuid, $3, 'application/json', $4::jsonb)`,
-    [input.runId, input.feedId, input.payloadKind, JSON.stringify(value)],
+        payload,
+        payload_size_bytes,
+        truncated
+      ) values ($1::uuid, $2::uuid, $3, 'application/json', $4::jsonb, $5, $6)`,
+    [input.runId, input.feedId, input.payloadKind, JSON.stringify(storedValue), sizeBytes, truncated],
   );
 }
 
@@ -411,7 +470,7 @@ async function upsertStaticCatalog(
         coalesce(string_to_array(nullif(t.cur_types, ''), '|'), '{}'::text[]),
         coalesce(string_to_array(nullif(t.conn_types, ''), '|'), '{}'::text[]),
         coalesce(string_to_array(nullif(t.pay_methods, ''), '|'), '{}'::text[]),
-        0, 0, 0, t.cp_count, now(), now(), now()
+        0, 0, 0, t.cp_count, null, null, now()
       from unnest(
         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
         $8::float8[], $9::float8[],
@@ -427,7 +486,7 @@ async function upsertStaticCatalog(
             geom = excluded.geom, charge_point_count = excluded.charge_point_count,
             max_power_kw = excluded.max_power_kw, current_types = excluded.current_types,
             connector_types = excluded.connector_types, payment_methods = excluded.payment_methods,
-            unknown_count = excluded.charge_point_count, last_price_update_at = now(), updated_at = now()
+            updated_at = now()
       returning station_code, id::text`,
     [
       c.map((s) => s.stationCode),
@@ -551,6 +610,17 @@ async function upsertStaticCatalog(
         [brandRows.map((r) => r[0]), brandRows.map((r) => r[1])],
       );
     }
+
+    const pricedStationIds = [...new Set(tariffRows.map((row) => row.stationId))];
+    if (pricedStationIds.length) {
+      await client.query(
+        `update stations
+            set last_price_update_at = now(),
+                updated_at = now()
+          where id = any($1::uuid[])`,
+        [pricedStationIds],
+      );
+    }
   }
 
   // ── 6. Cleanup: remove stale charge_points, tariffs, stations ─────────────
@@ -560,10 +630,12 @@ async function upsertStaticCatalog(
       `delete from charge_points where station_id = any($1::uuid[]) and not (charge_point_code = any($2::text[]))`,
       [stationIdsByCode, allCps.map((cp) => cp.code)],
     );
-    await client.query(
-      `delete from tariffs where station_id = any($1::uuid[]) and not (tariff_code = any($2::text[]))`,
-      [stationIdsByCode, tariffRows.map((t) => t.code)],
-    );
+    if (tariffRows.length) {
+      await client.query(
+        `delete from tariffs where station_id = any($1::uuid[]) and not (tariff_code = any($2::text[]))`,
+        [stationIdsByCode, tariffRows.map((t) => t.code)],
+      );
+    }
   }
   if (feed.cpoId && stationIdMap.size) {
     await client.query(
@@ -572,10 +644,18 @@ async function upsertStaticCatalog(
     );
   }
 
+  for (const stationId of stationIdsByCode) {
+    await aggregateStationStatus(client, stationId, null);
+  }
+
   return parsed.catalog.length;
 }
 
-async function aggregateStationStatus(client: PoolClient, stationId: string, touchedAt: string) {
+async function aggregateStationStatus(
+  client: PoolClient,
+  stationId: string,
+  touchedAt: string | null,
+) {
   await client.query(
     `with status_counts as (
         select
@@ -583,7 +663,8 @@ async function aggregateStationStatus(client: PoolClient, stationId: string, tou
           count(*) filter (where last_status_canonical = 'AVAILABLE') as available_count,
           count(*) filter (where last_status_canonical in ('CHARGING', 'RESERVED', 'BLOCKED')) as occupied_count,
           count(*) filter (where last_status_canonical in ('OUT_OF_SERVICE', 'MAINTENANCE')) as out_of_service_count,
-          count(*) filter (where last_status_canonical = 'UNKNOWN') as unknown_count
+          count(*) filter (where last_status_canonical = 'UNKNOWN') as unknown_count,
+          max(last_status_update_at) as max_status_update_at
         from charge_points
        where station_id = $1::uuid
        group by station_id
@@ -593,7 +674,7 @@ async function aggregateStationStatus(client: PoolClient, stationId: string, tou
              occupied_count = coalesce(c.occupied_count, 0),
              out_of_service_count = coalesce(c.out_of_service_count, 0),
              unknown_count = coalesce(c.unknown_count, 0),
-             last_status_update_at = $2::timestamptz,
+             last_status_update_at = coalesce($2::timestamptz, c.max_status_update_at, s.last_status_update_at),
              updated_at = now()
         from status_counts c
        where s.id = c.station_id`,
@@ -734,6 +815,29 @@ async function markFeedSuccess(
   );
 }
 
+/**
+ * Hard cap per feed. A single slow/hung upstream (Vaylens mTLS timeout, huge
+ * payload) must never block other feeds in the cycle. Configurable via
+ * FEED_RUN_TIMEOUT_MS. Default 90s — enough for a 40 MB Vaylens pull + parse.
+ */
+const FEED_RUN_TIMEOUT_MS = Number(process.env.FEED_RUN_TIMEOUT_MS ?? 90_000);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout nach ${ms}ms: ${label}`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export async function runFeedAction(
   feedId: string,
   action: FeedAction,
@@ -742,7 +846,7 @@ export async function runFeedAction(
     dryRun?: boolean;
   },
 ) {
-  return withFeedLock(feedId, async (client) => {
+  const lockResult = await withFeedLock(feedId, async (client) => {
     const feed = await getFeedConfigDb(feedId, client);
     if (!feed) {
       throw new Error("Feed not found");
@@ -857,23 +961,77 @@ export async function runFeedAction(
         } satisfies SyncRun)
       : null;
   });
+
+  if (!lockResult.ok) {
+    // Another worker already holds the advisory lock. Persist a short
+    // sync_runs entry so the admin UI sees the skip instead of silently
+    // going stale, and bump the feed's lastErrorMessage for diagnostics.
+    try {
+      const feed = await getFeedConfigDb(feedId);
+      if (feed) {
+        const client = await getPool().connect();
+        try {
+          const runId = await createRun(client, feed.id, action, "Lock belegt");
+          await finishRun(client, runId, {
+            status: "failed",
+            message: "Feed wird bereits verarbeitet (Lock belegt)",
+            deltaCount: 0,
+          });
+        } finally {
+          client.release();
+        }
+      }
+    } catch (err) {
+      console.error(`[ingest] failed to record lock-busy run for ${feedId}:`, errorMessage(err));
+    }
+    throw new Error("Feed wird bereits verarbeitet");
+  }
+
+  return lockResult.value;
 }
 
 export async function runDueFeedCycle() {
-  // Clean up any sync runs that got stuck in "running" state (e.g. Lambda timeout)
-  await cleanupStuckSyncRunsDb().catch(() => undefined);
-
-  const feeds = await listFeedConfigsDb();
-  const dueFeeds = feeds.filter((feed: FeedConfig) => shouldRunFeed(feed));
-
-  for (const feed of dueFeeds) {
-    const kind: FeedAction =
-      feed.type === "dynamic" && feed.mode !== "pull" ? "reconciliation" : "manual";
-
-    await runFeedAction(feed.id, kind).catch((error) => {
-      console.error(`[ingest] ${feed.name} failed:`, errorMessage(error));
-    });
+  // Clean up sync_runs stuck in "running" from prior Lambda timeouts or crashes.
+  const cleaned = await cleanupStuckSyncRunsDb().catch((error) => {
+    console.error("[ingest] cleanupStuckSyncRuns failed:", errorMessage(error));
+    return 0;
+  });
+  if (cleaned) {
+    console.log(`[ingest] cleaned up ${cleaned} stuck sync run(s)`);
   }
+
+  let feeds: FeedConfig[];
+  try {
+    feeds = await listFeedConfigsDb();
+  } catch (error) {
+    console.error("[ingest] listFeedConfigsDb failed:", errorMessage(error));
+    return 0;
+  }
+
+  const dueFeeds = feeds.filter((feed: FeedConfig) => shouldRunFeed(feed));
+  if (!dueFeeds.length) {
+    return 0;
+  }
+
+  // Parallelise — one slow/hung feed must not starve others. Each call is
+  // additionally bounded by FEED_RUN_TIMEOUT_MS so the whole cycle has a
+  // predictable upper bound.
+  const results = await Promise.allSettled(
+    dueFeeds.map((feed) => {
+      const kind: FeedAction =
+        feed.type === "dynamic" && feed.mode !== "pull" ? "reconciliation" : "manual";
+      return withTimeout(runFeedAction(feed.id, kind), FEED_RUN_TIMEOUT_MS, feed.name);
+    }),
+  );
+
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      console.error(
+        `[ingest] ${dueFeeds[index]!.name} failed:`,
+        errorMessage(result.reason),
+      );
+    }
+  });
 
   return dueFeeds.length;
 }
