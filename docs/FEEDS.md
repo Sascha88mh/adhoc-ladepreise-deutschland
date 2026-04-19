@@ -375,6 +375,15 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 
 ## 10. Bekannte Fallen für neue Agenten
 
+> **Wichtigste Arbeitsregel:** Niemals Payload-Strukturen raten, erfinden oder aus Dokumentation kopieren.
+> Stattdessen immer die echten Daten vom User anfordern:
+> - „Aktuelles Datenpaket herunterladen" vom Mobilithek-Feed-Detailblatt, oder
+> - einen `raw_feed_payloads`-Eintrag aus der DB extrahieren.
+>
+> Nur die echte Payload zeigt, wie ein CPO das Schema tatsächlich nutzt — Feldnamen,
+> Verschachtelungstiefe und optionale Felder weichen regelmäßig vom offiziellen Schema ab
+> (Vaylens: `locationReference` auf Station-Ebene statt Site-Ebene war ein solches Beispiel).
+
 | Falle | Symptom | Lösung |
 |-------|---------|--------|
 | `app_secrets`-INSERT vergessen | „Kein Mobilithek-Client-Zertifikat" für Feeds ohne Netlify-Env-Var | INSERT für `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` — Werte in §3.3 |
@@ -388,5 +397,6 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 
 ## 11. Änderungshistorie dieser Doku
 
+- **2026-04-19 v3** — §10: Arbeitsregel „echte Payload anfordern" ergänzt.
 - **2026-04-19 v2** — CPO-Besonderheiten (§9), Fallen-Tabelle (§10), Troubleshooting für Vaylens `locationReference`-Muster und `app_secrets`-Fallen.
 - **2026-04-19 v1** — Initiale Fassung nach Vaylens-Onboarding und Tesla-Stale-Vorfall. Fail-Fast-Cert, Parallel-Cycle, Payload-Truncation, `app_secrets`-Migration.
