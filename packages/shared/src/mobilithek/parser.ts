@@ -59,11 +59,17 @@ export function sanitizeMobilithekJsonPayload(payload: string) {
   return payload
     .replace(/\u0000/g, "")
     .replace(/\\u0000/gi, "")
+    // ES6 braced escapes (\u{XXXX}) are valid JS but invalid JSON — expand them
     .replace(/\\u\{([0-9a-fA-F]+)\}/g, (_, hex) => {
       const codePoint = Number.parseInt(hex, 16);
-      return Number.isNaN(codePoint) ? "" : String.fromCodePoint(codePoint);
+      if (Number.isNaN(codePoint) || codePoint > 0x10ffff) return "";
+      return String.fromCodePoint(codePoint);
     })
+    // \u not followed by exactly 4 hex digits is a JSON syntax error
+    .replace(/\\u(?![0-9a-fA-F]{4})/gi, "\\uFFFD")
+    // Lone high surrogates (\uD800–\uDBFF not followed by a low surrogate)
     .replace(/\\uD[89AB][0-9A-F]{2}(?!\\uD[CDEF][0-9A-F]{2})/gi, "\\uFFFD")
+    // Lone low surrogates (\uDC00–\uDFFF not preceded by a high surrogate)
     .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
 }
 

@@ -113,25 +113,49 @@ async function withFeedLock<T>(
 ): Promise<{ ok: true; value: T } | { ok: false; reason: "busy" }> {
   const client = await getPool().connect();
   const lockKey = hashLockKey(feedId);
-  let acquired = false;
+  let committed = false;
 
   try {
+    await client.query("BEGIN");
+
     const lock = await client.query<{ locked: boolean }>(
-      `select pg_try_advisory_lock($1) as locked`,
+      // Transaction-level advisory lock: released automatically on COMMIT/ROLLBACK.
+      // This works correctly with Supabase pgBouncer (transaction mode) where
+      // session-level locks can leak across pool connections.
+      `select pg_try_advisory_xact_lock($1) as locked`,
       [lockKey],
     );
 
     if (!lock.rows[0]?.locked) {
+      await client.query("ROLLBACK");
       return { ok: false, reason: "busy" };
     }
-    acquired = true;
 
-    const value = await work(client);
-    return { ok: true, value };
-  } finally {
-    if (acquired) {
-      await client.query(`select pg_advisory_unlock($1)`, [lockKey]).catch(() => undefined);
+    // Run work, capturing errors so we can COMMIT before re-throwing.
+    // Always committing ensures sync_runs audit entries (incl. failure records
+    // written inside work's own catch block) are persisted even on errors.
+    let workError: unknown = undefined;
+    let workResult: T | undefined;
+    try {
+      workResult = await work(client);
+    } catch (err) {
+      workError = err;
     }
+
+    await client.query("COMMIT");
+    committed = true;
+
+    if (workError !== undefined) {
+      throw workError;
+    }
+
+    return { ok: true, value: workResult as T };
+  } catch (error) {
+    if (!committed) {
+      await client.query("ROLLBACK").catch(() => undefined);
+    }
+    throw error;
+  } finally {
     client.release();
   }
 }
