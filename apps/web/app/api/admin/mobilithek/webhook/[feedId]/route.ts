@@ -15,20 +15,21 @@ function sanitizePayload(raw: string): string {
     .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
 }
 
-async function readBody(request: Request): Promise<string> {
-  const buffer = Buffer.from(await request.arrayBuffer());
-  const encoding = request.headers.get("content-encoding") ?? "";
-  const bytes = encoding.includes("gzip") ? gunzipSync(buffer) : buffer;
-  return bytes.toString("utf-8");
+function decodeBody(buffer: Buffer): string {
+  // Detect gzip by magic bytes 0x1F 0x8B — don't rely on Content-Encoding header
+  // since Netlify may strip it while leaving the body compressed.
+  const isGzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
+  return (isGzip ? gunzipSync(buffer) : buffer).toString("utf-8");
 }
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ feedId: string }> },
 ) {
-  const payload = sanitizePayload(await readBody(request));
   const { feedId } = await params;
   try {
+    const raw = decodeBody(Buffer.from(await request.arrayBuffer()));
+    const payload = sanitizePayload(raw);
     await processFeedWebhook(feedId, payload, request.headers.get("x-webhook-secret"));
     return Response.json({ ok: true });
   } catch (error) {
