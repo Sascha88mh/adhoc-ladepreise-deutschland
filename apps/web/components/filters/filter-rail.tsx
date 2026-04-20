@@ -107,7 +107,7 @@ function AnimatedSegmentedControl({
             key={option.id}
             type="button"
             onClick={() => onChange(option.id)}
-            className={`relative rounded-full px-3 py-1.5 text-sm font-medium transition-colors ${
+            className={`relative rounded-full px-2.5 py-1 sm:px-3 sm:py-1.5 text-xs sm:text-sm font-medium transition-colors ${
               active ? "text-[var(--accent-fg)]" : "text-[var(--foreground)] hover:bg-black/5"
             }`}
           >
@@ -205,9 +205,9 @@ export function FilterRail({
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1, transition: appleSpring }}
             exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.15, ease: "easeOut" } }}
-            className="flex items-center justify-between gap-1.5 p-1.5 w-full"
+            className="flex items-center gap-2 p-1.5 sm:justify-between"
           >
-            <div className="flex items-center gap-1.5 rounded-[22px] bg-white/60 p-1 shadow-inner">
+            <div className="flex items-center gap-1 rounded-[22px] bg-white/60 p-1 shadow-inner">
               <AnimatedSegmentedControl
                 options={[
                   { id: "Alle", label: "Alle" },
@@ -223,7 +223,7 @@ export function FilterRail({
             <button
               type="button"
               onClick={onToggle}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/80 text-[var(--foreground)] shadow-sm transition hover:bg-white"
+              className="flex h-8 w-8 sm:h-10 sm:w-10 shrink-0 items-center justify-center rounded-full bg-white/80 text-[var(--foreground)] shadow-sm transition hover:bg-white"
               aria-label="Mehr Filter"
             >
               <Filter className="h-4 w-4" />

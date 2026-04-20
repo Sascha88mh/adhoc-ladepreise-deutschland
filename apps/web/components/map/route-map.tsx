@@ -8,6 +8,7 @@ import maplibregl, {
 } from "maplibre-gl";
 import type { RouteCandidate, RoutePlan } from "@adhoc/shared";
 import { StationMarker } from "./station-marker";
+import { Compass } from "lucide-react";
 
 const MAP_STYLES = {
   light:
@@ -59,7 +60,40 @@ type Props = {
     maxLng: number;
   }) => void;
   mapMode: MapMode;
+  candidatesOpen?: boolean;
 };
+
+function CustomCompass({ map, candidatesOpen }: { map: MaplibreMap; candidatesOpen?: boolean }) {
+  const [bearing, setBearing] = useState(0);
+
+  useEffect(() => {
+    if (!map) return;
+    const update = () => setBearing(map.getBearing());
+    map.on('rotate', update);
+    map.on('pitch', update);
+    return () => {
+      map.off('rotate', update);
+      map.off('pitch', update);
+    };
+  }, [map]);
+
+  if (bearing === 0 && map.getPitch() === 0) return null;
+
+  return (
+    <button
+      onClick={() => map.flyTo({ bearing: 0, pitch: 0 })}
+      className={`absolute z-40 flex h-10 w-10 items-center justify-center rounded-full bg-white/80 shadow-sm transition-all duration-500 hover:bg-white bottom-4 right-4 sm:bottom-6 ${
+        candidatesOpen ? "sm:right-[26rem]" : "sm:right-4"
+      }`}
+      aria-label="Nordausrichtung"
+    >
+      <Compass 
+        className="h-5 w-5 text-[var(--foreground)] transition-transform duration-75" 
+        style={{ transform: `rotate(${-bearing}deg)` }} 
+      />
+    </button>
+  );
+}
 
 function isLocationFocusRoute(route: RoutePlan) {
   return route.destination.label === "Umgebung";
@@ -443,6 +477,7 @@ export function RouteMap({
   onSelect,
   onViewportChange,
   mapMode,
+  candidatesOpen,
 }: Props) {
   const [mapInstance, setMapInstance] = useState<MaplibreMap | null>(null);
   const [isZoomedIn, setIsZoomedIn] = useState(false);
@@ -493,7 +528,6 @@ export function RouteMap({
       attributionControl: false,
     });
 
-    map.addControl(new maplibregl.NavigationControl(), "top-right");
     mapRef.current = map;
     setMapInstance(map); // Store map purely to trigger React re-render of child markers
     setIsZoomedIn(map.getZoom() > 11.5);
@@ -658,6 +692,7 @@ export function RouteMap({
   return (
     <>
       <div ref={containerRef} className="h-full w-full" />
+      {mapInstance && <CustomCompass map={mapInstance} candidatesOpen={candidatesOpen} />}
       {mapInstance &&
         Array.from(allCandidates.values()).map((candidate) => (
           <StationMarker

@@ -437,11 +437,12 @@ export function RoutePlannerShell({
           onSelect={handleSelectStation}
           onViewportChange={setMapBounds}
           mapMode={mapMode}
+          candidatesOpen={showRouteCandidatesUi && candidatesOpen}
         />
       </div>
 
       {/* Top Left Floating Controls (Search & Filters) */}
-      <div className="pointer-events-none absolute left-4 top-4 bottom-4 z-30 flex flex-col items-start gap-4 w-[calc(100vw-2rem)] sm:w-[24rem]">
+      <div className="pointer-events-none absolute left-4 top-4 bottom-4 z-30 flex flex-col items-start gap-4 justify-between sm:justify-start w-[calc(100vw-2rem)] sm:w-[24rem]">
         <div className="pointer-events-auto w-full shrink-0 shadow-[0_8px_30px_rgb(0,0,0,0.12)] rounded-[30px] glass-panel-strong">
           <RouteSearchBar
             query={query}
@@ -456,7 +457,7 @@ export function RoutePlannerShell({
           initial={false}
           animate={{ borderRadius: filtersOpen ? 32 : 40 }}
           transition={{ type: "spring", bounce: 0, duration: 0.35 }}
-          className="pointer-events-auto w-full min-h-0 flex flex-col overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.12)] glass-panel-strong"
+          className={`pointer-events-auto min-h-0 flex flex-col overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.12)] glass-panel-strong ${filtersOpen ? 'w-full' : 'self-start w-auto sm:self-auto sm:w-full'}`}
         >
           <FilterRail
             filters={filters}
@@ -495,9 +496,16 @@ export function RoutePlannerShell({
       </AnimatePresence>
 
       {/* Map Style Switcher */}
-      <div className="pointer-events-none absolute right-[4.8rem] top-3 z-20 flex justify-end">
+      <div className="pointer-events-none absolute bottom-[4.5rem] left-4 sm:left-auto sm:top-3 sm:bottom-auto sm:right-4 z-20 flex sm:justify-end">
         <div className="group pointer-events-auto flex items-center rounded-full p-1 shadow-2xl glass-panel-strong transition-colors hover:bg-white/95">
-          <div className="flex max-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap pl-0 opacity-0 transition-all duration-300 ease-in-out group-hover:max-w-[20rem] group-hover:pl-1 group-hover:pr-2 group-hover:opacity-100">
+          <button
+            type="button"
+            className="order-1 sm:order-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_4px_10px_rgba(21,111,99,0.2)] transition-transform group-hover:scale-105"
+            aria-label="Kartenstil auswählen"
+          >
+            <Layers size={16} />
+          </button>
+          <div className="order-2 sm:order-1 flex max-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap pl-0 pr-0 opacity-0 transition-all duration-300 ease-in-out group-hover:max-w-[20rem] group-hover:pl-2 group-hover:pr-1 sm:group-hover:pl-1 sm:group-hover:pr-2 group-hover:opacity-100">
             {MAP_MODE_OPTIONS.map((option) => (
               <button
                 key={option.id}
@@ -513,13 +521,6 @@ export function RoutePlannerShell({
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_4px_10px_rgba(21,111,99,0.2)] transition-transform group-hover:scale-105"
-            aria-label="Kartenstil auswählen"
-          >
-            <Layers size={16} />
-          </button>
         </div>
       </div>
 
@@ -541,7 +542,7 @@ export function RoutePlannerShell({
       ) : null}
 
       {(globalLoading || error) && (
-        <div className="glass-panel-strong absolute bottom-24 right-6 z-30 flex max-w-[min(28rem,calc(100vw-3rem))] items-center gap-3 rounded-full px-5 py-3 text-sm text-[var(--foreground)] shadow-2xl sm:bottom-6">
+        <div className="glass-panel-strong absolute bottom-24 left-1/2 z-50 flex w-max max-w-[calc(100vw-2.5rem)] -translate-x-1/2 items-center justify-center gap-3 rounded-full px-5 py-3 text-sm text-[var(--foreground)] shadow-2xl sm:bottom-8 sm:left-1/2">
           {globalLoading && (
             <LoaderCircle className="h-4 w-4 animate-spin text-[var(--accent)]" />
           )}
