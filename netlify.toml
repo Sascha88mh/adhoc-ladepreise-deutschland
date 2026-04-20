@@ -14,6 +14,16 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+# Mobilithek sendet den Webhook-Body gzip-kodiert. Der @netlify/plugin-nextjs
+# Adapter dekodiert den Body als UTF-8 bevor er die Route erreicht (mangelt also
+# die Magic-Bytes). Deshalb den Webhook auf eine native Netlify Function
+# umleiten, die Bytes unverändert bekommt.
+[[redirects]]
+  from = "/api/admin/mobilithek/webhook/:feedId"
+  to = "/.netlify/functions/mobilithek-webhook/:feedId"
+  status = 200
+  force = true
+
 [[headers]]
   for = "/api/*"
   [headers.values]
