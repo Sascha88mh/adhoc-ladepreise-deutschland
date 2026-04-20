@@ -205,7 +205,7 @@ function parseChargePoint(
   point: {
     idG?: string;
     currentType?: { value?: string };
-    connector?: Array<{ connectorType?: { value?: string } }>;
+    connector?: Array<{ connectorType?: { value?: string }; maxPowerAtSocket?: number }>;
     availableChargingPower?: number[];
     electricEnergy?: Array<{
       energyRate?: Array<{
@@ -237,9 +237,12 @@ function parseChargePoint(
 
   const connectors: ParsedConnector[] = (point.connector ?? []).map((connector, index) => ({
     connectorType: connector.connectorType?.value ?? `UNKNOWN_${index + 1}`,
-    maxPowerKw: point.availableChargingPower?.[index]
-      ? point.availableChargingPower[index]! / 1000
-      : null,
+    maxPowerKw:
+      point.availableChargingPower?.[index] != null
+        ? point.availableChargingPower[index]! / 1000
+        : connector.maxPowerAtSocket != null
+          ? connector.maxPowerAtSocket / 1000
+          : null,
   }));
 
   const tariffs = (point.electricEnergy ?? []).flatMap((energy) =>
@@ -252,6 +255,7 @@ function parseChargePoint(
     connectors,
     maxPowerKw: Math.max(
       ...((point.availableChargingPower ?? []).map((value) => value / 1000)),
+      ...(point.connector ?? []).map((c) => (c.maxPowerAtSocket != null ? c.maxPowerAtSocket / 1000 : 0)),
       0,
     ),
     tariffs,
@@ -295,130 +299,157 @@ function resolveLocationRef(ref?: {
   return { coords, address };
 }
 
+type StationEntry = {
+  idG?: string;
+  description?: unknown;
+  externalIdentifier?: Array<{ identifier?: string }>;
+  authenticationAndIdentificationMethods?: Array<{ value?: string }>;
+  numberOfRefillPoints?: number;
+  totalMaximumPower?: number;
+  // Vaylens puts locationReference here instead of at the site level
+  locationReference?: {
+    locAreaLocation?: LocationBlock;
+    locPointLocation?: LocationBlock;
+  };
+  refillPoint?: Array<{
+    aegiElectricChargingPoint?: {
+      idG?: string;
+      currentType?: { value?: string };
+      connector?: Array<{ connectorType?: { value?: string }; maxPowerAtSocket?: number }>;
+      availableChargingPower?: number[];
+      electricEnergy?: Array<{
+        energyRate?: Array<{
+          idG?: string;
+          rateName?: unknown;
+          applicableCurrency?: string[];
+          payment?: {
+            paymentMeans?: Array<{ value?: string }>;
+            brandsAccepted?: Array<{ value?: string }>;
+          };
+          energyPrice?: Array<{
+            priceType?: { value?: string };
+            value?: number;
+            priceCap?: number;
+            timeBasedApplicability?: { fromMinute?: number };
+          }>;
+        }>;
+      }>;
+    };
+  }>;
+};
+
+function buildCatalogEntry(
+  stationCode: string,
+  cpoId: string,
+  cpoName: string,
+  address: FacilityAddress,
+  latitude: number,
+  longitude: number,
+  stations: StationEntry[],
+): ParsedStationCatalog {
+  const allChargePoints = stations.flatMap((station) =>
+    (station.refillPoint ?? [])
+      .map((item) => item.aegiElectricChargingPoint)
+      .filter((point): point is NonNullable<typeof point> => Boolean(point))
+      .map((point) => parseChargePoint(point, stationCode)),
+  );
+
+  const paymentMethods = Array.from(
+    new Set(
+      [
+        ...stations.flatMap((station) =>
+          (station.authenticationAndIdentificationMethods ?? []).map((method) => method.value),
+        ),
+        ...allChargePoints.flatMap((point) => point.tariffs.flatMap((tariff) => tariff.paymentMethods)),
+      ].filter((value): value is string => Boolean(value)),
+    ),
+  );
+
+  const connectorTypes = Array.from(
+    new Set(allChargePoints.flatMap((point) => point.connectors.map((connector) => connector.connectorType))),
+  );
+
+  const currentTypes = Array.from(new Set(allChargePoints.map((point) => point.currentType)));
+
+  const maxPowerKw = Math.max(
+    ...stations.map((station) => (station.totalMaximumPower != null ? station.totalMaximumPower / 1000 : 0)),
+    ...allChargePoints.map((point) => point.maxPowerKw),
+    0,
+  );
+
+  const chargePointCount = Math.max(
+    1,
+    stations.reduce((sum, station) => sum + (station.numberOfRefillPoints ?? 0), 0) || allChargePoints.length,
+  );
+
+  const name = stations.map((station) => readMultilingual(station.description)).find(Boolean) ?? "Ladestation";
+
+  return {
+    stationCode,
+    cpoId,
+    cpoName,
+    name,
+    addressLine: readAddressLine(address),
+    city: readMultilingual(address.city) ?? "Unbekannt",
+    postalCode: address.postcode ?? "",
+    countryCode: address.countryCode ?? "DE",
+    coordinates: { lat: latitude, lng: longitude },
+    chargePointCount,
+    currentTypes,
+    connectorTypes,
+    paymentMethods,
+    maxPowerKw,
+    chargePoints: allChargePoints,
+    notes: [],
+  };
+}
+
 function parseStationCatalog(
   site: {
+    idG?: string;
     operator?: { afacAnOrganisation?: { name?: unknown; externalIdentifier?: Array<{ identifier?: string }> } };
     locationReference?: {
       locAreaLocation?: LocationBlock;
       locPointLocation?: LocationBlock;
     };
-    energyInfrastructureStation?: Array<{
-      idG?: string;
-      description?: unknown;
-      externalIdentifier?: Array<{ identifier?: string }>;
-      authenticationAndIdentificationMethods?: Array<{ value?: string }>;
-      numberOfRefillPoints?: number;
-      totalMaximumPower?: number;
-      // Vaylens puts locationReference here instead of at the site level
-      locationReference?: {
-        locAreaLocation?: LocationBlock;
-        locPointLocation?: LocationBlock;
-      };
-      refillPoint?: Array<{
-        aegiElectricChargingPoint?: {
-          idG?: string;
-          currentType?: { value?: string };
-          connector?: Array<{ connectorType?: { value?: string } }>;
-          availableChargingPower?: number[];
-          electricEnergy?: Array<{
-            energyRate?: Array<{
-              idG?: string;
-              rateName?: unknown;
-              applicableCurrency?: string[];
-              payment?: {
-                paymentMeans?: Array<{ value?: string }>;
-                brandsAccepted?: Array<{ value?: string }>;
-              };
-              energyPrice?: Array<{
-                priceType?: { value?: string };
-                value?: number;
-                priceCap?: number;
-                timeBasedApplicability?: { fromMinute?: number };
-              }>;
-            }>;
-          }>;
-        };
-      }>;
-    }>;
+    energyInfrastructureStation?: StationEntry[];
   }): ParsedStationCatalog[] {
-  // Tesla-style: locationReference on the site itself.
-  // Vaylens-style: locationReference on each energyInfrastructureStation instead.
-  const siteLocation = resolveLocationRef(site.locationReference);
-  const firstStation = site.energyInfrastructureStation?.[0];
-  const { coords: coordinates, address } =
-    siteLocation.coords != null && siteLocation.address != null
-      ? siteLocation
-      : resolveLocationRef(firstStation?.locationReference);
-
-  const latitude = coordinates?.latitude;
-  const longitude = coordinates?.longitude;
-
-  if (latitude == null || longitude == null || !address) {
-    return [];
-  }
-
   const cpoId =
     site.operator?.afacAnOrganisation?.externalIdentifier?.[0]?.identifier ??
     readMultilingual(site.operator?.afacAnOrganisation?.name) ??
     "unknown";
   const cpoName = readMultilingual(site.operator?.afacAnOrganisation?.name) ?? "Unknown CPO";
 
-  return (site.energyInfrastructureStation ?? []).map((station, stationIndex) => {
+  const allStations = site.energyInfrastructureStation ?? [];
+  const siteLocation = resolveLocationRef(site.locationReference);
+
+  if (siteLocation.coords != null && siteLocation.address != null) {
+    // EnBW/Tesla-style: site has its own location → aggregate all stations into one DB entry
+    const { coords, address } = siteLocation;
+    const latitude = coords!.latitude;
+    const longitude = coords!.longitude;
+
+    if (latitude == null || longitude == null) return [];
+
+    const stationCode = site.idG ?? stableId([cpoId, String(latitude), String(longitude)]);
+
+    return [buildCatalogEntry(stationCode, cpoId, cpoName, address!, latitude, longitude, allStations)];
+  }
+
+  // Vaylens-style: no site-level location → each energyInfrastructureStation is its own DB entry
+  return allStations.flatMap((station, stationIndex) => {
+    const { coords, address } = resolveLocationRef(station.locationReference);
+    const latitude = coords?.latitude;
+    const longitude = coords?.longitude;
+
+    if (latitude == null || longitude == null || !address) return [];
+
     const stationCode =
       station.idG ??
       station.externalIdentifier?.[0]?.identifier ??
       stableId([cpoId, readMultilingual(station.description), stationIndex]);
 
-    const chargePoints = (station.refillPoint ?? [])
-      .map((item) => item.aegiElectricChargingPoint)
-      .filter((point): point is NonNullable<typeof point> => Boolean(point))
-      .map((point) => parseChargePoint(point, stationCode));
-
-    const tariffs = chargePoints.flatMap((point) => point.tariffs);
-    const paymentMethods = Array.from(
-      new Set([
-        ...(station.authenticationAndIdentificationMethods ?? []).map((method) => method.value),
-        ...tariffs.flatMap((tariff) => tariff.paymentMethods),
-      ].filter((value): value is string => Boolean(value))),
-    );
-
-    const connectorTypes = Array.from(
-      new Set(chargePoints.flatMap((point) => point.connectors.map((connector) => connector.connectorType))),
-    );
-
-    const currentTypes = Array.from(
-      new Set(chargePoints.map((point) => point.currentType)),
-    );
-
-    const maxPowerKw = Math.max(
-      station.totalMaximumPower ? station.totalMaximumPower / 1000 : 0,
-      ...chargePoints.map((point) => point.maxPowerKw),
-      0,
-    );
-
-    const chargePointCount = Math.max(1, station.numberOfRefillPoints ?? chargePoints.length);
-
-    return {
-      stationCode,
-      cpoId,
-      cpoName,
-      name: readMultilingual(station.description) ?? "Ladestation",
-      addressLine: readAddressLine(address),
-      city: readMultilingual(address.city) ?? "Unbekannt",
-      postalCode: address.postcode ?? "",
-      countryCode: address.countryCode ?? "DE",
-      coordinates: {
-        lat: latitude,
-        lng: longitude,
-      },
-      chargePointCount,
-      currentTypes,
-      connectorTypes,
-      paymentMethods,
-      maxPowerKw,
-      chargePoints,
-      notes: [],
-    } satisfies ParsedStationCatalog;
+    return [buildCatalogEntry(stationCode, cpoId, cpoName, address, latitude, longitude, [station])];
   });
 }
 

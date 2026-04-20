@@ -8,7 +8,6 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r --if-present lint",
     "test": "pnpm -r --if-present test",
-    "ingest:demo": "pnpm --filter ingest demo",
     "ingest:sync": "pnpm --filter ingest sync"
   }
 }

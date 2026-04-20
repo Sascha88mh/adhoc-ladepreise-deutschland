@@ -1,5 +1,4 @@
 import type { LocationSuggestion, RouteLocation } from "../domain/types";
-import { DEMO_LOCATIONS } from "../fixtures/locations";
 
 type NominatimResult = {
   place_id?: string | number;
@@ -49,25 +48,6 @@ function fromCoordinateInput(input: string): RouteLocation | null {
   };
 }
 
-function fromFixtureExact(input: string) {
-  const normalized = normalize(input);
-  return (
-    DEMO_LOCATIONS.find((location) => normalize(location.label) === normalized) ??
-    null
-  );
-}
-
-function fromFixturePartial(input: string) {
-  const normalized = normalize(input);
-  return (
-    DEMO_LOCATIONS.find(
-      (location) =>
-        normalize(location.label).includes(normalized) ||
-        normalize(location.city ?? "").includes(normalized),
-    ) ?? null
-  );
-}
-
 function toRouteLocation(input: string, result: NominatimResult): RouteLocation {
   const label =
     result.name?.trim() ||
@@ -107,29 +87,6 @@ function toLocationSuggestion(result: NominatimResult, index: number): LocationS
       lng: Number(result.lon),
     },
   };
-}
-
-function fixtureSuggestion(location: RouteLocation, index: number): LocationSuggestion {
-  return {
-    id: `fixture-${index}-${normalize(location.label)}`,
-    label: location.label,
-    secondaryLabel: location.city ?? null,
-    inputLabel: [location.label, location.city].filter(Boolean).join(", "),
-    query: [location.label, location.city].filter(Boolean).join(", "),
-    coordinates: location.coordinates,
-  };
-}
-
-function fixtureSuggestions(input: string, limit: number): LocationSuggestion[] {
-  const normalized = normalize(input);
-
-  return DEMO_LOCATIONS.filter(
-    (location) =>
-      normalize(location.label).includes(normalized) ||
-      normalize(location.city ?? "").includes(normalized),
-  )
-    .slice(0, limit)
-    .map((location, index) => fixtureSuggestion(location, index));
 }
 
 async function geocodeWithNominatim(input: string): Promise<RouteLocation | null> {
@@ -238,12 +195,8 @@ export async function searchLocations(
     ];
   }
 
-  const [remote, local] = await Promise.all([
-    searchWithNominatim(trimmed, limit),
-    Promise.resolve(fixtureSuggestions(trimmed, limit)),
-  ]);
-
-  return dedupeSuggestions([...remote, ...local]).slice(0, limit);
+  const remote = await searchWithNominatim(trimmed, limit);
+  return dedupeSuggestions(remote).slice(0, limit);
 }
 
 export async function reverseGeocodeLocation(
@@ -285,17 +238,11 @@ export async function resolveLocation(input: string): Promise<RouteLocation | nu
     return coordinates;
   }
 
-  const exact = fromFixtureExact(input);
-
-  if (exact) {
-    return exact;
-  }
-
   const remote = await geocodeWithNominatim(input);
 
   if (remote) {
     return remote;
   }
 
-  return fromFixturePartial(input);
+  return null;
 }

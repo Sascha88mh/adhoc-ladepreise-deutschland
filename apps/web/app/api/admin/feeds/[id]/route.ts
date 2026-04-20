@@ -1,5 +1,6 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { deleteAdminFeedConfig, updateAdminFeedConfig } from "@/lib/server/admin-data";
+import { cpoExistsDb, usingDatabase } from "@adhoc/shared/db";
 
 const patchSchema = z.object({
   source: z.enum(["mobilithek"]).optional(),
@@ -31,15 +32,50 @@ export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const body = patchSchema.parse(await request.json());
-  const { id } = await params;
-  const updated = await updateAdminFeedConfig(id, body);
+  try {
+    const body = patchSchema.parse(await request.json());
 
-  if (!updated) {
-    return Response.json({ error: "Feed not found" }, { status: 404 });
+    if (usingDatabase() && body.cpoId && !(await cpoExistsDb(body.cpoId))) {
+      return Response.json(
+        {
+          error:
+            `Unbekannte CPO-ID "${body.cpoId}". Erwartet wird eine vorhandene ` +
+            `cpos.id wie z. B. "enbw" oder "tesla". Alternativ das Feld leer lassen.`,
+        },
+        { status: 400 },
+      );
+    }
+
+    const { id } = await params;
+    const updated = await updateAdminFeedConfig(id, body);
+
+    if (!updated) {
+      return Response.json({ error: "Feed not found" }, { status: 404 });
+    }
+
+    return Response.json({ data: updated });
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return Response.json({ error: "Ungültige Feed-Konfiguration." }, { status: 400 });
+    }
+
+    const code = typeof error === "object" && error && "code" in error
+      ? String((error as { code?: string }).code ?? "")
+      : "";
+
+    if (code === "23503") {
+      return Response.json(
+        {
+          error:
+            "Die angegebene CPO-ID existiert nicht in der Datenbank. Bitte eine vorhandene cpos.id verwenden oder das Feld leer lassen.",
+        },
+        { status: 400 },
+      );
+    }
+
+    const message = error instanceof Error ? error.message : "Feed konnte nicht gespeichert werden.";
+    return Response.json({ error: message }, { status: 500 });
   }
-
-  return Response.json({ data: updated });
 }
 
 export async function DELETE(

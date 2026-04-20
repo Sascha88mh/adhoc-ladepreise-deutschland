@@ -1,8 +1,10 @@
 "use client";
 
+import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronDown, ChevronUp, Filter, WalletCards } from "lucide-react";
 import type { CandidateFilters } from "@adhoc/shared";
+import { DualRangeSlider } from "@/components/ui/range-slider";
 
 type Props = {
   filters: CandidateFilters;
@@ -15,8 +17,9 @@ type Props = {
   showCorridorFilter?: boolean;
 };
 
-const MAX_POWER_KW = 350;
-const MAX_CHARGE_POINTS = 16;
+const MAX_POWER_KW = 1000;
+const MAX_CHARGE_POINTS = 50;
+const MAX_PRICE_CENTS = 100;
 const DEFAULT_CORRIDOR_KM = 5;
 const MAX_CORRIDOR_KM = 25;
 
@@ -53,6 +56,76 @@ function ToggleChip({
   );
 }
 
+function CollapsibleFilterSection({ title, defaultExpanded = false, children }: { title: React.ReactNode; defaultExpanded?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultExpanded);
+  return (
+    <div className="space-y-3">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="group flex w-full items-center justify-between transition-opacity hover:opacity-80 focus:outline-none"
+      >
+        <div className="metric-label flex items-center gap-2 m-0">{title}</div>
+        <ChevronDown 
+          className={`h-4 w-4 text-[var(--muted)] transition-transform duration-200 ${open ? "rotate-180" : ""}`} 
+        />
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+           <motion.div
+             initial={{ height: 0, opacity: 0 }}
+             animate={{ height: "auto", opacity: 1 }}
+             exit={{ height: 0, opacity: 0 }}
+             transition={{ duration: 0.2 }}
+             className="overflow-hidden"
+           >
+             <div className="pt-1">
+               {children}
+             </div>
+           </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function AnimatedSegmentedControl({
+  options,
+  activeId,
+  onChange,
+}: {
+  options: { id: string; label: string }[];
+  activeId: string;
+  onChange: (id: any) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      {options.map((option) => {
+        const active = option.id === activeId;
+        return (
+          <button
+            key={option.id}
+            type="button"
+            onClick={() => onChange(option.id)}
+            className={`relative rounded-full px-3 py-1.5 text-sm font-medium transition-colors ${
+              active ? "text-[var(--accent-fg)]" : "text-[var(--foreground)] hover:bg-black/5"
+            }`}
+          >
+            {active && (
+              <motion.div
+                layoutId="power-tier-indicator"
+                className="absolute inset-0 rounded-full bg-[var(--accent)] shadow-sm"
+                transition={{ type: "spring", stiffness: 450, damping: 45 }}
+              />
+            )}
+            <span className="relative z-10">{option.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function formatPriceBand(priceBand: { min: number | null; max: number | null }) {
   if (priceBand.min == null || priceBand.max == null) {
     return "Noch kein Preisband";
@@ -73,74 +146,119 @@ export function FilterRail({
   onToggle,
   showCorridorFilter = true,
 }: Props) {
-  const summaryChips = [
-    ...(filters.currentTypes?.includes("AC") ? ["AC"] : []),
-    ...(filters.currentTypes?.includes("DC") ? ["DC"] : []),
-    ...(filters.minPowerKw && filters.minPowerKw >= 150 ? ["HPC"] : []),
-  ];
+  function isPowerTierActive(filtersToTest: CandidateFilters, tier: "Alle" | "AC" | "DC" | "HPC") {
+    if (tier === "Alle") {
+      return !filtersToTest.currentTypes && !filtersToTest.minPowerKw && !filtersToTest.maxPowerKw;
+    }
+    if (tier === "AC") {
+      return filtersToTest.currentTypes?.includes("AC") && filtersToTest.maxPowerKw === 44;
+    }
+    if (tier === "DC") {
+      return filtersToTest.currentTypes?.includes("DC") && filtersToTest.minPowerKw === 45 && filtersToTest.maxPowerKw === 99;
+    }
+    if (tier === "HPC") {
+      return filtersToTest.currentTypes?.includes("DC") && filtersToTest.minPowerKw === 100 && !filtersToTest.maxPowerKw;
+    }
+    return false;
+  }
+
+  function handleToggleTier(tier: "Alle" | "AC" | "DC" | "HPC") {
+    if (tier === "Alle" || isPowerTierActive(filters, tier)) {
+      const next = { ...filters };
+      delete next.currentTypes;
+      delete next.minPowerKw;
+      delete next.maxPowerKw;
+      onChange(next);
+      return;
+    }
+
+    const next = { ...filters };
+    if (tier === "AC") {
+      next.currentTypes = ["AC"];
+      delete next.minPowerKw;
+      next.maxPowerKw = 44;
+    } else if (tier === "DC") {
+      next.currentTypes = ["DC"];
+      next.minPowerKw = 45;
+      next.maxPowerKw = 99;
+    } else if (tier === "HPC") {
+      next.currentTypes = ["DC"];
+      next.minPowerKw = 100;
+      delete next.maxPowerKw;
+    }
+    onChange(next);
+  }
+
+  let activeTier = "Alle";
+  if (isPowerTierActive(filters, "AC")) activeTier = "AC";
+  else if (isPowerTierActive(filters, "DC")) activeTier = "DC";
+  else if (isPowerTierActive(filters, "HPC")) activeTier = "HPC";
+
+  const appleSpring = { type: "spring", bounce: 0, duration: 0.35 };
 
   return (
-    <aside className="min-h-[9.5rem] p-4 sm:min-h-[10.5rem] sm:p-5">
-      <div className="mb-1 flex justify-center">
-        <div className="h-1.5 w-14 rounded-full bg-[rgba(21,111,99,0.14)]" />
-      </div>
-
-      <div className="flex items-start justify-between gap-3 pt-1">
-        <div className="min-w-0 flex-1">
-          <p className="metric-label mb-2 flex items-center gap-2">
-            <Filter className="h-3.5 w-3.5" />
-            Filter
-          </p>
-          <div className="flex flex-wrap items-center gap-3">
-            <p className="font-[var(--font-heading)] text-3xl font-semibold tracking-[-0.04em]">
-              {hitCount}
-            </p>
-            <div
-              className={`rounded-full px-3 py-2 text-sm ${
-                expanded
-                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "bg-[rgba(21,111,99,0.10)] text-[rgba(21,111,99,0.72)]"
-              }`}
-            >
-              {formatPriceBand(priceBand)}
-            </div>
-          </div>
-          {!expanded && summaryChips.length ? (
-            <div className="mt-3 flex flex-wrap gap-2">
-              {summaryChips.map((chip) => (
-                <span
-                  key={chip}
-                  className="rounded-full border border-[rgba(21,111,99,0.12)] bg-white/56 px-2.5 py-1 text-xs font-medium tracking-[0.04em] text-[rgba(21,38,27,0.7)]"
-                >
-                  {chip}
-                </span>
-              ))}
-            </div>
-          ) : null}
-        </div>
-
-        <button
-          type="button"
-          onClick={onToggle}
-          className="rounded-full border border-[var(--line)] bg-white/82 px-3 py-2 text-sm text-[var(--foreground)] transition hover:bg-white"
-        >
-          <span className="flex items-center gap-1.5">
-            {expanded ? "Weniger" : "Mehr Filter"}
-            {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
-          </span>
-        </button>
-      </div>
-
-      <AnimatePresence initial={false}>
-        {expanded ? (
+    <aside className="relative flex flex-col h-full min-h-0">
+      <AnimatePresence mode="popLayout" initial={false}>
+        {!expanded ? (
           <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.22, ease: "easeOut" }}
-            className="overflow-hidden"
+            key="collapsed"
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1, transition: appleSpring }}
+            exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.15, ease: "easeOut" } }}
+            className="flex items-center justify-between gap-1.5 p-1.5 w-full"
           >
-            <div className="space-y-5 pt-5">
+            <div className="flex items-center gap-1.5 rounded-[22px] bg-white/60 p-1 shadow-inner">
+              <AnimatedSegmentedControl
+                options={[
+                  { id: "Alle", label: "Alle" },
+                  { id: "AC", label: "AC" },
+                  { id: "DC", label: "DC" },
+                  { id: "HPC", label: "HPC" },
+                ]}
+                activeId={activeTier}
+                onChange={handleToggleTier}
+              />
+            </div>
+            
+            <button
+              type="button"
+              onClick={onToggle}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/80 text-[var(--foreground)] shadow-sm transition hover:bg-white"
+              aria-label="Mehr Filter"
+            >
+              <Filter className="h-4 w-4" />
+            </button>
+          </motion.div>
+        ) : (
+          <motion.div
+            layout
+            key="expanded"
+            initial={{ opacity: 0, y: 15, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1, transition: appleSpring }}
+            exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.15, ease: "easeOut" } }}
+            className="flex flex-col flex-1 min-h-0 w-full"
+          >
+            <div className="shrink-0 px-4 pt-4 sm:px-5 sm:pt-5">
+              <div className="flex items-center justify-between">
+                <p className="metric-label flex items-center gap-2 m-0">
+                  <Filter className="h-3.5 w-3.5" />
+                  Filter
+                </p>
+
+                <button
+                  type="button"
+                  onClick={onToggle}
+                  className="rounded-full border border-[var(--line)] bg-white/82 px-3 py-2 text-sm text-[var(--foreground)] transition hover:bg-white"
+                >
+                  <span className="flex items-center gap-1.5">
+                    Schließen <ChevronDown className="h-4 w-4" />
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto custom-scrollbar scroll-shadow px-4 pb-4 sm:px-5 sm:pb-5">
+              <div className="space-y-6 pt-5 pb-2">
               {showCorridorFilter ? (
                 <section>
                   <p className="metric-label mb-2">Korridor entlang der Route</p>
@@ -169,121 +287,109 @@ export function FilterRail({
               ) : null}
 
               <section>
-                <p className="metric-label mb-2">Preis pro kWh</p>
-                <input
-                  type="range"
+                <p className="metric-label mb-3">Preis pro kWh</p>
+                <DualRangeSlider
                   min={0}
-                  max={80}
+                  max={MAX_PRICE_CENTS}
                   step={1}
-                  value={filters.maxPriceKwh != null ? filters.maxPriceKwh * 100 : 0}
-                  onChange={(event) => {
-                    const value = Number(event.target.value);
+                  value={[
+                    filters.minPriceKwh != null ? filters.minPriceKwh * 100 : 0,
+                    filters.maxPriceKwh != null ? filters.maxPriceKwh * 100 : MAX_PRICE_CENTS,
+                  ]}
+                  onChange={([minVal, maxVal]) => {
                     onChange({
                       ...filters,
-                      maxPriceKwh: value > 0 ? value / 100 : undefined,
+                      minPriceKwh: minVal > 0 ? minVal / 100 : undefined,
+                      maxPriceKwh: maxVal < MAX_PRICE_CENTS ? maxVal / 100 : undefined,
                     });
                   }}
-                  className="w-full accent-[var(--accent)]"
                 />
-                <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                  <span>egal</span>
+                <div className="mt-3 flex items-center justify-between text-sm text-[var(--muted)]">
+                  <span>{filters.minPriceKwh ? `${filters.minPriceKwh.toFixed(2).replace(".", ",")} €` : "0,00 €"}</span>
                   <strong className="text-[var(--foreground)]">
-                    {filters.maxPriceKwh != null
-                      ? `max. ${filters.maxPriceKwh.toFixed(2).replace(".", ",")} €`
+                    {filters.minPriceKwh || filters.maxPriceKwh
+                      ? `${filters.minPriceKwh ? filters.minPriceKwh.toFixed(2).replace(".", ",") : "0,00"} – ${filters.maxPriceKwh ? filters.maxPriceKwh.toFixed(2).replace(".", ",") : "1,00"} €`
                       : "kein Preislimit"}
                   </strong>
-                  <span>0,80 €</span>
+                  <span>1,00 €</span>
                 </div>
               </section>
 
               <section>
-                <p className="metric-label mb-2">Stromart</p>
-                <div className="flex flex-wrap gap-2">
-                  <ToggleChip
-                    active={filters.currentTypes?.includes("AC") ?? false}
-                    label="AC"
-                    onClick={() =>
-                      onChange({
-                        ...filters,
-                        currentTypes: toggleArrayValue(filters.currentTypes, "AC"),
-                      })
-                    }
-                  />
-                  <ToggleChip
-                    active={filters.currentTypes?.includes("DC") ?? false}
-                    label="DC"
-                    onClick={() =>
-                      onChange({
-                        ...filters,
-                        currentTypes: toggleArrayValue(filters.currentTypes, "DC"),
-                      })
-                    }
+                <p className="metric-label mb-3">Stromart {activeTier !== "Alle" && `(${activeTier})`}</p>
+                <div className="flex rounded-2xl bg-white/60 p-1 shadow-inner w-max">
+                  <AnimatedSegmentedControl
+                    options={[
+                      { id: "Alle", label: "Alle" },
+                      { id: "AC", label: "AC" },
+                      { id: "DC", label: "DC" },
+                      { id: "HPC", label: "HPC" },
+                    ]}
+                    activeId={activeTier}
+                    onChange={handleToggleTier}
                   />
                 </div>
               </section>
 
-              <section className="grid grid-cols-2 gap-3">
-                <div className="text-sm">
-                  <span className="metric-label mb-2 block">Mindest-kW</span>
-                  <input
-                    type="range"
+              <div className="space-y-6">
+                <section>
+                  <span className="metric-label mb-3 block">Leistung (kW)</span>
+                  <DualRangeSlider
                     min={0}
                     max={MAX_POWER_KW}
                     step={10}
-                    value={filters.minPowerKw ?? 0}
-                    onChange={(event) => {
-                      const value = Number(event.target.value);
+                    value={[filters.minPowerKw ?? 0, filters.maxPowerKw ?? MAX_POWER_KW]}
+                    onChange={([minVal, maxVal]) => {
                       onChange({
                         ...filters,
-                        minPowerKw: value > 0 ? value : undefined,
+                        minPowerKw: minVal > 0 ? minVal : undefined,
+                        maxPowerKw: maxVal < MAX_POWER_KW ? maxVal : undefined,
                       });
                     }}
-                    className="w-full accent-[var(--accent)]"
                   />
-                  <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                    <span>egal</span>
+                  <div className="mt-3 flex items-center justify-between text-[13px] text-[var(--muted)]">
+                    <span>{filters.minPowerKw ?? 0}</span>
                     <strong className="text-[var(--foreground)]">
-                      {filters.minPowerKw ? `ab ${filters.minPowerKw} kW` : "egal"}
+                      {filters.minPowerKw || filters.maxPowerKw ? `${filters.minPowerKw ?? 0}–${filters.maxPowerKw ?? MAX_POWER_KW} kW` : "egal"}
                     </strong>
-                    <span>{MAX_POWER_KW} kW</span>
+                    <span>{MAX_POWER_KW}</span>
                   </div>
-                </div>
+                </section>
 
-                <div className="text-sm">
-                  <span className="metric-label mb-2 block">Mindestladepunkte</span>
-                  <input
-                    type="range"
+                <section>
+                  <span className="metric-label mb-3 block">Ladepunkte</span>
+                  <DualRangeSlider
                     min={0}
                     max={MAX_CHARGE_POINTS}
                     step={1}
-                    value={filters.minChargePointCount ?? 0}
-                    onChange={(event) => {
-                      const value = Number(event.target.value);
+                    value={[filters.minChargePointCount ?? 0, filters.maxChargePointCount ?? MAX_CHARGE_POINTS]}
+                    onChange={([minVal, maxVal]) => {
                       onChange({
                         ...filters,
-                        minChargePointCount: value > 0 ? value : undefined,
+                        minChargePointCount: minVal > 0 ? minVal : undefined,
+                        maxChargePointCount: maxVal < MAX_CHARGE_POINTS ? maxVal : undefined,
                       });
                     }}
-                    className="w-full accent-[var(--accent)]"
                   />
-                  <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                    <span>egal</span>
+                  <div className="mt-3 flex items-center justify-between text-[13px] text-[var(--muted)]">
+                    <span>{filters.minChargePointCount ?? 0}</span>
                     <strong className="text-[var(--foreground)]">
-                      {filters.minChargePointCount
-                        ? `mind. ${filters.minChargePointCount}`
-                        : "egal"}
+                      {filters.minChargePointCount || filters.maxChargePointCount ? `${filters.minChargePointCount ?? 0}–${filters.maxChargePointCount ?? MAX_CHARGE_POINTS}` : "egal"}
                     </strong>
                     <span>{MAX_CHARGE_POINTS}</span>
                   </div>
-                </div>
-              </section>
+                </section>
+              </div>
 
-              <section>
-                <p className="metric-label mb-2 flex items-center gap-2">
-                  <WalletCards className="h-3.5 w-3.5" />
-                  Bezahlarten
-                </p>
-                <div className="flex flex-wrap gap-2">
+              <CollapsibleFilterSection 
+                title={
+                  <>
+                    <WalletCards className="h-3.5 w-3.5" />
+                    Bezahlarten
+                  </>
+                }
+              >
+                <div className="flex flex-wrap gap-2 pt-1">
                   {[
                     { id: "ecCard", label: "EC-Karte" },
                     { id: "creditCard", label: "Kreditkarte" },
@@ -304,11 +410,10 @@ export function FilterRail({
                     />
                   ))}
                 </div>
-              </section>
+              </CollapsibleFilterSection>
 
-              <section>
-                <p className="metric-label mb-2">Anbieter</p>
-                <div className="max-h-44 space-y-2 overflow-auto pr-2 text-sm scroll-shadow">
+              <CollapsibleFilterSection title="Anbieter">
+                <div className="max-h-44 space-y-2 overflow-y-auto px-1 -mx-1 text-sm custom-scrollbar scroll-shadow">
                   {cpos.map((cpo) => (
                     <label key={cpo.id} className="flex items-center justify-between gap-3 rounded-2xl bg-white/72 px-3 py-2">
                       <span className="flex items-center gap-3">
@@ -329,9 +434,10 @@ export function FilterRail({
                     </label>
                   ))}
                 </div>
-              </section>
+              </CollapsibleFilterSection>
 
-              <section className="space-y-2 text-sm">
+              <CollapsibleFilterSection title="Sonstige Punkte">
+                <div className="space-y-2 text-sm pt-1">
                 {[
                   {
                     key: "availableOnly",
@@ -375,8 +481,12 @@ export function FilterRail({
                     </label>
                   );
                 })}
-              </section>
+                </div>
+              </CollapsibleFilterSection>
+            </div>
+            </div>
 
+            <div className="shrink-0 px-4 pb-4 pt-2 sm:px-5 sm:pb-5">
               <button
                 type="button"
                 onClick={() =>
@@ -386,11 +496,11 @@ export function FilterRail({
                 }
                 className="w-full rounded-2xl border border-[var(--line)] px-3 py-2 text-sm text-[var(--muted)] transition hover:bg-white/80"
               >
-                Filter zurücksetzen
+                Zurücksetzen
               </button>
             </div>
           </motion.div>
-        ) : null}
+        )}
       </AnimatePresence>
     </aside>
   );

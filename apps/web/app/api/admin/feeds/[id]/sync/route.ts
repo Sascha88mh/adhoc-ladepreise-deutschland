@@ -1,4 +1,3 @@
-import { after } from "next/server";
 import { triggerAdminFeedAction } from "@/lib/server/admin-data";
 
 export async function POST(
@@ -9,12 +8,10 @@ export async function POST(
   try {
     const startedAt = new Date().toISOString();
 
-    after(async () => {
-      try {
-        await triggerAdminFeedAction(id, "sync");
-      } catch (error) {
+    queueMicrotask(() => {
+      void triggerAdminFeedAction(id, "sync").catch((error) => {
         console.error(`[admin-sync] ${id} failed:`, error);
-      }
+      });
     });
 
     return Response.json(

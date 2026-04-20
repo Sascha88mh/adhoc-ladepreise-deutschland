@@ -89,6 +89,72 @@ function summarizeTariff(tariff: TariffSummary) {
   });
 }
 
+function mergeTariffShapes(
+  existing: {
+    stationId: string;
+    cpId: string | null;
+    code: string;
+    label: string;
+    currency: string;
+    isComplete: boolean;
+    tariff: ParsedTariff;
+  },
+  incoming: {
+    stationId: string;
+    cpId: string | null;
+    code: string;
+    label: string;
+    currency: string;
+    isComplete: boolean;
+    tariff: ParsedTariff;
+  },
+) {
+  const mergedPaymentMethods = Array.from(
+    new Set([...existing.tariff.paymentMethods, ...incoming.tariff.paymentMethods]),
+  );
+  const mergedBrandsAccepted = Array.from(
+    new Set([...existing.tariff.brandsAccepted, ...incoming.tariff.brandsAccepted]),
+  );
+  const mergedCaps = Array.from(
+    new Map(
+      [...existing.tariff.caps, ...incoming.tariff.caps].map((cap) => [
+        `${cap.label}|${cap.amount}|${cap.currency}`,
+        cap,
+      ]),
+    ).values(),
+  );
+
+  return {
+    stationId: existing.stationId,
+    cpId:
+      existing.cpId === incoming.cpId
+        ? existing.cpId
+        : null,
+    code: existing.code,
+    label: existing.label || incoming.label,
+    currency: existing.currency || incoming.currency,
+    isComplete: existing.isComplete || incoming.isComplete,
+    tariff: {
+      ...existing.tariff,
+      label: existing.tariff.label || incoming.tariff.label,
+      currency: existing.tariff.currency || incoming.tariff.currency,
+      pricePerKwh: existing.tariff.pricePerKwh ?? incoming.tariff.pricePerKwh,
+      pricePerMinute: existing.tariff.pricePerMinute ?? incoming.tariff.pricePerMinute,
+      sessionFee: existing.tariff.sessionFee ?? incoming.tariff.sessionFee,
+      preauthAmount: existing.tariff.preauthAmount ?? incoming.tariff.preauthAmount,
+      blockingFeePerMinute:
+        existing.tariff.blockingFeePerMinute ?? incoming.tariff.blockingFeePerMinute,
+      blockingFeeStartsAfterMinutes:
+        existing.tariff.blockingFeeStartsAfterMinutes ??
+        incoming.tariff.blockingFeeStartsAfterMinutes,
+      caps: mergedCaps,
+      paymentMethods: mergedPaymentMethods,
+      brandsAccepted: mergedBrandsAccepted,
+      isComplete: existing.tariff.isComplete || incoming.tariff.isComplete,
+    },
+  };
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unbekannter Fehler";
 }
@@ -580,7 +646,13 @@ async function upsertStaticCatalog(
     const stationId = cp.stationId;
     for (const tariff of cp.tariffs) tariffRows.push({ stationId, cpId, code: tariff.id, label: tariff.label ?? "", currency: tariff.currency ?? "EUR", isComplete: tariff.isComplete ?? false, tariff });
   }
-  if (tariffRows.length) {
+  const uniqueTariffRows = [...tariffRows.reduce((acc, row) => {
+    const current = acc.get(row.code);
+    acc.set(row.code, current ? mergeTariffShapes(current, row) : row);
+    return acc;
+  }, new Map<string, typeof tariffRows[number]>()).values()];
+
+  if (uniqueTariffRows.length) {
     const tariffResult = await client.query<{ tariff_code: string; id: string }>(
       `insert into tariffs (station_id, charge_point_id, tariff_code, label, currency, is_complete, updated_at)
        select t.sid::uuid, t.cpid::uuid, t.code, t.label, t.currency, t.complete, now()
@@ -589,7 +661,14 @@ async function upsertStaticCatalog(
          set station_id = excluded.station_id, charge_point_id = excluded.charge_point_id,
              label = excluded.label, currency = excluded.currency, is_complete = excluded.is_complete, updated_at = now()
        returning tariff_code, id::text`,
-      [tariffRows.map((t) => t.stationId), tariffRows.map((t) => t.cpId ?? ""), tariffRows.map((t) => t.code), tariffRows.map((t) => t.label), tariffRows.map((t) => t.currency), tariffRows.map((t) => t.isComplete)],
+      [
+        uniqueTariffRows.map((t) => t.stationId),
+        uniqueTariffRows.map((t) => t.cpId),
+        uniqueTariffRows.map((t) => t.code),
+        uniqueTariffRows.map((t) => t.label),
+        uniqueTariffRows.map((t) => t.currency),
+        uniqueTariffRows.map((t) => t.isComplete),
+      ],
     );
     const tariffIdMap = new Map(tariffResult.rows.map((r) => [r.tariff_code, r.id]));
     const allTariffIds = tariffResult.rows.map((r) => r.id);
@@ -601,7 +680,7 @@ async function upsertStaticCatalog(
     const compRows: Array<[string, string, number | null, number | null, number | null]> = [];
     const pmRows: Array<[string, string]> = [];
     const brandRows: Array<[string, string]> = [];
-    for (const row of tariffRows) {
+    for (const row of uniqueTariffRows) {
       const tid = tariffIdMap.get(row.code);
       if (!tid) continue;
       const t = row.tariff;
@@ -635,7 +714,7 @@ async function upsertStaticCatalog(
       );
     }
 
-    const pricedStationIds = [...new Set(tariffRows.map((row) => row.stationId))];
+    const pricedStationIds = [...new Set(uniqueTariffRows.map((row) => row.stationId))];
     if (pricedStationIds.length) {
       await client.query(
         `update stations
@@ -661,10 +740,13 @@ async function upsertStaticCatalog(
       );
     }
   }
-  if (feed.cpoId && stationIdMap.size) {
+  // Remove stale stations: use feed.cpoId if configured, otherwise use the CPO IDs from
+  // this parse run (handles cases where the station grouping changes between syncs).
+  const staleCpoIds = feed.cpoId ? [feed.cpoId] : [...cpoMap.keys()];
+  if (staleCpoIds.length && stationIdMap.size) {
     await client.query(
-      `delete from stations where cpo_id = $1 and not (station_code = any($2::text[]))`,
-      [feed.cpoId, c.map((s) => s.stationCode)],
+      `delete from stations where cpo_id = any($1::text[]) and not (station_code = any($2::text[]))`,
+      [staleCpoIds, c.map((s) => s.stationCode)],
     );
   }
 
@@ -870,6 +952,30 @@ export async function runFeedAction(
     dryRun?: boolean;
   },
 ) {
+  let prefetchedStaticPayload: string | undefined = options?.payload;
+  let prefetchedStaticParsed: ParsedStaticFeed | undefined;
+
+  if (!prefetchedStaticPayload) {
+    const feed = await getFeedConfigDb(feedId);
+    if (!feed) {
+      throw new Error("Feed not found");
+    }
+
+    if (feed.type === "static") {
+      prefetchedStaticPayload = await fetchStaticMobilithekPayload(feed);
+      prefetchedStaticParsed = parseStaticMobilithekPayload(prefetchedStaticPayload);
+    }
+  } else {
+    const feed = await getFeedConfigDb(feedId);
+    if (!feed) {
+      throw new Error("Feed not found");
+    }
+
+    if (feed.type === "static") {
+      prefetchedStaticParsed = parseStaticMobilithekPayload(prefetchedStaticPayload);
+    }
+  }
+
   const lockResult = await withFeedLock(feedId, async (client) => {
     const feed = await getFeedConfigDb(feedId, client);
     if (!feed) {
@@ -885,7 +991,7 @@ export async function runFeedAction(
       let lastSnapshotAt = feed.lastSnapshotAt;
 
       if (feed.type === "static") {
-        const payload = options?.payload ?? (await fetchStaticMobilithekPayload(feed));
+        const payload = prefetchedStaticPayload ?? (await fetchStaticMobilithekPayload(feed));
         await recordPayload(client, {
           runId,
           feedId: feed.id,
@@ -893,7 +999,7 @@ export async function runFeedAction(
           payload,
         });
 
-        const parsed = parseStaticMobilithekPayload(payload);
+        const parsed = prefetchedStaticParsed ?? parseStaticMobilithekPayload(payload);
         deltaCount = parsed.catalog.length;
         message = `${parsed.catalog.length} Stationen verarbeitet`;
 
@@ -942,11 +1048,13 @@ export async function runFeedAction(
         }
       }
 
-      await markFeedSuccess(client, feed, {
-        lastSnapshotAt,
-        lastDeltaCount: deltaCount,
-        cursorState,
-      });
+      if (!options?.dryRun) {
+        await markFeedSuccess(client, feed, {
+          lastSnapshotAt,
+          lastDeltaCount: deltaCount,
+          cursorState,
+        });
+      }
       await finishRun(client, runId, {
         status: "success",
         message,
@@ -954,12 +1062,19 @@ export async function runFeedAction(
       });
     } catch (error) {
       const message = errorMessage(error);
-      await markFeedFailure(client, feed, message);
-      await finishRun(client, runId, {
-        status: "failed",
-        message,
-        deltaCount: 0,
-      });
+      try {
+        await markFeedFailure(client, feed, message);
+        await finishRun(client, runId, {
+          status: "failed",
+          message,
+          deltaCount: 0,
+        });
+      } catch (recordError) {
+        console.error(
+          `[ingest] failed to persist failure state for ${feed.id}:`,
+          errorMessage(recordError),
+        );
+      }
       throw error;
     }
 

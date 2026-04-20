@@ -39,7 +39,7 @@ Ohne `VALHALLA_URL` werden PKW-Routen ueber OSRM berechnet. LKW-Routing liefert 
 ```bash
 pnpm test
 pnpm build
-pnpm ingest:demo
+pnpm ingest:sync
 ```
 
 ## Fixtures
@@ -304,7 +304,7 @@ Manuell pruefen:
 
 ### 10. Betriebsregeln
 
-- In Production ist Demo-Fallback gesperrt: `APP_DATA_SOURCE=db` plus `DATABASE_URL` oder `SUPABASE_DB_URL` sind Pflicht. Demo-Daten sind nur noch mit explizitem `ALLOW_DEMO_DATA=1` erlaubt.
+- Die App läuft ausschließlich mit `APP_DATA_SOURCE=db` plus `DATABASE_URL` oder `SUPABASE_DB_URL`.
 - Ohne erfolgreichen initialen Static-Sync sind Public-Daten unvollstaendig
 - Ohne Scheduler gibt es keine automatische Aktualisierung
 - Ohne Credentials kann nur mit `MOBILITHEK_USE_FIXTURES=1` getestet werden

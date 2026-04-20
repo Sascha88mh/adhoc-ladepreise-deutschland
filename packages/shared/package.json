@@ -7,8 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./db": "./src/db/index.ts",
-    "./ingest": "./src/ingest/index.ts",
-    "./store": "./src/store/feed-store.ts"
+    "./ingest": "./src/ingest/index.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

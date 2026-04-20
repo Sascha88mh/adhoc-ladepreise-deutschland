@@ -11,7 +11,13 @@ import {
   type CandidateFilters,
   type RoutePlan,
 } from "@adhoc/shared";
-import { listStationRecordsDb, usingDatabase } from "@adhoc/shared/db";
+import { listStationRecordsDb, loadChargePointRowsDb, usingDatabase } from "@adhoc/shared/db";
+
+function requirePublicDatabase() {
+  if (!usingDatabase()) {
+    throw new Error("Die öffentliche App benötigt APP_DATA_SOURCE=db und eine erreichbare Datenbank.");
+  }
+}
 
 export function createRouteFromPolyline(polyline: RoutePlan["geometry"], routeId?: string) {
   return routePlanSchema.parse({
@@ -71,10 +77,7 @@ export async function createLocationFocusRoute(query: string) {
 }
 
 async function stationRecords() {
-  if (!usingDatabase()) {
-    return undefined;
-  }
-
+  requirePublicDatabase();
   return listStationRecordsDb();
 }
 
@@ -89,7 +92,7 @@ export async function buildCandidateResponse(route: RoutePlan, filters: Candidat
   const results = findCandidatesForRoute(
     effectiveRoute,
     filters,
-    (await stationRecords()) ?? undefined,
+    await stationRecords(),
   );
 
   return {
@@ -102,16 +105,40 @@ export async function buildCandidateResponse(route: RoutePlan, filters: Candidat
 }
 
 export async function listCpos() {
-  return getCpoList((await stationRecords()) ?? undefined);
+  return getCpoList(await stationRecords());
 }
 
 export async function loadStationDetail(stationId: string) {
-  return getStationDetail(stationId, (await stationRecords()) ?? undefined);
+  requirePublicDatabase();
+  const [stations, cpRows] = await Promise.all([
+    listStationRecordsDb(stationId),
+    loadChargePointRowsDb(stationId),
+  ]);
+
+  const chargePoints = cpRows.map((row) => ({
+    code: row.charge_point_code,
+    currentType: row.current_type as "AC" | "DC",
+    maxPowerKw: row.max_power_kw,
+    status: row.last_status_canonical as
+      | "AVAILABLE"
+      | "CHARGING"
+      | "RESERVED"
+      | "BLOCKED"
+      | "OUT_OF_SERVICE"
+      | "MAINTENANCE"
+      | "UNKNOWN",
+    connectors: (row.connector_types ?? []).map((type, i) => ({
+      type,
+      maxPowerKw: (row.connector_powers ?? [])[i] ?? null,
+    })),
+  }));
+
+  return getStationDetail(stationId, stations, chargePoints);
 }
 
 export async function listMapStations(
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
   filters: CandidateFilters,
 ) {
-  return findStationsInView(bounds, filters, (await stationRecords()) ?? undefined);
+  return findStationsInView(bounds, filters, await stationRecords());
 }

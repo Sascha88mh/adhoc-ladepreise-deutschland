@@ -8,6 +8,15 @@ import type {
 import { adminStationRecordSchema, feedConfigSchema, stationOverrideSchema, syncRunSchema } from "../domain/types";
 import { getPool } from "./pool";
 
+function hashAdvisoryLockKey(input: string) {
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash;
+}
+
 function mapFeedRow(row: Record<string, unknown>): FeedConfig {
   return feedConfigSchema.parse({
     id: String(row.id),
@@ -120,6 +129,16 @@ export async function getFeedConfigDb(id: string, client?: PoolClient) {
   );
 
   return result.rows[0] ? mapFeedRow(result.rows[0]) : null;
+}
+
+export async function cpoExistsDb(id: string, client?: PoolClient) {
+  const executor = client ?? getPool();
+  const result = await executor.query<{ exists: boolean }>(
+    `select exists(select 1 from cpos where id = $1) as exists`,
+    [id],
+  );
+
+  return Boolean(result.rows[0]?.exists);
 }
 
 export async function createFeedConfigDb(
@@ -283,6 +302,32 @@ export async function getAppSecret(key: string): Promise<string | null> {
 
 export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
   const executor = client ?? getPool();
+  const staleRuns = await executor.query<{ feed_id: string | null }>(
+    `select distinct feed_id::text as feed_id
+       from sync_runs
+      where status = 'running'
+        and started_at < now() - interval '5 minutes'
+        and feed_id is not null`,
+  );
+
+  for (const row of staleRuns.rows) {
+    if (!row.feed_id) {
+      continue;
+    }
+
+    const lockKey = hashAdvisoryLockKey(row.feed_id);
+    await executor.query(
+      `select pg_terminate_backend(a.pid)
+         from pg_locks l
+         join pg_stat_activity a
+           on a.pid = l.pid
+        where l.locktype = 'advisory'
+          and l.objid = $1
+          and a.pid <> pg_backend_pid()`,
+      [lockKey],
+    );
+  }
+
   const result = await executor.query<{ id: string }>(
     `update sync_runs
         set status = 'failed',
@@ -293,6 +338,38 @@ export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
       returning id::text`,
   );
   return result.rowCount ?? 0;
+}
+
+export async function terminateFeedRunDb(feedId: string, client?: PoolClient) {
+  const executor = client ?? getPool();
+  const lockKey = hashAdvisoryLockKey(feedId);
+
+  const terminated = await executor.query<{ pid: number; terminated: boolean }>(
+    `select a.pid, pg_terminate_backend(a.pid) as terminated
+       from pg_locks l
+       join pg_stat_activity a
+         on a.pid = l.pid
+      where l.locktype = 'advisory'
+        and l.objid = $1
+        and a.pid <> pg_backend_pid()`,
+    [lockKey],
+  );
+
+  const updatedRuns = await executor.query<{ id: string }>(
+    `update sync_runs
+        set status = 'failed',
+            finished_at = now(),
+            message = 'Abgebrochen (manuell erzwungen)'
+      where feed_id = $1::uuid
+        and status = 'running'
+      returning id::text`,
+    [feedId],
+  );
+
+  return {
+    terminatedPids: terminated.rows.filter((row) => row.terminated).map((row) => row.pid),
+    updatedRuns: updatedRuns.rowCount ?? 0,
+  };
 }
 
 export async function listSyncRunsDb(feedId?: string, client?: PoolClient) {

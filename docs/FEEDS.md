@@ -359,6 +359,11 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 - Credentials: PEM-Paar (`TESLA_CLIENT_CERT` + `TESLA_CLIENT_KEY`) in `app_secrets`. **Nicht** die globale `.p12`.
 - `locationReference` liegt auf `energyInfrastructureSite`-Ebene (Standard).
 - Static-Interval: 1440 Min (täglich). Dynamic: Push + Fallback 5 Min.
+- **`availableChargingPower` ist in der Payload auf allen Charge Points `null`.**
+  Die Leistung steckt ausschließlich in `connector[i].maxPowerAtSocket` (in Watt, ÷ 1000 = kW).
+  Der Parser (ab 2026-04-19) nutzt `maxPowerAtSocket` als Fallback automatisch.
+  Ändert Tesla seine Payload-Struktur, hier dokumentieren.
+- Alle Sites haben exakt eine `energyInfrastructureStation` → kein Aggregierungs-Problem.
 
 ### Vaylens
 - Credentials: globale `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` in `app_secrets`.
@@ -369,7 +374,27 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 - `unsupported Unicode escape sequence`: Vaylens-Payloads enthielten ungültige `\u`-Escapes. Sanitizer in `parser.ts` behebt das seit 2026-04-19 automatisch.
 
 ### EnBW / EAAZE
-- Noch nicht in Produktion. Beim Einpflegen §3 folgen; vermutlich globales `MOBILITHEK_*`-Cert ausreichend.
+- Globales `MOBILITHEK_*`-Cert reicht.
+- EnBW liefert in der echten Payload `operator.externalIdentifier[0].identifier = "EBW"` und `name = "ENBW"`.
+  `feed_configs.cpo_id` daher entweder leer lassen oder exakt an der Payload ausrichten; nicht blind `enbw` erzwingen.
+- Static-Payload verwendet wiederkehrende `tariff.id`-Werte über mehrere Charge Points hinweg.
+  Der Static-Ingest muss Tarife daher vor dem Bulk-Upsert per `tariff_code` deduplizieren, sonst bricht Postgres mit
+  `ON CONFLICT DO UPDATE command cannot affect row a second time` ab.
+- **Site-Level-Aggregierung (ab 2026-04-19):**
+  EnBW-Sites haben oft mehrere `energyInfrastructureStation`-Einträge (Stand April 2026: 1333 von 2506 Sites).
+  Jede `energyInfrastructureStation` entspricht einer **physischen Ladesäule** am selben Standort.
+  Der Parser erzeugt ab sofort **genau einen DB-Eintrag pro `energyInfrastructureSite`** (statt einen pro `energyInfrastructureStation`),
+  sobald die Site eine eigene `locationReference` mit Koordinaten und Adresse besitzt.
+  Als `station_code` dient `site.idG` (z.B. `"800001256"`).
+  `charge_point_count` = Summe der `numberOfRefillPoints` aller untergeordneten Stationen;
+  `max_power_kw` = Maximum über alle `totalMaximumPower`-Werte.
+  Die alten station-level-Codes (kurze numerische IDs wie `"10996"`) existieren nicht mehr nach dem ersten Sync.
+
+  **Warum drei Varianten im Parser?**
+  | Stil | Erkennungsmerkmal | Verhalten |
+  |---|---|---|
+  | EnBW/Tesla | `site.locationReference` hat Coords + Adresse | Eine DB-Station pro Site, `stationCode = site.idG` |
+  | Vaylens | `site.locationReference` fehlt oder unvollständig; Location auf Station-Ebene | Jede `energyInfrastructureStation` → eigene DB-Station |
 
 ---
 
@@ -390,13 +415,23 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 | `description`-Spalte fehlt in `app_secrets` | SQL-Fehler beim INSERT mit `description` | Die Spalte existiert nur wenn Migration 002 mit der aktuellen Datei lief. INSERT ohne `description` funktioniert immer |
 | Advisory Lock hängt (pgBouncer Transaction Mode) | Feed stale, FEHLER=Keine, Lock-belegt-Einträge in sync_runs | Seit 2026-04-19 `pg_try_advisory_xact_lock` — Locks lösen sich beim Commit/Rollback |
 | `0 Stationen verarbeitet` bei neuem CPO | Feed sync grün, aber keine Marker auf Karte | `locationReference` prüfen — ist sie auf Site- oder Station-Ebene? Troubleshooting §7 |
+| Testlauf wirkt wie echter Sync | `last_success_at`/`last_delta_count` sehen grün aus, aber `stations` bleibt unverändert | Nur `kind = manual`/Scheduler-Läufe persistieren Katalogdaten. `kind = test` ist Dry-Run und darf nicht als produktiver Erfolg interpretiert werden |
+| EnBW Static bricht in DB-Schreibphase ab | Test ok, echter Sync failt ohne sichtbare Stationen | Auf doppelte `tariff.id` in der Payload prüfen; Tarife vor Bulk-Upsert deduplizieren (§9 EnBW / EAAZE) |
 | Payload > 200 MB | axios-Timeout oder silent truncation | `MAX_RESPONSE_BYTES` in `client.ts` hochsetzen (aktuell 200 MB) |
 | `APP_DATA_SOURCE` nicht gesetzt | DB-Fallback für Credentials wird übersprungen | Netlify Env: `APP_DATA_SOURCE=db` setzen |
+| Falsche Ladepunkt-Anzahl / Leistung (EnBW-Muster) | Frontend zeigt z.B. „2 Ladepunkte, 150 kW" statt „8 Ladepunkte, 300 kW" | Mehrere `energyInfrastructureStation` pro Site werden nicht aggregiert. Parser ab 2026-04-19 fasst alles per Site zusammen (§9 EnBW). Nach Code-Änderung Feed manuell neu synchronisieren. |
+| Geister-Stationen nach Grouping-Änderung | Neue aggregierte Station erscheint korrekt, aber alte Einzel-Einträge bleiben sichtbar | `upsertStaticCatalog` nutzt Cleanup-Query mit `cpo_id = any(parsed_cpo_ids)` — nur wirksam wenn Sync mit neuem Code läuft. `feed_configs.cpo_id = null` ist korrekt; Cleanup greift dann auf geparsede CPO-IDs. Sicherstellen dass der manuelle Sync nach der Code-Änderung über die lokale Dev-Instanz läuft (nicht Netlify-Deployment mit altem Code). |
+| Leistungsangaben bei Tesla = 0 oder leer | Stationen erscheinen mit 0 kW im Frontend | `availableChargingPower` ist in Tesla-Payloads generell `null`. Leistung kommt aus `connector.maxPowerAtSocket` (Watt). Parser-Fallback ab 2026-04-19 aktiv (§9 Tesla). |
 
 ---
 
 ## 11. Änderungshistorie dieser Doku
 
+- **2026-04-19 v4** — Zwei Parser-Bugs gefixt und dokumentiert:
+  1. **Tesla `maxPowerAtSocket`-Fallback** (§9 Tesla, §10): `availableChargingPower` ist in Tesla-Payloads generell `null`; Leistung jetzt aus `connector.maxPowerAtSocket` gezogen.
+  2. **EnBW Site-Level-Aggregierung** (§9 EnBW, §10): Parser gibt jetzt exakt eine DB-Station pro `energyInfrastructureSite` zurück (statt eine pro `energyInfrastructureStation`), wenn die Site eigene Koordinaten + Adresse hat. Station-Code = `site.idG`. Betrifft 1333 von 2506 EnBW-Sites mit mehreren Ladesäulen.
+  3. **Cleanup-Robustheit** (§10): `upsertStaticCatalog` löscht jetzt stale Stationen auch wenn `feed_configs.cpo_id = null`, indem geparsede CPO-IDs als Scope verwendet werden.
+  4. **Charge-Point-Details im Frontend**: Neues `chargePoints: ChargePointDetail[]`-Feld in `StationDetail` (domain/types.ts), DB-Query `loadChargePointRowsDb` (db/public.ts), aufklappbare UI-Sektion im Station-Drawer.
 - **2026-04-19 v3** — §10: Arbeitsregel „echte Payload anfordern" ergänzt.
 - **2026-04-19 v2** — CPO-Besonderheiten (§9), Fallen-Tabelle (§10), Troubleshooting für Vaylens `locationReference`-Muster und `app_secrets`-Fallen.
 - **2026-04-19 v1** — Initiale Fassung nach Vaylens-Onboarding und Tesla-Stale-Vorfall. Fail-Fast-Cert, Parallel-Cycle, Payload-Truncation, `app_secrets`-Migration.

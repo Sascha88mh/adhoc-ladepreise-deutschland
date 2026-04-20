@@ -135,6 +135,20 @@ export const routeCandidateSchema = z.object({
 });
 export type RouteCandidate = z.infer<typeof routeCandidateSchema>;
 
+export const chargePointDetailSchema = z.object({
+  code: z.string(),
+  currentType: currentTypeSchema,
+  maxPowerKw: z.number().nullable(),
+  status: chargePointStatusSchema,
+  connectors: z.array(
+    z.object({
+      type: z.string(),
+      maxPowerKw: z.number().nullable(),
+    }),
+  ),
+});
+export type ChargePointDetail = z.infer<typeof chargePointDetailSchema>;
+
 export const stationDetailSchema = stationRecordSchema.extend({
   exportTargets: z.object({
     googleMaps: z.string().url(),
@@ -142,14 +156,18 @@ export const stationDetailSchema = stationRecordSchema.extend({
     waze: z.string().url(),
     coordinates: z.string(),
   }),
+  chargePoints: z.array(chargePointDetailSchema).default([]),
 });
 export type StationDetail = z.infer<typeof stationDetailSchema>;
 
 export const candidateFiltersSchema = z.object({
   corridorKm: z.number().positive().optional(),
   maxPriceKwh: z.number().positive().optional(),
+  minPriceKwh: z.number().nonnegative().optional(),
   minPowerKw: z.number().positive().optional(),
+  maxPowerKw: z.number().positive().optional(),
   minChargePointCount: z.number().int().positive().optional(),
+  maxChargePointCount: z.number().int().positive().optional(),
   currentTypes: z.array(currentTypeSchema).optional(),
   paymentMethods: z.array(z.string()).optional(),
   cpoIds: z.array(z.string()).optional(),

@@ -1,5 +1,6 @@
 import type {
   CandidateFilters,
+  ChargePointDetail,
   RouteCandidate,
   RoutePlan,
   StationDetail,
@@ -7,7 +8,6 @@ import type {
   TariffSummary,
 } from "./types";
 import { routeCandidateSchema, stationDetailSchema } from "./types";
-import { DEMO_STATIONS } from "../fixtures/demo-stations";
 import { distanceFromRouteKm } from "../geo/route-corridor";
 
 function normalizePaymentMethod(method: string) {
@@ -62,6 +62,12 @@ function isFreshEnough(isoTimestamp: string, limitMinutes?: number) {
 function includeTariff(tariff: TariffSummary, filters: CandidateFilters) {
   if (filters.maxPriceKwh !== undefined) {
     if (tariff.pricePerKwh == null || tariff.pricePerKwh > filters.maxPriceKwh) {
+      return false;
+    }
+  }
+
+  if (filters.minPriceKwh !== undefined) {
+    if (tariff.pricePerKwh == null || tariff.pricePerKwh < filters.minPriceKwh) {
       return false;
     }
   }
@@ -137,7 +143,15 @@ function stationMatchesFilters(
     return false;
   }
 
+  if (filters.maxPowerKw && station.maxPowerKw > filters.maxPowerKw) {
+    return false;
+  }
+
   if (filters.minChargePointCount && station.chargePointCount < filters.minChargePointCount) {
+    return false;
+  }
+
+  if (filters.maxChargePointCount && station.chargePointCount > filters.maxChargePointCount) {
     return false;
   }
 
@@ -186,7 +200,7 @@ function mapStationCandidate(
 export function findCandidatesForRoute(
   route: RoutePlan,
   filters: CandidateFilters = {},
-  stations: StationRecord[] = DEMO_STATIONS,
+  stations: StationRecord[] = [],
 ) {
   const candidates = stations
     .map((station) => {
@@ -262,7 +276,7 @@ export function findCandidatesForRoute(
 export function findStationsInView(
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
   filters: CandidateFilters = {},
-  stations: StationRecord[] = DEMO_STATIONS,
+  stations: StationRecord[] = [],
 ) {
   return stations
     .filter((station) => {
@@ -294,7 +308,11 @@ export function findStationsInView(
     });
 }
 
-export function getStationDetail(stationId: string, stations: StationRecord[] = DEMO_STATIONS): StationDetail | null {
+export function getStationDetail(
+  stationId: string,
+  stations: StationRecord[] = [],
+  chargePoints: ChargePointDetail[] = [],
+): StationDetail | null {
   const station = stations.find((candidate) => candidate.stationId === stationId);
 
   if (!station) {
@@ -303,6 +321,7 @@ export function getStationDetail(stationId: string, stations: StationRecord[] = 
 
   return stationDetailSchema.parse({
     ...station,
+    chargePoints,
     exportTargets: {
       googleMaps: `https://www.google.com/maps/dir/?api=1&destination=${station.coordinates.lat},${station.coordinates.lng}`,
       appleMaps: `https://maps.apple.com/?daddr=${station.coordinates.lat},${station.coordinates.lng}&dirflg=d`,
@@ -312,7 +331,7 @@ export function getStationDetail(stationId: string, stations: StationRecord[] = 
   });
 }
 
-export function getCpoList(stations: StationRecord[] = DEMO_STATIONS) {
+export function getCpoList(stations: StationRecord[] = []) {
   const grouped = new Map<string, { id: string; name: string; stations: number }>();
 
   for (const station of stations) {

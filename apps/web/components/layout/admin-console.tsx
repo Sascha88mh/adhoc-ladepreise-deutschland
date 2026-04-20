@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, useTransition, type ReactNode } from "rea
 import { Database, Activity, MapPin, Search, HardDrive, Edit2, X, RotateCcw, Save, Trash2 } from "lucide-react";
 import type { AdminStationRecord, FeedConfig, SyncRun } from "@adhoc/shared";
 import {
+  cleanupStuckSyncRuns,
   createAdminFeed,
   deleteAdminFeed,
   deleteStationOverride,
@@ -11,12 +12,12 @@ import {
   fetchSyncRuns,
   saveStationOverride,
   searchAdminStations,
+  terminateFeedRun,
   triggerFeedAction,
   updateAdminFeed,
 } from "@/lib/client/api";
 
 type Props = {
-  dataSource: "demo" | "db";
   initialFeeds: FeedConfig[];
   initialSyncRuns: SyncRun[];
 };
@@ -47,7 +48,7 @@ type FeedHealth = {
 };
 
 type FeedActionState = {
-  kind: "create" | "save" | "delete" | "test" | "sync";
+  kind: "create" | "save" | "delete" | "test" | "sync" | "terminate" | "cleanup";
   label: string;
 };
 
@@ -71,7 +72,7 @@ const EMPTY_FORM: FeedFormState = {
 };
 
 const FEED_FIELD_DESCRIPTIONS = {
-  cpoId: "Interne oder externe CPO-Kennung. Leer lassen, wenn der Feed mehrere Betreiber enthält oder der CPO erst aus der Payload kommt.",
+  cpoId: "Vorhandene CPO-ID aus der DB, normalerweise als lowercase Slug wie enbw oder tesla. Kein Freitext-Name. Leer lassen, wenn der Feed mehrere Betreiber enthält oder der CPO erst aus der Payload kommt.",
   name: "Freier Anzeigename für die Admin-Oberfläche. Am besten Betreiber + Feed-Art, damit du ihn sofort wiederfindest.",
   subscriptionId: "Die Mobilithek-Subscription-ID oder eindeutige Feed-ID. Dieser Wert identifiziert den Feed technisch.",
   urlOverride: "Optionaler direkter Feed-Endpunkt. Nur setzen, wenn der Standard-Endpunkt aus der Subscription nicht verwendet werden soll.",
@@ -259,6 +260,10 @@ function loadingLabel(kind: FeedActionState["kind"]) {
       return "Test läuft";
     case "sync":
       return "Sync läuft";
+    case "terminate":
+      return "Lauf wird beendet";
+    case "cleanup":
+      return "Timeout-Cleanup läuft";
     default:
       return "Läuft";
   }
@@ -572,7 +577,7 @@ function FeedEditor({
   );
 }
 
-export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Props) {
+export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
   const [feeds, setFeeds] = useState(initialFeeds);
   const [syncRuns, setSyncRuns] = useState(initialSyncRuns);
   const [form, setForm] = useState(EMPTY_FORM);
@@ -605,10 +610,6 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
   const hasRunningRuns = syncRuns.some((run) => run.status === "running");
 
   useEffect(() => {
-    if (dataSource !== "db") {
-      return;
-    }
-
     const timer = window.setTimeout(async () => {
       try {
         const results = await searchAdminStations(stationQuery);
@@ -626,10 +627,10 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
     }, 250);
 
     return () => window.clearTimeout(timer);
-  }, [dataSource, selectedStationId, startTransition, stationQuery]);
+  }, [selectedStationId, startTransition, stationQuery]);
 
   useEffect(() => {
-    if (dataSource !== "db" || !hasRunningRuns) {
+    if (!hasRunningRuns) {
       return;
     }
 
@@ -644,7 +645,7 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
     }, 2500);
 
     return () => window.clearInterval(interval);
-  }, [dataSource, hasRunningRuns]);
+  }, [hasRunningRuns]);
 
   function setFeedAction(feedId: string, action: FeedActionState | null) {
     setFeedActions((current) => {
@@ -675,7 +676,7 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
 
   async function handleCreate() {
     setUiError(null);
-    setFeedAction("__create__", { kind: "create", label: "Feed wird angelegt" });
+    setFeedAction("__create__", { kind: "create", label: "Feed wird angelegt und synchronisiert" });
     try {
       const created = await createAdminFeed({
         ...form,
@@ -688,6 +689,18 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
       setExpandedFeedId(created.id);
       setCreateFormOpen(false);
       setForm(EMPTY_FORM);
+
+      try {
+        const run = await triggerFeedAction(created.id, "sync");
+        setSyncRuns((current) => [run, ...current.filter((entry) => entry.id !== run.id)]);
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Automatischer Initial-Sync konnte nicht gestartet werden.";
+        setUiError(`Feed wurde angelegt, aber der automatische Sync ist fehlgeschlagen: ${message}`);
+      }
+
       await refreshAdminData();
     } catch (error) {
       setUiError(error instanceof Error ? error.message : "Feed konnte nicht angelegt werden.");
@@ -749,6 +762,37 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
       setUiError(error instanceof Error ? error.message : "Aktion konnte nicht ausgeführt werden.");
     } finally {
       setFeedAction(feedId, null);
+    }
+  }
+
+  async function handleTerminate(feedId: string) {
+    setUiError(null);
+    setFeedAction(feedId, { kind: "terminate", label: "Lauf wird beendet" });
+
+    try {
+      await terminateFeedRun(feedId);
+      await refreshAdminData();
+    } catch (error) {
+      setUiError(error instanceof Error ? error.message : "Lauf konnte nicht beendet werden.");
+    } finally {
+      setFeedAction(feedId, null);
+    }
+  }
+
+  async function handleCleanupStuckRuns() {
+    setUiError(null);
+    setFeedAction("__cleanup__", {
+      kind: "cleanup",
+      label: "Timeout-Cleanup läuft",
+    });
+
+    try {
+      await cleanupStuckSyncRuns();
+      await refreshAdminData();
+    } catch (error) {
+      setUiError(error instanceof Error ? error.message : "Cleanup konnte nicht ausgeführt werden.");
+    } finally {
+      setFeedAction("__cleanup__", null);
     }
   }
 
@@ -822,7 +866,7 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
           </h1>
           <p className="mt-1 flex items-center gap-2 text-xs text-[var(--muted)]">
             <HardDrive className="h-3.5 w-3.5" />
-            {dataSource === "db" ? "Production / Postgres" : "Demo Mode"}
+            Postgres / Supabase
           </p>
         </div>
 
@@ -1300,11 +1344,21 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
                 Letzte Läufe
               </h2>
             </div>
-            {hasRunningRuns ? (
-              <div className="rounded-full bg-[#fff8df] px-3 py-2 text-sm text-[#7a5f00]">
-                <ActionSpinner />
-              </div>
-            ) : null}
+            <div className="flex items-center gap-3">
+              {hasRunningRuns ? (
+                <div className="rounded-full bg-[#fff8df] px-3 py-2 text-sm text-[#7a5f00]">
+                  <ActionSpinner />
+                </div>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => void handleCleanupStuckRuns()}
+                disabled={Boolean(feedActions.__cleanup__)}
+                className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-60"
+              >
+                {feedActions.__cleanup__ ? "Bereinigt..." : "Timeout-Cleanup"}
+              </button>
+            </div>
           </div>
 
           <div className="space-y-3">
@@ -1325,7 +1379,21 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
                 <p className="text-sm text-slate-700">{run.message}</p>
                 <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
                   <span>{new Date(run.startedAt).toLocaleString("de-DE")}</span>
-                  <span>Delta {run.deltaCount}</span>
+                  <div className="flex items-center gap-3">
+                    <span>Delta {run.deltaCount}</span>
+                    {run.status === "running" ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleTerminate(run.feedId)}
+                        disabled={Boolean(feedActions[run.feedId])}
+                        className="rounded-full border border-[#fca5a5] bg-white px-3 py-1 text-xs font-semibold text-[#ef4444] shadow-sm transition hover:bg-[#fef2f2] disabled:opacity-60"
+                      >
+                        {feedActions[run.feedId]?.kind === "terminate"
+                          ? "Beendet..."
+                          : "Beenden erzwingen"}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
               </div>
             ))}
@@ -1345,15 +1413,9 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
                 Stations-Korrekturen
               </h2>
             </div>
-            {dataSource !== "db" ? (
-              <div className="rounded-full bg-[#fff3ee] px-3 py-2 text-sm text-[#9a3f1b]">
-                Nur in DB-Modus aktiv
-              </div>
-            ) : null}
           </div>
 
-          {dataSource === "db" ? (
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
               <div className="space-y-3">
                 <div className="relative">
                   <Search className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -1657,11 +1719,6 @@ export function AdminConsole({ dataSource, initialFeeds, initialSyncRuns }: Prop
                 )}
               </div>
             </div>
-          ) : (
-            <div className="rounded-[24px] border border-dashed border-[var(--line)] px-4 py-6 text-sm text-[var(--muted)]">
-              Overrides sind nur aktiv, wenn `APP_DATA_SOURCE=db` gesetzt ist und eine Datenbank verbunden ist.
-            </div>
-          )}
         </section>
           </div>
         )}

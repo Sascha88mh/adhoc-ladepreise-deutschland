@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import maplibregl, {
   type GeoJSONSource,
-  type Map,
+  type Map as MaplibreMap,
   type StyleSpecification,
 } from "maplibre-gl";
 import type { RouteCandidate, RoutePlan } from "@adhoc/shared";
+import { StationMarker } from "./station-marker";
 
 const MAP_STYLES = {
   light:
@@ -191,7 +192,7 @@ function selectedCollection(
 }
 
 function updateSource(
-  map: Map,
+  map: MaplibreMap,
   sourceId: string,
   data: Parameters<GeoJSONSource["setData"]>[0],
 ) {
@@ -269,7 +270,7 @@ function routePalette(mode: MapMode) {
   };
 }
 
-function ensureOperationalLayers(map: Map, mapMode: MapMode) {
+function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
   const palette = routePalette(mapMode);
 
   if (!map.getSource("route")) {
@@ -331,75 +332,6 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
       },
     });
   }
-
-  if (!map.getLayer("browse-circles")) {
-    map.addLayer({
-      id: "browse-circles",
-      type: "circle",
-      source: "browse",
-      paint: {
-        "circle-color": [
-          "case",
-          [">", ["get", "available"], 0],
-          "#2f8577",
-          "#d09a4a",
-        ],
-        "circle-radius": [
-          "case",
-          [">=", ["get", "power"], 250],
-          8,
-          [">=", ["get", "power"], 150],
-          7,
-          5.5,
-        ],
-        "circle-opacity": 0.72,
-        "circle-stroke-width": 1.6,
-        "circle-stroke-color": palette.candidateStroke,
-      },
-    });
-  }
-
-  if (!map.getLayer("candidate-circles")) {
-    map.addLayer({
-      id: "candidate-circles",
-      type: "circle",
-      source: "candidates",
-      paint: {
-        "circle-color": [
-          "case",
-          [">", ["get", "available"], 0],
-          "#156f63",
-          "#b96710",
-        ],
-        "circle-radius": [
-          "case",
-          [">=", ["get", "power"], 250],
-          11,
-          [">=", ["get", "power"], 150],
-          9,
-          7,
-        ],
-        "circle-stroke-width": 2.4,
-        "circle-stroke-color": palette.candidateStroke,
-      },
-    });
-  }
-
-  if (!map.getLayer("selected-circle")) {
-    map.addLayer({
-      id: "selected-circle",
-      type: "circle",
-      source: "selected",
-      paint: {
-        "circle-color": palette.selectedFill,
-        "circle-radius": 16,
-        "circle-stroke-width": 4,
-        "circle-stroke-color": palette.selectedStroke,
-        "circle-opacity": 0.78,
-      },
-    });
-  }
-
   if (!map.getLayer("focus-halo")) {
     map.addLayer({
       id: "focus-halo",
@@ -411,6 +343,7 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
         "circle-opacity": 0.75,
         "circle-stroke-width": 1.5,
         "circle-stroke-color": palette.focusCore,
+        "circle-stroke-opacity": 0.75,
       },
     });
   }
@@ -428,20 +361,15 @@ function ensureOperationalLayers(map: Map, mapMode: MapMode) {
       },
     });
   }
-
   map.setPaintProperty("route-glow", "line-color", palette.glow);
   map.setPaintProperty("route-line", "line-color", palette.line);
-  map.setPaintProperty("browse-circles", "circle-stroke-color", palette.candidateStroke);
-  map.setPaintProperty("candidate-circles", "circle-stroke-color", palette.candidateStroke);
-  map.setPaintProperty("selected-circle", "circle-color", palette.selectedFill);
-  map.setPaintProperty("selected-circle", "circle-stroke-color", palette.selectedStroke);
   map.setPaintProperty("focus-halo", "circle-color", palette.focusHalo);
   map.setPaintProperty("focus-halo", "circle-stroke-color", palette.focusCore);
   map.setPaintProperty("focus-core", "circle-color", palette.focusCore);
 }
 
 function syncMapData(
-  map: Map,
+  map: MaplibreMap,
   route: RoutePlan,
   candidates: RouteCandidate[],
   browseCandidates: RouteCandidate[],
@@ -475,7 +403,7 @@ function syncMapData(
   updateSource(map, "focus", focusCollection(route));
 }
 
-function fitMapToContent(map: Map, route: RoutePlan, candidates: RouteCandidate[]) {
+function fitMapToContent(map: MaplibreMap, route: RoutePlan, candidates: RouteCandidate[]) {
   if (isLocationFocusRoute(route)) {
     if (candidates.length > 0) {
       const bounds = new maplibregl.LngLatBounds();
@@ -516,8 +444,11 @@ export function RouteMap({
   onViewportChange,
   mapMode,
 }: Props) {
+  const [mapInstance, setMapInstance] = useState<MaplibreMap | null>(null);
+  const [isZoomedIn, setIsZoomedIn] = useState(false);
+  const [isZoomedOut, setIsZoomedOut] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<Map | null>(null);
+  const mapRef = useRef<MaplibreMap | null>(null);
   const onSelectRef = useRef(onSelect);
   const routeRef = useRef(route);
   const candidatesRef = useRef(candidates);
@@ -564,6 +495,9 @@ export function RouteMap({
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
     mapRef.current = map;
+    setMapInstance(map); // Store map purely to trigger React re-render of child markers
+    setIsZoomedIn(map.getZoom() > 11.5);
+    setIsZoomedOut(map.getZoom() < 10.0);
 
     const renderCurrentState = () => {
       const currentRoute = routeRef.current;
@@ -592,42 +526,15 @@ export function RouteMap({
         maxLng: bounds.getEast(),
       });
     });
-    map.on("click", "candidate-circles", (event) => {
-      const feature = event.features?.[0];
-      const id = feature?.properties?.id;
-
-      if (typeof id === "string") {
-        onSelectRef.current(id);
-      }
+    map.on("click", () => {
+      // Any click that reaches the MapLibre canvas wasn't caught by a StationMarker overlay
+      // Therefore, it's a click on an empty area of the map or the route line.
+      onSelectRef.current(null);
     });
-    map.on("mouseenter", "candidate-circles", () => {
-      map.getCanvas().style.cursor = "pointer";
-    });
-    map.on("mouseleave", "candidate-circles", () => {
-      map.getCanvas().style.cursor = "";
-    });
-    map.on("click", "browse-circles", (event) => {
-      const feature = event.features?.[0];
-      const id = feature?.properties?.id;
-
-      if (typeof id === "string") {
-        onSelectRef.current(id);
-      }
-    });
-    map.on("click", (event) => {
-      const features = map.queryRenderedFeatures(event.point, {
-        layers: ["candidate-circles", "browse-circles"],
-      });
-
-      if (features.length === 0) {
-        onSelectRef.current(null);
-      }
-    });
-    map.on("mouseenter", "browse-circles", () => {
-      map.getCanvas().style.cursor = "pointer";
-    });
-    map.on("mouseleave", "browse-circles", () => {
-      map.getCanvas().style.cursor = "";
+    map.on("zoom", () => {
+      const zoom = map.getZoom();
+      setIsZoomedIn(zoom > 11.5);
+      setIsZoomedOut(zoom < 10.0);
     });
     map.on("moveend", () => {
       const bounds = map.getBounds();
@@ -639,7 +546,34 @@ export function RouteMap({
       });
     });
 
+    let frameId: number;
+    const animatePulse = (timestamp: number) => {
+      const currentMap = mapRef.current;
+      if (currentMap?.getLayer("focus-halo")) {
+        // Continuous smooth oscillation between 0 and 1
+        const phase = (Math.sin(timestamp / 800) + 1) / 2;
+        
+        // "Breathing" radius: smoothly grows and shrinks between roughly 12px and 22px
+        const radius = 12 + 10 * phase;
+        
+        // Intelligently linked opacity: when the halo is smallest, it glows brightest (0.7).
+        // When it expands, the light "dilutes" and becomes more transparent (0.3).
+        const opacity = 0.7 - 0.4 * phase;
+        
+        try {
+          currentMap.setPaintProperty("focus-halo", "circle-radius", radius);
+          currentMap.setPaintProperty("focus-halo", "circle-opacity", opacity);
+          currentMap.setPaintProperty("focus-halo", "circle-stroke-opacity", opacity);
+        } catch (error) {
+          // Layer might be rendering or map disconnected temporarily
+        }
+      }
+      frameId = requestAnimationFrame(animatePulse);
+    };
+    frameId = requestAnimationFrame(animatePulse);
+
     return () => {
+      cancelAnimationFrame(frameId);
       map.remove();
       mapRef.current = null;
     };
@@ -712,13 +646,30 @@ export function RouteMap({
 
   useEffect(() => {
     const map = mapRef.current;
-
-    if (!map || !map.isStyleLoaded()) {
-      return;
-    }
-
+    if (!map) return;
     fitMapToContent(map, route, candidates);
-  }, [route.routeId]);
+  }, [route.routeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  // Merge candidate lists without duplicates
+  const allCandidates = new Map<string, RouteCandidate>();
+  candidates.forEach(c => allCandidates.set(c.stationId, c));
+  browseCandidates.forEach(c => allCandidates.set(c.stationId, c));
+
+  return (
+    <>
+      <div ref={containerRef} className="h-full w-full" />
+      {mapInstance &&
+        Array.from(allCandidates.values()).map((candidate) => (
+          <StationMarker
+            key={candidate.stationId}
+            map={mapInstance}
+            candidate={candidate}
+            isSelected={selectedStationId === candidate.stationId || hoveredStationId === candidate.stationId}
+            isZoomedIn={isZoomedIn}
+            isZoomedOut={isZoomedOut}
+            onClick={onSelect}
+          />
+        ))}
+    </>
+  );
 }

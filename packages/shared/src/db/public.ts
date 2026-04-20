@@ -90,7 +90,7 @@ function makeTariffSummary(
   return summary;
 }
 
-async function loadStationRows(stationId?: string, client?: PoolClient) {
+async function loadStationRows(stationCode?: string, client?: PoolClient) {
   const executor = client ?? getPool();
   const result = await executor.query<StationRow>(
     `select
@@ -121,10 +121,10 @@ async function loadStationRows(stationId?: string, client?: PoolClient) {
         on c.id = s.cpo_id
  left join station_overrides o
         on o.station_id = s.id
-     where ($1::uuid is null or s.id = $1::uuid)
+     where ($1::text is null or s.station_code = $1::text)
        and coalesce(o.is_hidden, false) = false
      order by c.name asc, name asc`,
-    [stationId ?? null],
+    [stationCode ?? null],
   );
 
   return result.rows;
@@ -181,8 +181,42 @@ async function loadTariffRows(stationIds: string[], client?: PoolClient) {
   };
 }
 
-export async function listStationRecordsDb(stationId?: string, client?: PoolClient) {
-  const stationRows = await loadStationRows(stationId, client);
+export async function loadChargePointRowsDb(stationCode: string, client?: PoolClient) {
+  const executor = client ?? getPool();
+  const result = await executor.query<{
+    charge_point_code: string;
+    current_type: string;
+    max_power_kw: number | null;
+    last_status_canonical: string;
+    connector_types: string[];
+    connector_powers: (number | null)[];
+  }>(
+    `select
+        cp.charge_point_code,
+        cp.current_type,
+        cp.max_power_kw::float8,
+        cp.last_status_canonical,
+        coalesce(
+          array_agg(c.connector_type order by c.id) filter (where c.id is not null),
+          '{}'
+        ) as connector_types,
+        coalesce(
+          array_agg(c.max_power_kw::float8 order by c.id) filter (where c.id is not null),
+          '{}'
+        ) as connector_powers
+       from charge_points cp
+       join stations s on s.id = cp.station_id
+  left join connectors c on c.charge_point_id = cp.id
+      where s.station_code = $1
+      group by cp.id, cp.charge_point_code, cp.current_type, cp.max_power_kw, cp.last_status_canonical
+      order by cp.charge_point_code`,
+    [stationCode],
+  );
+  return result.rows;
+}
+
+export async function listStationRecordsDb(stationCode?: string, client?: PoolClient) {
+  const stationRows = await loadStationRows(stationCode, client);
   const { tariffs, components } = await loadTariffRows(
     stationRows.map((row) => row.station_id),
     client,

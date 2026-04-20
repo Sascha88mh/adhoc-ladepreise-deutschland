@@ -162,9 +162,25 @@ export async function triggerFeedAction(id: string, action: "test" | "sync") {
   return response.data;
 }
 
+export async function terminateFeedRun(id: string) {
+  const response = await requestJson<{ data: { terminatedPids: number[]; updatedRuns: number } }>(
+    `/api/admin/feeds/${id}/terminate`,
+    {
+      method: "POST",
+    },
+  );
+  return response.data;
+}
+
 export async function fetchSyncRuns(): Promise<SyncRun[]> {
   const response = await requestJson<{ data: SyncRun[] }>("/api/admin/sync-runs");
   return response.data;
+}
+
+export async function cleanupStuckSyncRuns() {
+  return requestJson<{ cleaned: number }>("/api/admin/sync-runs", {
+    method: "DELETE",
+  });
 }
 
 export async function searchAdminStations(query: string): Promise<AdminStationRecord[]> {

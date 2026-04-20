@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { AnimatePresence, motion } from "framer-motion";
-import { LoaderCircle, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { LoaderCircle, PanelRightClose, PanelRightOpen, Layers } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type {
   CandidateFilters,
@@ -92,7 +92,8 @@ export function RoutePlannerShell({
 }: Props) {
   function effectiveFilters(source: CandidateFilters, mode: SearchQueryState["mode"]) {
     if (mode === "location") {
-      const { corridorKm, ...rest } = source;
+      const rest = { ...source };
+      delete rest.corridorKm;
       return rest;
     }
 
@@ -129,6 +130,7 @@ export function RoutePlannerShell({
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const autoLocatedRef = useRef(false);
+  const manualSearchRef = useRef(false);
   const [detailOpen, setDetailOpen] = useState(
     Boolean(initialResults.candidates[0]?.stationId),
   );
@@ -138,11 +140,25 @@ export function RoutePlannerShell({
     maxLat: number;
     maxLng: number;
   } | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
   const mapCandidates = query.mode === "route" ? results.candidates : [];
   const activeStationId = selectedStationId;
   const activeDetail =
     detail?.stationId === activeStationId ? detail : null;
   const showRouteCandidatesUi = query.mode === "route";
+  const globalLoading = routeLoading || resultsLoading;
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      setRefreshTick((current) => current + 1);
+    }, 60_000);
+
+    return () => window.clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     let ignore = false;
@@ -187,7 +203,7 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, showRouteCandidatesUi]);
+  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, showRouteCandidatesUi]);
 
   useEffect(() => {
     if (!mapBounds) {
@@ -219,7 +235,7 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [mapBounds, debouncedFilters, query.mode]);
+  }, [mapBounds, debouncedFilters, query.mode, refreshTick]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -231,10 +247,20 @@ export function RoutePlannerShell({
 
     async function loadDetail() {
       setDetailLoading(true);
+      setError(null);
       try {
         const next = await fetchStationDetail(stationId);
         if (!ignore) {
           setDetail(next);
+        }
+      } catch (caught) {
+        if (!ignore) {
+          setDetail(null);
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : "Stationsdetails konnten nicht geladen werden.",
+          );
         }
       } finally {
         if (!ignore) {
@@ -328,7 +354,7 @@ export function RoutePlannerShell({
 
         const nextRoute = await fetchLocationFocus(`${lat}, ${lng}`);
 
-        if (ignore) {
+        if (ignore || manualSearchRef.current) {
           return;
         }
 
@@ -374,6 +400,7 @@ export function RoutePlannerShell({
               destination: query.destination,
               profile: "auto",
             });
+      manualSearchRef.current = true;
       setRoute(nextRoute);
       setSelectedStationId(null);
       setDetail(null);
@@ -413,9 +440,9 @@ export function RoutePlannerShell({
         />
       </div>
 
-      {/* Top Left Floating Search Bar */}
-      <div className="pointer-events-none absolute left-4 top-4 z-20 w-[min(22rem,calc(100vw-2rem))]">
-        <div className="pointer-events-auto shadow-2xl rounded-[30px] glass-panel-strong">
+      {/* Top Left Floating Controls (Search & Filters) */}
+      <div className="pointer-events-none absolute left-4 top-4 bottom-4 z-30 flex flex-col items-start gap-4 w-[calc(100vw-2rem)] sm:w-[24rem]">
+        <div className="pointer-events-auto w-full shrink-0 shadow-[0_8px_30px_rgb(0,0,0,0.12)] rounded-[30px] glass-panel-strong">
           <RouteSearchBar
             query={query}
             onChange={setQuery}
@@ -423,11 +450,14 @@ export function RoutePlannerShell({
             pending={routeLoading}
           />
         </div>
-      </div>
 
-      {/* Bottom Filter Sheet */}
-      <div className="pointer-events-none absolute bottom-4 left-4 z-20 w-[min(25rem,calc(100vw-2rem))]">
-        <div className="pointer-events-auto overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong">
+        <motion.div 
+          layout
+          initial={false}
+          animate={{ borderRadius: filtersOpen ? 32 : 40 }}
+          transition={{ type: "spring", bounce: 0, duration: 0.35 }}
+          className="pointer-events-auto w-full min-h-0 flex flex-col overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.12)] glass-panel-strong"
+        >
           <FilterRail
             filters={filters}
             onChange={setFilters}
@@ -438,7 +468,7 @@ export function RoutePlannerShell({
             onToggle={() => setFiltersOpen((current) => !current)}
             showCorridorFilter={query.mode === "route"}
           />
-        </div>
+        </motion.div>
       </div>
 
       {/* Right Floating Candidate List */}
@@ -465,22 +495,31 @@ export function RoutePlannerShell({
       </AnimatePresence>
 
       {/* Map Style Switcher */}
-      <div className="pointer-events-none absolute right-[4.8rem] top-3 z-20">
-        <div className="pointer-events-auto flex items-center gap-2 rounded-[22px] p-2 shadow-2xl glass-panel-strong">
-          {MAP_MODE_OPTIONS.map((option) => (
-            <button
-              key={option.id}
-              type="button"
-              onClick={() => setMapMode(option.id)}
-              className={`rounded-full px-3 py-2 text-xs font-medium transition ${
-                mapMode === option.id
-                  ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_10px_18px_rgba(21,111,99,0.22)]"
-                  : "border border-[var(--line)] bg-white/78 text-[var(--foreground)] hover:bg-white"
-              }`}
-            >
-              {option.label}
-            </button>
-          ))}
+      <div className="pointer-events-none absolute right-[4.8rem] top-3 z-20 flex justify-end">
+        <div className="group pointer-events-auto flex items-center rounded-full p-1 shadow-2xl glass-panel-strong transition-colors hover:bg-white/95">
+          <div className="flex max-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap pl-0 opacity-0 transition-all duration-300 ease-in-out group-hover:max-w-[20rem] group-hover:pl-1 group-hover:pr-2 group-hover:opacity-100">
+            {MAP_MODE_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setMapMode(option.id)}
+                className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                  mapMode === option.id
+                    ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_4px_10px_rgba(21,111,99,0.22)]"
+                    : "border border-[var(--line)] bg-white/70 text-[var(--foreground)] hover:bg-white"
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-fg)] shadow-[0_4px_10px_rgba(21,111,99,0.2)] transition-transform group-hover:scale-105"
+            aria-label="Kartenstil auswählen"
+          >
+            <Layers size={16} />
+          </button>
         </div>
       </div>
 
@@ -501,9 +540,9 @@ export function RoutePlannerShell({
         </div>
       ) : null}
 
-      {(routeLoading || resultsLoading || detailLoading || error) && (
-        <div className="glass-panel-strong absolute left-1/2 top-40 z-30 flex -translate-x-1/2 items-center gap-3 rounded-full px-5 py-3 text-sm text-[var(--foreground)] shadow-2xl">
-          {(routeLoading || resultsLoading || detailLoading) && (
+      {(globalLoading || error) && (
+        <div className="glass-panel-strong absolute bottom-24 right-6 z-30 flex max-w-[min(28rem,calc(100vw-3rem))] items-center gap-3 rounded-full px-5 py-3 text-sm text-[var(--foreground)] shadow-2xl sm:bottom-6">
+          {globalLoading && (
             <LoaderCircle className="h-4 w-4 animate-spin text-[var(--accent)]" />
           )}
           {routeLoading && (
@@ -520,13 +559,13 @@ export function RoutePlannerShell({
                 : "Berechne Kandidaten entlang der Route..."}
             </span>
           )}
-          {!routeLoading && !resultsLoading && detailLoading && <span>Lade Stationsdetails...</span>}
           {error && <span className="text-[#9c4110]">{error}</span>}
         </div>
       )}
 
       <StationDrawer
         detail={activeDetail}
+        loading={detailLoading}
         open={detailOpen && Boolean(activeStationId)}
         onClose={() => {
           setDetailOpen(false);
