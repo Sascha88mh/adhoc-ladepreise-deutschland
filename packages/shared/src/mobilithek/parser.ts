@@ -75,17 +75,7 @@ export function sanitizeMobilithekJsonPayload(payload: string) {
 }
 
 function parseMobilithekJson(payload: string): Record<string, unknown> {
-  try {
-    return JSON.parse(payload) as Record<string, unknown>;
-  } catch (error) {
-    const sanitized = sanitizeMobilithekJsonPayload(payload);
-
-    if (sanitized !== payload) {
-      return JSON.parse(sanitized) as Record<string, unknown>;
-    }
-
-    throw error;
-  }
+  return JSON.parse(sanitizeMobilithekJsonPayload(payload)) as Record<string, unknown>;
 }
 
 function normalizeStatus(value: string | undefined): ChargePointStatus {

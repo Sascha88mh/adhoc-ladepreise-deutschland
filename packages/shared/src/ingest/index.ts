@@ -192,17 +192,7 @@ function errorMessage(error: unknown) {
 }
 
 function parsePayloadJson(payload: string) {
-  try {
-    return JSON.parse(payload) as Record<string, unknown>;
-  } catch (error) {
-    const sanitized = sanitizeMobilithekJsonPayload(payload);
-
-    if (sanitized !== payload) {
-      return JSON.parse(sanitized) as Record<string, unknown>;
-    }
-
-    throw error;
-  }
+  return JSON.parse(sanitizeMobilithekJsonPayload(payload)) as Record<string, unknown>;
 }
 
 async function withFeedLock<T>(
