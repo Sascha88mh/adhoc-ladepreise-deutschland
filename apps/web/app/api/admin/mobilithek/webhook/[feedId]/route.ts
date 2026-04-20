@@ -15,11 +15,16 @@ function sanitizePayload(raw: string): string {
     .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
 }
 
-function decodeBody(buffer: Buffer): string {
-  // Detect gzip by magic bytes 0x1F 0x8B — don't rely on Content-Encoding header
-  // since Netlify may strip it while leaving the body compressed.
-  const isGzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
-  return (isGzip ? gunzipSync(buffer) : buffer).toString("utf-8");
+async function readBodyBuffer(request: Request): Promise<Buffer> {
+  // Use ReadableStream reader to get raw bytes, bypassing any Request-level encoding
+  const chunks: Buffer[] = [];
+  const reader = request.body!.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
 }
 
 export async function POST(
@@ -28,12 +33,16 @@ export async function POST(
 ) {
   const { feedId } = await params;
   try {
-    const raw = decodeBody(Buffer.from(await request.arrayBuffer()));
+    const buffer = await readBodyBuffer(request);
+    const firstBytesHex = buffer.slice(0, 4).toString("hex");
+    const isGzip = buffer[0] === 0x1f && buffer[1] === 0x8b;
+    const raw = isGzip ? gunzipSync(buffer).toString("utf-8") : buffer.toString("utf-8");
     const payload = sanitizePayload(raw);
     await processFeedWebhook(feedId, payload, request.headers.get("x-webhook-secret"));
     return Response.json({ ok: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Webhook processing failed";
+    // TODO: remove firstBytesHex from response after diagnosis
     return Response.json({ error: message }, { status: message === "Feed not found" ? 404 : 500 });
   }
 }
