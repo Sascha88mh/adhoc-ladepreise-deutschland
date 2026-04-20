@@ -63,7 +63,7 @@ export function StationMarker({ map, candidate, isSelected, isZoomedIn, isZoomed
   const trackColor = "#e2e8f0"; // Slate 200 for sharp contrast
   const textColor = hasAvailability ? "text-[#156f63]" : "text-[#b96710]";
 
-  const appleSpring = { type: "spring", stiffness: 350, damping: 30, mass: 1 };
+  const appleSpring = { type: "spring" as const, stiffness: 350, damping: 30, mass: 1 };
 
   if (isZoomedOut) {
     return createPortal(

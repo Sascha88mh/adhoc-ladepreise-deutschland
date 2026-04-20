@@ -194,7 +194,7 @@ export function FilterRail({
   else if (isPowerTierActive(filters, "DC")) activeTier = "DC";
   else if (isPowerTierActive(filters, "HPC")) activeTier = "HPC";
 
-  const appleSpring = { type: "spring", bounce: 0, duration: 0.35 };
+  const appleSpring = { type: "spring" as const, bounce: 0, duration: 0.35 };
 
   return (
     <aside className="relative flex flex-col h-full min-h-0">
