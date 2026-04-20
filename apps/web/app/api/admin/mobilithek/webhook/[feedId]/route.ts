@@ -1,4 +1,5 @@
 import { processFeedWebhook } from "@adhoc/shared/ingest";
+// cache-bust: force rebuild after sanitizer fix
 
 export async function POST(
   request: Request,
