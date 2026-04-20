@@ -1,4 +1,5 @@
 import { processFeedWebhook } from "@adhoc/shared/ingest";
+import { gunzipSync } from "zlib";
 
 function sanitizePayload(raw: string): string {
   return raw
@@ -14,11 +15,18 @@ function sanitizePayload(raw: string): string {
     .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
 }
 
+async function readBody(request: Request): Promise<string> {
+  const buffer = Buffer.from(await request.arrayBuffer());
+  const encoding = request.headers.get("content-encoding") ?? "";
+  const bytes = encoding.includes("gzip") ? gunzipSync(buffer) : buffer;
+  return bytes.toString("utf-8");
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ feedId: string }> },
 ) {
-  const payload = sanitizePayload(await request.text());
+  const payload = sanitizePayload(await readBody(request));
   const { feedId } = await params;
   try {
     await processFeedWebhook(feedId, payload, request.headers.get("x-webhook-secret"));
