@@ -109,6 +109,32 @@ function powerCategoryLabel(powerKw: number | null) {
   return `${powerKw} kW`;
 }
 
+function connectorLabel(type: string) {
+  const normalized = type.toLowerCase();
+
+  if (normalized.includes("chademo")) {
+    return "Chademo";
+  }
+
+  if (
+    normalized.includes("iec62196t2combo") ||
+    normalized.includes("combo") ||
+    normalized.includes("ccs")
+  ) {
+    return "CCS";
+  }
+
+  if (
+    normalized.includes("iec62196t2") ||
+    normalized.includes("type2") ||
+    normalized.includes("typ2")
+  ) {
+    return "Typ 2";
+  }
+
+  return type;
+}
+
 function tariffSignature(detail: StationDetail, tariff: StationDetail["tariffs"][number]) {
   const chargePointCode = parseChargePointCodeFromTariffId(tariff.id);
   const powerKw =
@@ -132,23 +158,33 @@ function groupedTariffs(detail: StationDetail) {
       powerKw: number | null;
       tariff: StationDetail["tariffs"][number];
       chargePointCount: number;
+      connectorTypes: string[];
     }
   >();
 
   for (const tariff of detail.tariffs) {
     const chargePointCode = parseChargePointCodeFromTariffId(tariff.id);
-    const powerKw =
-      detail.chargePoints.find((chargePoint) => chargePoint.code === chargePointCode)?.maxPowerKw ?? null;
+    const chargePoint = detail.chargePoints.find((entry) => entry.code === chargePointCode);
+    const powerKw = chargePoint?.maxPowerKw ?? null;
     const key = tariffSignature(detail, tariff);
     const current = grouped.get(key);
 
     if (current) {
       current.chargePointCount += 1;
+      current.connectorTypes = Array.from(
+        new Set([
+          ...current.connectorTypes,
+          ...(chargePoint?.connectors.map((connector) => connectorLabel(connector.type)) ?? []),
+        ]),
+      ).sort();
     } else {
       grouped.set(key, {
         powerKw,
         tariff,
         chargePointCount: 1,
+        connectorTypes: Array.from(
+          new Set(chargePoint?.connectors.map((connector) => connectorLabel(connector.type)) ?? []),
+        ).sort(),
       });
     }
   }
@@ -239,15 +275,27 @@ export function StationDrawer({ detail, loading, open, onClose }: Props) {
 
                 <div className="mb-5 space-y-3">
                   {detail.tariffs.length ? (
-                    groupedTariffs(detail).map(({ powerKw, tariff, chargePointCount }) => (
+                    groupedTariffs(detail).map(({ powerKw, tariff, chargePointCount, connectorTypes }) => (
                       <div key={tariff.id} className="rounded-[24px] border border-[var(--line)] p-4">
                         <div className="mb-3 flex items-start justify-between gap-3">
                           <div>
-                            <p className="metric-label mb-1">Preiskategorie</p>
+                            <p className="metric-label mb-1">Leistungsklasse</p>
                             <h4 className="font-semibold">{powerCategoryLabel(powerKw)}</h4>
                             <p className="mt-1 text-sm text-[var(--muted)]">
                               {chargePointCount} Ladepunkt{chargePointCount === 1 ? "" : "e"} in dieser Preisgruppe
                             </p>
+                            {connectorTypes.length ? (
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {connectorTypes.map((connectorType) => (
+                                  <span
+                                    key={`${tariff.id}-${connectorType}`}
+                                    className="rounded-xl border border-[var(--line)] bg-[var(--accent-soft)] px-3 py-1 text-xs font-medium text-[var(--accent)] shadow-sm"
+                                  >
+                                    {connectorType}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
                           </div>
                           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 text-xs text-[var(--accent)]">
                             {tariff.isComplete ? "vollständig" : "teilweise"}
