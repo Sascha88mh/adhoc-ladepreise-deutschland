@@ -2,6 +2,7 @@ import type {
   ChargePointStatus,
   Coordinate,
   CurrentType,
+  TariffCap,
   StationRecord,
   TariffSummary,
 } from "../domain/types";
@@ -11,8 +12,25 @@ export type ParsedConnector = {
   maxPowerKw: number | null;
 };
 
+export type ParsedTariffComponent = {
+  componentType: "pricePerKWh" | "pricePerMinute" | "sessionFee" | "preauth" | "blockingFee";
+  amount: number;
+  startsAfterMinutes: number | null;
+  priceCap: number | null;
+  timeBasedApplicability: Record<string, unknown> | null;
+  overallPeriod: Record<string, unknown> | null;
+  energyBasedApplicability: Record<string, unknown> | null;
+  taxIncluded: boolean | null;
+  taxRate: number | null;
+};
+
 export type ParsedTariff = TariffSummary & {
   id: string;
+  externalCode: string;
+  scope: "charge_point" | "station";
+  scopeCode: string;
+  components: ParsedTariffComponent[];
+  caps: TariffCap[];
 };
 
 export type ParsedChargePoint = {

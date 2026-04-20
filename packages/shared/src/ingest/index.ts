@@ -89,26 +89,48 @@ function summarizeTariff(tariff: TariffSummary) {
   });
 }
 
+function tariffFingerprint(tariff: ParsedTariff) {
+  return JSON.stringify({
+    id: tariff.id,
+    externalCode: tariff.externalCode,
+    label: tariff.label,
+    currency: tariff.currency,
+    isComplete: tariff.isComplete,
+    paymentMethods: [...tariff.paymentMethods].sort(),
+    brandsAccepted: [...tariff.brandsAccepted].sort(),
+    caps: tariff.caps
+      .map((cap) => `${cap.label}|${cap.amount}|${cap.currency}`)
+      .sort(),
+    components: tariff.components.map((component) => ({
+      componentType: component.componentType,
+      amount: component.amount,
+      startsAfterMinutes: component.startsAfterMinutes,
+      priceCap: component.priceCap,
+      timeBasedApplicability: component.timeBasedApplicability,
+      overallPeriod: component.overallPeriod,
+      energyBasedApplicability: component.energyBasedApplicability,
+      taxIncluded: component.taxIncluded,
+      taxRate: component.taxRate,
+    })),
+  });
+}
+
+type TariffShapeRow = {
+  stationId: string;
+  cpId: string | null;
+  code: string;
+  externalCode: string;
+  scope: ParsedTariff["scope"];
+  label: string;
+  currency: string;
+  isComplete: boolean;
+  tariff: ParsedTariff;
+};
+
 function mergeTariffShapes(
-  existing: {
-    stationId: string;
-    cpId: string | null;
-    code: string;
-    label: string;
-    currency: string;
-    isComplete: boolean;
-    tariff: ParsedTariff;
-  },
-  incoming: {
-    stationId: string;
-    cpId: string | null;
-    code: string;
-    label: string;
-    currency: string;
-    isComplete: boolean;
-    tariff: ParsedTariff;
-  },
-) {
+  existing: TariffShapeRow,
+  incoming: TariffShapeRow,
+): TariffShapeRow {
   const mergedPaymentMethods = Array.from(
     new Set([...existing.tariff.paymentMethods, ...incoming.tariff.paymentMethods]),
   );
@@ -131,6 +153,8 @@ function mergeTariffShapes(
         ? existing.cpId
         : null,
     code: existing.code,
+    externalCode: existing.externalCode,
+    scope: existing.scope,
     label: existing.label || incoming.label,
     currency: existing.currency || incoming.currency,
     isComplete: existing.isComplete || incoming.isComplete,
@@ -151,6 +175,14 @@ function mergeTariffShapes(
       paymentMethods: mergedPaymentMethods,
       brandsAccepted: mergedBrandsAccepted,
       isComplete: existing.tariff.isComplete || incoming.tariff.isComplete,
+      components: Array.from(
+        new Map(
+          [...existing.tariff.components, ...incoming.tariff.components].map((component) => [
+            JSON.stringify(component),
+            component,
+          ]),
+        ).values(),
+      ),
     },
   };
 }
@@ -346,15 +378,19 @@ async function insertTariffShape(
     `insert into tariffs (
         station_id,
         charge_point_id,
+        tariff_key,
         tariff_code,
+        tariff_scope,
         label,
         currency,
         is_complete,
         updated_at
-      ) values ($1::uuid, $2::uuid, $3, $4, $5, $6, now())
-      on conflict (tariff_code) do update
+      ) values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, now())
+      on conflict (tariff_key) do update
         set station_id = excluded.station_id,
             charge_point_id = excluded.charge_point_id,
+            tariff_code = excluded.tariff_code,
+            tariff_scope = excluded.tariff_scope,
             label = excluded.label,
             currency = excluded.currency,
             is_complete = excluded.is_complete,
@@ -364,6 +400,8 @@ async function insertTariffShape(
       input.stationId,
       input.chargePointId,
       input.tariff.id,
+      input.tariff.externalCode,
+      input.tariff.scope,
       input.tariff.label,
       input.tariff.currency,
       input.tariff.isComplete,
@@ -376,32 +414,48 @@ async function insertTariffShape(
   await client.query(`delete from tariff_payment_methods where tariff_id = $1::uuid`, [tariffId]);
   await client.query(`delete from tariff_brands_accepted where tariff_id = $1::uuid`, [tariffId]);
 
-  const componentRows: Array<[string, number | null, number | null, number | null]> = [];
-  if (input.tariff.pricePerKwh != null) {
-    componentRows.push(["pricePerKWh", input.tariff.pricePerKwh, null, null]);
-  }
-  if (input.tariff.pricePerMinute != null) {
-    componentRows.push(["pricePerMinute", input.tariff.pricePerMinute, null, null]);
-  }
-  if (input.tariff.sessionFee != null) {
-    componentRows.push(["sessionFee", input.tariff.sessionFee, null, null]);
-  }
-  if (input.tariff.preauthAmount != null) {
-    componentRows.push(["preauth", input.tariff.preauthAmount, null, null]);
-  }
-  if (input.tariff.blockingFeePerMinute != null) {
-    componentRows.push([
-      "blockingFee",
-      input.tariff.blockingFeePerMinute,
-      input.tariff.blockingFeeStartsAfterMinutes,
-      null,
-    ]);
-  }
-  for (const cap of input.tariff.caps) {
-    componentRows.push(["cap", null, null, cap.amount]);
+  const componentRows = input.tariff.components.map((component) => ({
+    componentType: component.componentType,
+    amount: component.amount,
+    startsAfterMinutes: component.startsAfterMinutes,
+    priceCap: component.priceCap,
+    taxIncluded: component.taxIncluded,
+    taxRate: component.taxRate,
+    overallPeriod: component.overallPeriod,
+    timeBasedApplicability: component.timeBasedApplicability,
+    energyBasedApplicability: component.energyBasedApplicability,
+  }));
+
+  for (const component of componentRows) {
+    await client.query(
+      `insert into tariff_components (
+          tariff_id,
+          component_type,
+          amount,
+          starts_after_minutes,
+          price_cap,
+          tax_included,
+          tax_rate,
+          overall_period,
+          time_based_applicability,
+          energy_based_applicability
+        ) values ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb)`,
+      [
+        tariffId,
+        component.componentType,
+        component.amount,
+        component.startsAfterMinutes,
+        component.priceCap,
+        component.taxIncluded,
+        component.taxRate,
+        component.overallPeriod ? JSON.stringify(component.overallPeriod) : null,
+        component.timeBasedApplicability ? JSON.stringify(component.timeBasedApplicability) : null,
+        component.energyBasedApplicability ? JSON.stringify(component.energyBasedApplicability) : null,
+      ],
+    );
   }
 
-  for (const [componentType, amount, startsAfterMinutes, priceCap] of componentRows) {
+  for (const cap of input.tariff.caps) {
     await client.query(
       `insert into tariff_components (
           tariff_id,
@@ -409,8 +463,8 @@ async function insertTariffShape(
           amount,
           starts_after_minutes,
           price_cap
-        ) values ($1::uuid, $2, $3, $4, $5)`,
-      [tariffId, componentType, amount, startsAfterMinutes, priceCap],
+        ) values ($1::uuid, 'cap', null, null, $2)`,
+      [tariffId, cap.amount],
     );
   }
 
@@ -435,8 +489,10 @@ async function insertTariffShape(
   return tariffId;
 }
 
-async function loadCurrentTariffSummary(client: PoolClient, tariffCode: string) {
+async function loadCurrentTariffFingerprint(client: PoolClient, tariffKey: string) {
   const result = await client.query<{
+    tariff_key: string;
+    tariff_code: string;
     label: string;
     currency: string;
     is_complete: boolean;
@@ -444,10 +500,17 @@ async function loadCurrentTariffSummary(client: PoolClient, tariffCode: string) 
     amount: number | null;
     starts_after_minutes: number | null;
     price_cap: number | null;
+    tax_included: boolean | null;
+    tax_rate: number | null;
+    overall_period: Record<string, unknown> | null;
+    time_based_applicability: Record<string, unknown> | null;
+    energy_based_applicability: Record<string, unknown> | null;
     payment_methods: string[];
     brands: string[];
   }>(
     `select
+        t.tariff_key,
+        t.tariff_code,
         t.label,
         t.currency,
         t.is_complete,
@@ -455,6 +518,11 @@ async function loadCurrentTariffSummary(client: PoolClient, tariffCode: string) 
         c.amount::float8 as amount,
         c.starts_after_minutes,
         c.price_cap::float8 as price_cap,
+        c.tax_included,
+        c.tax_rate::float8 as tax_rate,
+        c.overall_period,
+        c.time_based_applicability,
+        c.energy_based_applicability,
         coalesce(
           array(
             select payment_method
@@ -476,53 +544,34 @@ async function loadCurrentTariffSummary(client: PoolClient, tariffCode: string) 
       from tariffs t
  left join tariff_components c
         on c.tariff_id = t.id
-     where t.tariff_code = $1`,
-    [tariffCode],
+     where t.tariff_key = $1`,
+    [tariffKey],
   );
 
   if (!result.rows.length) {
     return null;
   }
 
-  const first = result.rows[0];
-  const summary: TariffSummary = {
-    id: tariffCode,
-    label: first.label,
-    currency: first.currency,
-    pricePerKwh: null,
-    pricePerMinute: null,
-    sessionFee: null,
-    preauthAmount: null,
-    blockingFeePerMinute: null,
-    blockingFeeStartsAfterMinutes: null,
-    caps: [],
-    paymentMethods: first.payment_methods ?? [],
-    brandsAccepted: first.brands ?? [],
-    isComplete: first.is_complete,
-  };
-
-  for (const row of result.rows) {
-    if (row.component_type === "pricePerKWh") {
-      summary.pricePerKwh = row.amount;
-    } else if (row.component_type === "pricePerMinute") {
-      summary.pricePerMinute = row.amount;
-    } else if (row.component_type === "sessionFee") {
-      summary.sessionFee = row.amount;
-    } else if (row.component_type === "preauth") {
-      summary.preauthAmount = row.amount;
-    } else if (row.component_type === "blockingFee") {
-      summary.blockingFeePerMinute = row.amount;
-      summary.blockingFeeStartsAfterMinutes = row.starts_after_minutes;
-    } else if (row.component_type === "cap" && row.price_cap != null) {
-      summary.caps.push({
-        label: "priceCap",
-        amount: row.price_cap,
-        currency: first.currency,
-      });
-    }
-  }
-
-  return summary;
+  return JSON.stringify(
+    result.rows.map((row) => ({
+      tariffKey: row.tariff_key,
+      tariffCode: row.tariff_code,
+      label: row.label,
+      currency: row.currency,
+      isComplete: row.is_complete,
+      componentType: row.component_type,
+      amount: row.amount,
+      startsAfterMinutes: row.starts_after_minutes,
+      priceCap: row.price_cap,
+      taxIncluded: row.tax_included,
+      taxRate: row.tax_rate,
+      overallPeriod: row.overall_period,
+      timeBasedApplicability: row.time_based_applicability,
+      energyBasedApplicability: row.energy_based_applicability,
+      paymentMethods: row.payment_methods,
+      brands: row.brands,
+    })),
+  );
 }
 
 async function upsertStaticCatalog(
@@ -640,65 +689,133 @@ async function upsertStaticCatalog(
   }
 
   // ── 5. Tariffs (bulk upsert per charge-point, then components) ─────────────
-  const tariffRows: Array<{ stationId: string; cpId: string | null; code: string; label: string; currency: string; isComplete: boolean; tariff: typeof allCps[0]["tariffs"][0] }> = [];
+  const tariffRows: TariffShapeRow[] = [];
   for (const cp of allCps) {
     const cpId = cpIdMap.get(cp.code) ?? null;
     const stationId = cp.stationId;
-    for (const tariff of cp.tariffs) tariffRows.push({ stationId, cpId, code: tariff.id, label: tariff.label ?? "", currency: tariff.currency ?? "EUR", isComplete: tariff.isComplete ?? false, tariff });
+    for (const tariff of cp.tariffs) {
+      tariffRows.push({
+        stationId,
+        cpId,
+        code: tariff.id,
+        externalCode: tariff.externalCode,
+        scope: tariff.scope,
+        label: tariff.label ?? "",
+        currency: tariff.currency ?? "EUR",
+        isComplete: tariff.isComplete ?? false,
+        tariff,
+      });
+    }
   }
-  const uniqueTariffRows = [...tariffRows.reduce((acc, row) => {
-    const current = acc.get(row.code);
-    acc.set(row.code, current ? mergeTariffShapes(current, row) : row);
-    return acc;
-  }, new Map<string, typeof tariffRows[number]>()).values()];
+  const uniqueTariffRows = [
+    ...tariffRows.reduce<Map<string, TariffShapeRow>>((acc, row) => {
+      const current = acc.get(row.code);
+      acc.set(row.code, current ? mergeTariffShapes(current, row) : row);
+      return acc;
+    }, new Map()).values(),
+  ];
 
   if (uniqueTariffRows.length) {
-    const tariffResult = await client.query<{ tariff_code: string; id: string }>(
-      `insert into tariffs (station_id, charge_point_id, tariff_code, label, currency, is_complete, updated_at)
-       select t.sid::uuid, t.cpid::uuid, t.code, t.label, t.currency, t.complete, now()
-       from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bool[]) as t(sid, cpid, code, label, currency, complete)
-       on conflict (tariff_code) do update
+    const tariffResult = await client.query<{ tariff_key: string; id: string }>(
+      `insert into tariffs (station_id, charge_point_id, tariff_key, tariff_code, tariff_scope, label, currency, is_complete, updated_at)
+       select t.sid::uuid, t.cpid::uuid, t.tkey, t.tcode, t.tscope, t.label, t.currency, t.complete, now()
+       from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bool[]) as t(sid, cpid, tkey, tcode, tscope, label, currency, complete)
+       on conflict (tariff_key) do update
          set station_id = excluded.station_id, charge_point_id = excluded.charge_point_id,
+             tariff_code = excluded.tariff_code, tariff_scope = excluded.tariff_scope,
              label = excluded.label, currency = excluded.currency, is_complete = excluded.is_complete, updated_at = now()
-       returning tariff_code, id::text`,
+       returning tariff_key, id::text`,
       [
         uniqueTariffRows.map((t) => t.stationId),
         uniqueTariffRows.map((t) => t.cpId),
         uniqueTariffRows.map((t) => t.code),
+        uniqueTariffRows.map((t) => t.externalCode),
+        uniqueTariffRows.map((t) => t.scope),
         uniqueTariffRows.map((t) => t.label),
         uniqueTariffRows.map((t) => t.currency),
         uniqueTariffRows.map((t) => t.isComplete),
       ],
     );
-    const tariffIdMap = new Map(tariffResult.rows.map((r) => [r.tariff_code, r.id]));
+    const tariffIdMap = new Map(tariffResult.rows.map((r) => [r.tariff_key, r.id]));
     const allTariffIds = tariffResult.rows.map((r) => r.id);
 
     await client.query(`delete from tariff_components where tariff_id = any($1::uuid[])`, [allTariffIds]);
     await client.query(`delete from tariff_payment_methods where tariff_id = any($1::uuid[])`, [allTariffIds]);
     await client.query(`delete from tariff_brands_accepted where tariff_id = any($1::uuid[])`, [allTariffIds]);
 
-    const compRows: Array<[string, string, number | null, number | null, number | null]> = [];
+    const compRows: Array<{
+      tariffId: string;
+      componentType: string;
+      amount: number | null;
+      startsAfterMinutes: number | null;
+      priceCap: number | null;
+      taxIncluded: boolean | null;
+      taxRate: number | null;
+      overallPeriod: string | null;
+      timeBasedApplicability: string | null;
+      energyBasedApplicability: string | null;
+    }> = [];
     const pmRows: Array<[string, string]> = [];
     const brandRows: Array<[string, string]> = [];
     for (const row of uniqueTariffRows) {
       const tid = tariffIdMap.get(row.code);
       if (!tid) continue;
       const t = row.tariff;
-      if (t.pricePerKwh != null) compRows.push([tid, "pricePerKWh", t.pricePerKwh, null, null]);
-      if (t.pricePerMinute != null) compRows.push([tid, "pricePerMinute", t.pricePerMinute, null, null]);
-      if (t.sessionFee != null) compRows.push([tid, "sessionFee", t.sessionFee, null, null]);
-      if (t.preauthAmount != null) compRows.push([tid, "preauth", t.preauthAmount, null, null]);
-      if (t.blockingFeePerMinute != null) compRows.push([tid, "blockingFee", t.blockingFeePerMinute, t.blockingFeeStartsAfterMinutes ?? null, null]);
-      for (const cap of t.caps ?? []) compRows.push([tid, "cap", null, null, cap.amount]);
+      for (const component of t.components ?? []) {
+        compRows.push({
+          tariffId: tid,
+          componentType: component.componentType,
+          amount: component.amount,
+          startsAfterMinutes: component.startsAfterMinutes,
+          priceCap: component.priceCap,
+          taxIncluded: component.taxIncluded,
+          taxRate: component.taxRate,
+          overallPeriod: component.overallPeriod ? JSON.stringify(component.overallPeriod) : null,
+          timeBasedApplicability: component.timeBasedApplicability ? JSON.stringify(component.timeBasedApplicability) : null,
+          energyBasedApplicability: component.energyBasedApplicability ? JSON.stringify(component.energyBasedApplicability) : null,
+        });
+      }
+      for (const cap of t.caps ?? []) {
+        compRows.push({
+          tariffId: tid,
+          componentType: "cap",
+          amount: null,
+          startsAfterMinutes: null,
+          priceCap: cap.amount,
+          taxIncluded: null,
+          taxRate: null,
+          overallPeriod: null,
+          timeBasedApplicability: null,
+          energyBasedApplicability: null,
+        });
+      }
       for (const pm of t.paymentMethods ?? []) pmRows.push([tid, pm]);
       for (const brand of t.brandsAccepted ?? []) brandRows.push([tid, brand]);
     }
     if (compRows.length) {
       await client.query(
-        `insert into tariff_components (tariff_id, component_type, amount, starts_after_minutes, price_cap)
-         select t.tid::uuid, t.ctype, t.amount, t.sam, t.pcap
-         from unnest($1::text[], $2::text[], $3::float8[], $4::float8[], $5::float8[]) as t(tid, ctype, amount, sam, pcap)`,
-        [compRows.map((r) => r[0]), compRows.map((r) => r[1]), compRows.map((r) => r[2]), compRows.map((r) => r[3]), compRows.map((r) => r[4])],
+        `insert into tariff_components (
+            tariff_id, component_type, amount, starts_after_minutes, price_cap,
+            tax_included, tax_rate, overall_period, time_based_applicability, energy_based_applicability
+          )
+         select t.tid::uuid, t.ctype, t.amount, t.sam, t.pcap, t.tax_included, t.tax_rate,
+                t.overall_period::jsonb, t.time_based_applicability::jsonb, t.energy_based_applicability::jsonb
+         from unnest(
+           $1::text[], $2::text[], $3::float8[], $4::float8[], $5::float8[],
+           $6::bool[], $7::float8[], $8::text[], $9::text[], $10::text[]
+         ) as t(tid, ctype, amount, sam, pcap, tax_included, tax_rate, overall_period, time_based_applicability, energy_based_applicability)`,
+        [
+          compRows.map((r) => r.tariffId),
+          compRows.map((r) => r.componentType),
+          compRows.map((r) => r.amount),
+          compRows.map((r) => r.startsAfterMinutes),
+          compRows.map((r) => r.priceCap),
+          compRows.map((r) => r.taxIncluded),
+          compRows.map((r) => r.taxRate),
+          compRows.map((r) => r.overallPeriod),
+          compRows.map((r) => r.timeBasedApplicability),
+          compRows.map((r) => r.energyBasedApplicability),
+        ],
       );
     }
     if (pmRows.length) {
@@ -735,7 +852,7 @@ async function upsertStaticCatalog(
     );
     if (tariffRows.length) {
       await client.query(
-        `delete from tariffs where station_id = any($1::uuid[]) and not (tariff_code = any($2::text[]))`,
+        `delete from tariffs where station_id = any($1::uuid[]) and not (tariff_key = any($2::text[]))`,
         [stationIdsByCode, tariffRows.map((t) => t.code)],
       );
     }
@@ -845,22 +962,22 @@ async function applyDynamicUpdates(
 
     if (feed.ingestPrices) {
       for (const tariff of update.tariffs) {
-        const before = await loadCurrentTariffSummary(client, tariff.id);
+        const before = await loadCurrentTariffFingerprint(client, tariff.id);
         const tariffId = await insertTariffShape(client, {
           stationId: chargePoint.station_id,
           chargePointId: chargePoint.id,
           tariff,
         });
-        const afterSummary = summarizeTariff(tariff);
+        const afterFingerprint = tariffFingerprint(tariff);
 
-        if (!before || summarizeTariff(before) !== afterSummary) {
+        if (!before || before !== afterFingerprint) {
           await client.query(
             `insert into price_snapshots (
                 tariff_id,
                 recorded_at,
                 summary
               ) values ($1::uuid, $2::timestamptz, $3::jsonb)`,
-            [tariffId, updateTime, afterSummary],
+            [tariffId, updateTime, summarizeTariff(tariff)],
           );
           await client.query(
             `update stations

@@ -97,6 +97,69 @@ function money(value: number | null | undefined) {
   return `${value.toFixed(2).replace(".", ",")} €`;
 }
 
+function parseChargePointCodeFromTariffId(tariffId: string) {
+  const [scope, scopeCode] = tariffId.split("|");
+  return scope === "charge_point" ? scopeCode : null;
+}
+
+function powerCategoryLabel(powerKw: number | null) {
+  if (powerKw == null) {
+    return "Leistung unbekannt";
+  }
+  return `${powerKw} kW`;
+}
+
+function tariffSignature(detail: StationDetail, tariff: StationDetail["tariffs"][number]) {
+  const chargePointCode = parseChargePointCodeFromTariffId(tariff.id);
+  const powerKw =
+    detail.chargePoints.find((chargePoint) => chargePoint.code === chargePointCode)?.maxPowerKw ?? null;
+
+  return JSON.stringify({
+    powerKw,
+    pricePerKwh: tariff.pricePerKwh,
+    pricePerMinute: tariff.pricePerMinute,
+    sessionFee: tariff.sessionFee,
+    preauthAmount: tariff.preauthAmount,
+    blockingFeePerMinute: tariff.blockingFeePerMinute,
+    blockingFeeStartsAfterMinutes: tariff.blockingFeeStartsAfterMinutes,
+  });
+}
+
+function groupedTariffs(detail: StationDetail) {
+  const grouped = new Map<
+    string,
+    {
+      powerKw: number | null;
+      tariff: StationDetail["tariffs"][number];
+      chargePointCount: number;
+    }
+  >();
+
+  for (const tariff of detail.tariffs) {
+    const chargePointCode = parseChargePointCodeFromTariffId(tariff.id);
+    const powerKw =
+      detail.chargePoints.find((chargePoint) => chargePoint.code === chargePointCode)?.maxPowerKw ?? null;
+    const key = tariffSignature(detail, tariff);
+    const current = grouped.get(key);
+
+    if (current) {
+      current.chargePointCount += 1;
+    } else {
+      grouped.set(key, {
+        powerKw,
+        tariff,
+        chargePointCount: 1,
+      });
+    }
+  }
+
+  return [...grouped.values()].sort((left, right) => {
+    const leftPower = left.powerKw ?? -1;
+    const rightPower = right.powerKw ?? -1;
+    return rightPower - leftPower || (left.tariff.pricePerKwh ?? 999) - (right.tariff.pricePerKwh ?? 999);
+  });
+}
+
 export function StationDrawer({ detail, loading, open, onClose }: Props) {
   return (
     <AnimatePresence>
@@ -176,12 +239,15 @@ export function StationDrawer({ detail, loading, open, onClose }: Props) {
 
                 <div className="mb-5 space-y-3">
                   {detail.tariffs.length ? (
-                    detail.tariffs.map((tariff) => (
+                    groupedTariffs(detail).map(({ powerKw, tariff, chargePointCount }) => (
                       <div key={tariff.id} className="rounded-[24px] border border-[var(--line)] p-4">
                         <div className="mb-3 flex items-start justify-between gap-3">
                           <div>
-                            <p className="metric-label mb-1">Tarif</p>
-                            <h4 className="font-semibold">{tariff.label}</h4>
+                            <p className="metric-label mb-1">Preiskategorie</p>
+                            <h4 className="font-semibold">{powerCategoryLabel(powerKw)}</h4>
+                            <p className="mt-1 text-sm text-[var(--muted)]">
+                              {chargePointCount} Ladepunkt{chargePointCount === 1 ? "" : "e"} in dieser Preisgruppe
+                            </p>
                           </div>
                           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1 text-xs text-[var(--accent)]">
                             {tariff.isComplete ? "vollständig" : "teilweise"}

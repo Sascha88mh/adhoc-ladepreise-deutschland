@@ -5,6 +5,15 @@ Für Feed-System-Details → `docs/FEEDS.md` (Single Source of Truth).
 
 ---
 
+## Kommunikationsstil
+
+- Datei- und Zeilenlinks in Antworten nur sparsam verwenden.
+- Solche Links nur dann einfügen, wenn sie den konkreten Punkt wesentlich klarer machen, z. B. bei Review-Findings, Debugging-Hinweisen oder gezielten Codeverweisen.
+- Keine automatische Pfad-Link-Sammlung an fast jeden Satz anhängen.
+- Wenn ein normaler Klartextsatz ausreicht, Klartext ohne Datei-Link bevorzugen.
+
+---
+
 ## Projektstruktur
 
 ```

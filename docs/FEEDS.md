@@ -364,6 +364,10 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
   Der Parser (ab 2026-04-19) nutzt `maxPowerAtSocket` als Fallback automatisch.
   Ändert Tesla seine Payload-Struktur, hier dokumentieren.
 - Alle Sites haben exakt eine `energyInfrastructureStation` → kein Aggregierungs-Problem.
+- **Preise in den bisher geprüften Beispielpayloads:**
+  Tesla-Static enthielt keine `energyRate`/`energyPrice`.
+  Tesla-Dynamic nutzte `aegiElectricChargingPointStatus`, enthielt im geprüften Delta aber ebenfalls keine `energyRateUpdate`.
+  Fazit: Tesla kann Status bereits liefern; Preislieferung ist in den vorliegenden Beispielen nicht belegt.
 
 ### Vaylens
 - Credentials: globale `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` in `app_secrets`.
@@ -377,9 +381,26 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 - Globales `MOBILITHEK_*`-Cert reicht.
 - EnBW liefert in der echten Payload `operator.externalIdentifier[0].identifier = "EBW"` und `name = "ENBW"`.
   `feed_configs.cpo_id` daher entweder leer lassen oder exakt an der Payload ausrichten; nicht blind `enbw` erzwingen.
-- Static-Payload verwendet wiederkehrende `tariff.id`-Werte über mehrere Charge Points hinweg.
-  Der Static-Ingest muss Tarife daher vor dem Bulk-Upsert per `tariff_code` deduplizieren, sonst bricht Postgres mit
-  `ON CONFLICT DO UPDATE command cannot affect row a second time` ab.
+- **Tarifidentität:**
+  EnBW verwendet im Static Feed denselben rohen Tarifcode `adHoc` an sehr vielen Ladepunkten und Standorten,
+  aber mit unterschiedlichen Preisformen.
+  `tariff_code` ist deshalb **nicht global eindeutig** und darf nie als Primärschlüssel oder Upsert-Key behandelt werden.
+  Die Plattform verwendet dafür ab 2026-04-20 `tariff_key = <scope>|<scopeCode>|<externalTariffCode>`.
+  Neue CPO-Anbindungen müssen dieselbe Regel einhalten.
+- **Preise im Static Feed:**
+  EnBW liefert echte `energyRate`-/`energyPrice`-Daten.
+  In den geprüften Payloads tauchten mehrere Preisformen auf, unter anderem:
+  `0.66386555 €/kWh + 0.20 €/min ab Minute 30` und
+  `0.58823529 €/kWh + 0.10 €/min ab Minute 120`.
+  Das sind standort- oder ladepunktabhängige Preisformen trotz identischem externem Tarifcode.
+- **Zeitlogik:**
+  In den geprüften EnBW-Preisobjekten gab es keine echten Tageszeit- oder Kalenderfenster.
+  `timeBasedApplicability` wurde nur sessionbezogen genutzt (`ab Minute X`).
+  Echte Tag-/Nachtlogik wäre DATEX-seitig eher über `overallPeriod` zu erwarten und muss bei neuen CPOs gezielt geprüft werden.
+- **Dynamic-Statusformat:**
+  EnBW-Deltas nutzen in den geprüften Beispielen `aegiRefillPointStatus`, nicht `aegiElectricChargingPointStatus`.
+  Parser und zukünftige Agenten müssen beide Varianten unterstützen.
+  `outOfOrder` ist fachlich als `OUT_OF_SERVICE` zu behandeln.
 - **Site-Level-Aggregierung (ab 2026-04-19):**
   EnBW-Sites haben oft mehrere `energyInfrastructureStation`-Einträge (Stand April 2026: 1333 von 2506 Sites).
   Jede `energyInfrastructureStation` entspricht einer **physischen Ladesäule** am selben Standort.
@@ -409,6 +430,12 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 > Verschachtelungstiefe und optionale Felder weichen regelmäßig vom offiziellen Schema ab
 > (Vaylens: `locationReference` auf Station-Ebene statt Site-Ebene war ein solches Beispiel).
 
+Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
+- Niemals annehmen, dass `tariff_code` global eindeutig ist. Immer prüfen, ob derselbe externe Code an mehreren Standorten oder Ladepunkten wiederverwendet wird.
+- Dynamic-Feeds nicht nur auf `aegiElectricChargingPointStatus` prüfen. Auch `aegiRefillPointStatus` und stationbezogene Statusobjekte sind schema-konform.
+- `timeBasedApplicability` ist Sessionlogik, nicht automatisch Tageszeitlogik. Für Tag-/Nachtpreise gezielt nach `overallPeriod` in Preisobjekten suchen.
+- Vor dem Aktivieren von `ingest_prices` immer mindestens einen echten Static- und einen echten Dynamic-Payload des CPO prüfen.
+
 | Falle | Symptom | Lösung |
 |-------|---------|--------|
 | `app_secrets`-INSERT vergessen | „Kein Mobilithek-Client-Zertifikat" für Feeds ohne Netlify-Env-Var | INSERT für `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` — Werte in §3.3 |
@@ -416,7 +443,8 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 | Advisory Lock hängt (pgBouncer Transaction Mode) | Feed stale, FEHLER=Keine, Lock-belegt-Einträge in sync_runs | Seit 2026-04-19 `pg_try_advisory_xact_lock` — Locks lösen sich beim Commit/Rollback |
 | `0 Stationen verarbeitet` bei neuem CPO | Feed sync grün, aber keine Marker auf Karte | `locationReference` prüfen — ist sie auf Site- oder Station-Ebene? Troubleshooting §7 |
 | Testlauf wirkt wie echter Sync | `last_success_at`/`last_delta_count` sehen grün aus, aber `stations` bleibt unverändert | Nur `kind = manual`/Scheduler-Läufe persistieren Katalogdaten. `kind = test` ist Dry-Run und darf nicht als produktiver Erfolg interpretiert werden |
-| EnBW Static bricht in DB-Schreibphase ab | Test ok, echter Sync failt ohne sichtbare Stationen | Auf doppelte `tariff.id` in der Payload prüfen; Tarife vor Bulk-Upsert deduplizieren (§9 EnBW / EAAZE) |
+| Falsche Tarifüberschreibung bei CPOs mit wiederverwendetem Tarifcode | Preise eines Standorts überschreiben Preise eines anderen | Tarife immer über `tariff_key = scope + scopeCode + externalTariffCode` identifizieren, nie nur über `tariff_code` |
+| Dynamic-Feed schreibt keine Statusänderungen obwohl Payload ok aussieht | Delta enthält `refillPointStatus`, aber DB bleibt unverändert | Prüfen, ob der Feed `aegiRefillPointStatus` statt `aegiElectricChargingPointStatus` nutzt; beide Varianten müssen geparst werden |
 | Payload > 200 MB | axios-Timeout oder silent truncation | `MAX_RESPONSE_BYTES` in `client.ts` hochsetzen (aktuell 200 MB) |
 | `APP_DATA_SOURCE` nicht gesetzt | DB-Fallback für Credentials wird übersprungen | Netlify Env: `APP_DATA_SOURCE=db` setzen |
 | Falsche Ladepunkt-Anzahl / Leistung (EnBW-Muster) | Frontend zeigt z.B. „2 Ladepunkte, 150 kW" statt „8 Ladepunkte, 300 kW" | Mehrere `energyInfrastructureStation` pro Site werden nicht aggregiert. Parser ab 2026-04-19 fasst alles per Site zusammen (§9 EnBW). Nach Code-Änderung Feed manuell neu synchronisieren. |
@@ -427,6 +455,10 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 
 ## 11. Änderungshistorie dieser Doku
 
+- **2026-04-20 v5** — Preis-/Statuslogik für neue CPOs geschärft:
+  1. **Tarifinstanzen statt globalem Tarifcode** (§9 EnBW, §10): `tariff_code` darf nicht mehr als global eindeutiger Schlüssel verstanden werden; neue Regel ist `tariff_key = scope + scopeCode + externalTariffCode`.
+  2. **Dynamic-Statusvarianten dokumentiert** (§9 Tesla, §9 EnBW, §10): Tesla-Beispiele nutzen `aegiElectricChargingPointStatus`, EnBW-Beispiele `aegiRefillPointStatus`; beide sind zu unterstützen.
+  3. **Preisbefunde festgehalten** (§9 Tesla, §9 EnBW): Tesla-Beispielpayloads ohne Preise, EnBW-Static mit echten standortabhängigen Preisformen und sessionbezogener Minutenlogik.
 - **2026-04-19 v4** — Zwei Parser-Bugs gefixt und dokumentiert:
   1. **Tesla `maxPowerAtSocket`-Fallback** (§9 Tesla, §10): `availableChargingPower` ist in Tesla-Payloads generell `null`; Leistung jetzt aus `connector.maxPowerAtSocket` gezogen.
   2. **EnBW Site-Level-Aggregierung** (§9 EnBW, §10): Parser gibt jetzt exakt eine DB-Station pro `energyInfrastructureSite` zurück (statt eine pro `energyInfrastructureStation`), wenn die Site eigene Koordinaten + Adresse hat. Station-Code = `site.idG`. Betrifft 1333 von 2506 EnBW-Sites mit mehreren Ladesäulen.

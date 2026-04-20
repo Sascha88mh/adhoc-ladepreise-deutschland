@@ -8,6 +8,7 @@ import type {
 import type {
   ParsedChargePoint,
   ParsedConnector,
+  ParsedTariffComponent,
   ParsedDynamicFeed,
   ParsedDynamicUpdate,
   ParsedStaticFeed,
@@ -110,7 +111,7 @@ function normalizeStatus(value: string | undefined): ChargePointStatus {
     return "BLOCKED";
   }
 
-  if (["outofservice", "out_of_service", "faulted", "offline"].includes(normalized)) {
+  if (["outofservice", "out_of_service", "outoforder", "faulted", "inoperative", "offline"].includes(normalized)) {
     return "OUT_OF_SERVICE";
   }
 
@@ -119,6 +120,14 @@ function normalizeStatus(value: string | undefined): ChargePointStatus {
   }
 
   return "UNKNOWN";
+}
+
+function buildTariffId(
+  scope: ParsedTariff["scope"],
+  scopeCode: string,
+  externalCode: string,
+) {
+  return `${scope}|${scopeCode}|${externalCode}`;
 }
 
 function parseTariff(rate: {
@@ -133,17 +142,29 @@ function parseTariff(rate: {
     priceType?: { value?: string };
     value?: number;
     priceCap?: number;
+    taxIncluded?: boolean;
+    taxRate?: number;
+    overallPeriod?: Record<string, unknown>;
     timeBasedApplicability?: { fromMinute?: number };
+    energyBasedApplicability?: Record<string, unknown>;
   }>;
+},
+identity: {
+  scope: ParsedTariff["scope"];
+  scopeCode: string;
 }): ParsedTariff {
+  const externalCode =
+    rate.idG ??
+    stableId([
+      readMultilingual(rate.rateName),
+      rate.applicableCurrency?.[0],
+      JSON.stringify(rate.energyPrice ?? []),
+    ]);
   const summary: ParsedTariff = {
-    id:
-      rate.idG ??
-      stableId([
-        readMultilingual(rate.rateName),
-        rate.applicableCurrency?.[0],
-        JSON.stringify(rate.energyPrice ?? []),
-      ]),
+    id: buildTariffId(identity.scope, identity.scopeCode, externalCode),
+    externalCode,
+    scope: identity.scope,
+    scopeCode: identity.scopeCode,
     label: readMultilingual(rate.rateName) ?? "Ad-hoc",
     currency: rate.applicableCurrency?.[0] ?? "EUR",
     pricePerKwh: null,
@@ -160,22 +181,50 @@ function parseTariff(rate: {
       .map((brand) => brand.value)
       .filter((value): value is string => Boolean(value)),
     isComplete: true,
+    components: [],
   };
 
   for (const price of rate.energyPrice ?? []) {
     const priceType = price.priceType?.value?.toLowerCase();
+    const component: ParsedTariffComponent = {
+      componentType: "pricePerKWh",
+      amount: price.value ?? 0,
+      startsAfterMinutes: price.timeBasedApplicability?.fromMinute ?? null,
+      priceCap: price.priceCap ?? null,
+      timeBasedApplicability:
+        price.timeBasedApplicability != null
+          ? (price.timeBasedApplicability as Record<string, unknown>)
+          : null,
+      overallPeriod: price.overallPeriod ?? null,
+      energyBasedApplicability: price.energyBasedApplicability ?? null,
+      taxIncluded: price.taxIncluded ?? null,
+      taxRate: price.taxRate ?? null,
+    };
 
     if (priceType === "priceperkwh") {
       summary.pricePerKwh = price.value ?? null;
+      summary.components.push(component);
     } else if (priceType === "priceperminute") {
       if (price.timeBasedApplicability?.fromMinute != null) {
         summary.blockingFeePerMinute = price.value ?? null;
         summary.blockingFeeStartsAfterMinutes = price.timeBasedApplicability.fromMinute;
+        summary.components.push({
+          ...component,
+          componentType: "blockingFee",
+        });
       } else {
         summary.pricePerMinute = price.value ?? null;
+        summary.components.push({
+          ...component,
+          componentType: "pricePerMinute",
+        });
       }
     } else if (priceType === "pricepersession" || priceType === "flatfee") {
       summary.sessionFee = price.value ?? null;
+      summary.components.push({
+        ...component,
+        componentType: "sessionFee",
+      });
     }
 
     if (price.priceCap != null) {
@@ -246,7 +295,12 @@ function parseChargePoint(
   }));
 
   const tariffs = (point.electricEnergy ?? []).flatMap((energy) =>
-    (energy.energyRate ?? []).map((rate) => parseTariff(rate)),
+    (energy.energyRate ?? []).map((rate) =>
+      parseTariff(rate, {
+        scope: "charge_point",
+        scopeCode: chargePointCode,
+      }),
+    ),
   );
 
   return {
@@ -524,7 +578,29 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
                         priceType?: { value?: string };
                         value?: number;
                         priceCap?: number;
+                        taxIncluded?: boolean;
+                        taxRate?: number;
+                        overallPeriod?: Record<string, unknown>;
                         timeBasedApplicability?: { fromMinute?: number };
+                        energyBasedApplicability?: Record<string, unknown>;
+                      }>;
+                      energyRateReference?: { idG?: string };
+                    }>;
+                  };
+                  aegiRefillPointStatus?: {
+                    reference?: { idG?: string };
+                    status?: { value?: string };
+                    lastUpdated?: string;
+                    energyRateUpdate?: Array<{
+                      energyPrice?: Array<{
+                        priceType?: { value?: string };
+                        value?: number;
+                        priceCap?: number;
+                        taxIncluded?: boolean;
+                        taxRate?: number;
+                        overallPeriod?: Record<string, unknown>;
+                        timeBasedApplicability?: { fromMinute?: number };
+                        energyBasedApplicability?: Record<string, unknown>;
                       }>;
                       energyRateReference?: { idG?: string };
                     }>;
@@ -539,11 +615,14 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
 
   const updates =
     messageContainer?.payload?.flatMap((item) =>
-      (item.aegiEnergyInfrastructureStatusPublication?.energyInfrastructureSiteStatus ?? []).flatMap((site) =>
-        (site.energyInfrastructureStationStatus ?? []).flatMap((station) =>
+        (item.aegiEnergyInfrastructureStatusPublication?.energyInfrastructureSiteStatus ?? []).flatMap((site) =>
+          (site.energyInfrastructureStationStatus ?? []).flatMap((station) =>
           (station.refillPointStatus ?? []).flatMap((pointStatus) => {
-            const point = pointStatus.aegiElectricChargingPointStatus;
-            if (!point?.reference?.idG) {
+            const point =
+              pointStatus.aegiElectricChargingPointStatus ??
+              pointStatus.aegiRefillPointStatus;
+            const scopeCode = point?.reference?.idG;
+            if (!scopeCode) {
               return [];
             }
 
@@ -551,12 +630,15 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
               parseTariff({
                 idG: rate.energyRateReference?.idG,
                 energyPrice: rate.energyPrice,
+              }, {
+                scope: "charge_point",
+                scopeCode,
               }),
             );
 
             return [
               {
-                chargePointId: point.reference.idG,
+                chargePointId: scopeCode,
                 statusRaw: point.status?.value?.toUpperCase() ?? "UNKNOWN",
                 statusCanonical: normalizeStatus(point.status?.value),
                 tariffs,

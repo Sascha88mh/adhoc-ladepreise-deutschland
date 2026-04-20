@@ -161,7 +161,7 @@ export function StationMarker({ map, candidate, isSelected, isZoomedIn, isZoomed
                 <>
                   <div className="mx-2 h-3.5 w-[1.5px] rounded-full bg-slate-300" />
                   <span className="text-[11.5px] font-semibold tracking-tight text-slate-700 whitespace-nowrap">
-                    {(price / 100).toFixed(2).replace('.', ',')}€
+                    {price.toFixed(2).replace('.', ',')}€
                   </span>
                 </>
               )}

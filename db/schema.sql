@@ -146,7 +146,9 @@ CREATE TABLE tariffs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   station_id UUID NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
   charge_point_id UUID REFERENCES charge_points(id) ON DELETE CASCADE,
-  tariff_code TEXT NOT NULL UNIQUE,
+  tariff_key TEXT NOT NULL UNIQUE,
+  tariff_code TEXT NOT NULL,
+  tariff_scope TEXT NOT NULL CHECK (tariff_scope IN ('station', 'charge_point')),
   label TEXT NOT NULL,
   currency CHAR(3) NOT NULL DEFAULT 'EUR',
   is_complete BOOLEAN NOT NULL DEFAULT false,
@@ -159,6 +161,7 @@ CREATE TABLE tariffs (
 
 CREATE INDEX idx_tariffs_station ON tariffs(station_id);
 CREATE INDEX idx_tariffs_charge_point ON tariffs(charge_point_id);
+CREATE INDEX idx_tariffs_station_code ON tariffs(station_id, tariff_code);
 
 CREATE TABLE tariff_components (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -177,7 +180,11 @@ CREATE TABLE tariff_components (
   unit TEXT,
   starts_after_minutes INTEGER,
   price_cap NUMERIC(10, 2),
+  tax_included BOOLEAN,
+  tax_rate NUMERIC(6, 3),
+  overall_period JSONB,
   time_based_applicability JSONB,
+  energy_based_applicability JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

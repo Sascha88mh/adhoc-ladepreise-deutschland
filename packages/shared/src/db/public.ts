@@ -3,6 +3,11 @@ import type { StationRecord, TariffSummary } from "../domain/types";
 import { stationRecordSchema } from "../domain/types";
 import { getPool } from "./pool";
 
+type TariffSchemaCapabilities = {
+  hasTariffKey: boolean;
+  hasComponentTaxMeta: boolean;
+};
+
 type StationRow = {
   station_id: string;
   station_code: string;
@@ -30,6 +35,7 @@ type StationRow = {
 
 type TariffRow = {
   station_id: string;
+  tariff_key: string;
   tariff_code: string;
   label: string;
   currency: string;
@@ -39,19 +45,37 @@ type TariffRow = {
 };
 
 type ComponentRow = {
-  tariff_code: string;
+  tariff_key: string;
   component_type: string;
   amount: number | null;
   starts_after_minutes: number | null;
   price_cap: number | null;
+  tax_included: boolean | null;
+  tax_rate: number | null;
 };
+
+function grossAmount(
+  amount: number | null,
+  taxIncluded: boolean | null,
+  taxRate: number | null,
+) {
+  if (amount == null) {
+    return null;
+  }
+
+  if (taxIncluded !== false || taxRate == null) {
+    return amount;
+  }
+
+  return amount * (1 + taxRate / 100);
+}
 
 function makeTariffSummary(
   row: TariffRow,
   components: ComponentRow[],
 ): TariffSummary {
   const summary: TariffSummary = {
-    id: row.tariff_code,
+    id: row.tariff_key,
     label: row.label,
     currency: row.currency,
     pricePerKwh: null,
@@ -68,15 +92,35 @@ function makeTariffSummary(
 
   for (const component of components) {
     if (component.component_type === "pricePerKWh") {
-      summary.pricePerKwh = component.amount;
+      summary.pricePerKwh = grossAmount(
+        component.amount,
+        component.tax_included,
+        component.tax_rate,
+      );
     } else if (component.component_type === "pricePerMinute") {
-      summary.pricePerMinute = component.amount;
+      summary.pricePerMinute = grossAmount(
+        component.amount,
+        component.tax_included,
+        component.tax_rate,
+      );
     } else if (component.component_type === "sessionFee") {
-      summary.sessionFee = component.amount;
+      summary.sessionFee = grossAmount(
+        component.amount,
+        component.tax_included,
+        component.tax_rate,
+      );
     } else if (component.component_type === "preauth") {
-      summary.preauthAmount = component.amount;
+      summary.preauthAmount = grossAmount(
+        component.amount,
+        component.tax_included,
+        component.tax_rate,
+      );
     } else if (component.component_type === "blockingFee") {
-      summary.blockingFeePerMinute = component.amount;
+      summary.blockingFeePerMinute = grossAmount(
+        component.amount,
+        component.tax_included,
+        component.tax_rate,
+      );
       summary.blockingFeeStartsAfterMinutes = component.starts_after_minutes;
     } else if (component.component_type === "cap" && component.price_cap != null) {
       summary.caps.push({
@@ -88,6 +132,59 @@ function makeTariffSummary(
   }
 
   return summary;
+}
+
+async function getTariffSchemaCapabilities(client?: PoolClient) {
+  if (client) {
+    const result = await client.query<{
+      has_tariff_key: boolean;
+      has_component_tax_meta: boolean;
+    }>(
+      `select
+          exists (
+            select 1
+              from information_schema.columns
+             where table_name = 'tariffs'
+               and column_name = 'tariff_key'
+          ) as has_tariff_key,
+          exists (
+            select 1
+              from information_schema.columns
+             where table_name = 'tariff_components'
+               and column_name = 'tax_included'
+          ) as has_component_tax_meta`,
+    );
+
+    return {
+      hasTariffKey: Boolean(result.rows[0]?.has_tariff_key),
+      hasComponentTaxMeta: Boolean(result.rows[0]?.has_component_tax_meta),
+    };
+  }
+
+  const pool = getPool();
+  const result = await pool.query<{
+    has_tariff_key: boolean;
+    has_component_tax_meta: boolean;
+  }>(
+    `select
+        exists (
+          select 1
+            from information_schema.columns
+           where table_name = 'tariffs'
+             and column_name = 'tariff_key'
+        ) as has_tariff_key,
+        exists (
+          select 1
+            from information_schema.columns
+           where table_name = 'tariff_components'
+             and column_name = 'tax_included'
+        ) as has_component_tax_meta`,
+  );
+
+  return {
+    hasTariffKey: Boolean(result.rows[0]?.has_tariff_key),
+    hasComponentTaxMeta: Boolean(result.rows[0]?.has_component_tax_meta),
+  };
 }
 
 async function loadStationRows(stationCode?: string, client?: PoolClient) {
@@ -139,9 +236,20 @@ async function loadTariffRows(stationIds: string[], client?: PoolClient) {
   }
 
   const executor = client ?? getPool();
+  const capabilities = await getTariffSchemaCapabilities(client);
+  const tariffIdentitySql = capabilities.hasTariffKey
+    ? "t.tariff_key"
+    : "t.tariff_code";
+  const componentTaxIncludedSql = capabilities.hasComponentTaxMeta
+    ? "c.tax_included"
+    : "null::boolean";
+  const componentTaxRateSql = capabilities.hasComponentTaxMeta
+    ? "c.tax_rate::float8"
+    : "null::float8";
   const tariffResult = await executor.query<TariffRow>(
     `select
         t.station_id::text as station_id,
+        ${tariffIdentitySql} as tariff_key,
         t.tariff_code,
         t.label,
         t.currency,
@@ -154,24 +262,26 @@ async function loadTariffRows(stationIds: string[], client?: PoolClient) {
  left join tariff_brands_accepted ba
         on ba.tariff_id = t.id
      where t.station_id = any($1::uuid[])
-     group by t.id, t.station_id, t.tariff_code, t.label, t.currency, t.is_complete`,
+     group by t.id, t.station_id, ${tariffIdentitySql}, t.tariff_code, t.label, t.currency, t.is_complete`,
     [stationIds],
   );
 
-  const codes = tariffResult.rows.map((row) => row.tariff_code);
-  const componentResult = codes.length
+  const keys = tariffResult.rows.map((row) => row.tariff_key);
+  const componentResult = keys.length
     ? await executor.query<ComponentRow>(
         `select
-            t.tariff_code,
+            ${tariffIdentitySql} as tariff_key,
             c.component_type,
             c.amount::float8 as amount,
             c.starts_after_minutes,
-            c.price_cap::float8 as price_cap
+            c.price_cap::float8 as price_cap,
+            ${componentTaxIncludedSql} as tax_included,
+            ${componentTaxRateSql} as tax_rate
           from tariff_components c
           join tariffs t
             on t.id = c.tariff_id
-         where t.tariff_code = any($1::text[])`,
-        [codes],
+         where ${tariffIdentitySql} = any($1::text[])`,
+        [keys],
       )
     : { rows: [] as ComponentRow[] };
 
@@ -224,15 +334,15 @@ export async function listStationRecordsDb(stationCode?: string, client?: PoolCl
 
   const componentsByTariff = new Map<string, ComponentRow[]>();
   for (const component of components) {
-    const entry = componentsByTariff.get(component.tariff_code) ?? [];
+    const entry = componentsByTariff.get(component.tariff_key) ?? [];
     entry.push(component);
-    componentsByTariff.set(component.tariff_code, entry);
+    componentsByTariff.set(component.tariff_key, entry);
   }
 
   const tariffsByStation = new Map<string, TariffSummary[]>();
   for (const tariff of tariffs) {
     const entry = tariffsByStation.get(tariff.station_id) ?? [];
-    entry.push(makeTariffSummary(tariff, componentsByTariff.get(tariff.tariff_code) ?? []));
+    entry.push(makeTariffSummary(tariff, componentsByTariff.get(tariff.tariff_key) ?? []));
     tariffsByStation.set(tariff.station_id, entry);
   }
 
