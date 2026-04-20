@@ -7,6 +7,17 @@ type NominatimResult = {
   name?: string;
   display_name?: string;
   address?: {
+    house_number?: string;
+    road?: string;
+    pedestrian?: string;
+    footway?: string;
+    cycleway?: string;
+    path?: string;
+    square?: string;
+    neighbourhood?: string;
+    suburb?: string;
+    postcode?: string;
+    country?: string;
     city?: string;
     town?: string;
     village?: string;
@@ -69,8 +80,66 @@ function toRouteLocation(input: string, result: NominatimResult): RouteLocation 
   };
 }
 
+function germanLocality(address?: NominatimResult["address"]) {
+  return (
+    address?.city ??
+    address?.town ??
+    address?.village ??
+    address?.municipality ??
+    address?.county ??
+    null
+  );
+}
+
+function germanStreet(address?: NominatimResult["address"]) {
+  return (
+    address?.road ??
+    address?.pedestrian ??
+    address?.footway ??
+    address?.cycleway ??
+    address?.path ??
+    address?.square ??
+    null
+  );
+}
+
+function formatGermanAddress(result: NominatimResult) {
+  const street = germanStreet(result.address);
+  const houseNumber = result.address?.house_number?.trim();
+  const postcode = result.address?.postcode?.trim();
+  const locality = germanLocality(result.address);
+  const streetLine = [street, houseNumber].filter(Boolean).join(" ").trim();
+  const cityLine = [postcode, locality].filter(Boolean).join(" ").trim();
+
+  if (!streetLine && !cityLine) {
+    return null;
+  }
+
+  const baseAddress = [streetLine, cityLine].filter(Boolean).join(", ");
+  const name = result.name?.trim();
+
+  if (!name) {
+    return baseAddress;
+  }
+
+  const normalizedName = normalize(name);
+  if (
+    normalizedName === normalize(baseAddress) ||
+    (houseNumber && normalizedName === normalize(houseNumber)) ||
+    (streetLine && normalizedName === normalize(streetLine))
+  ) {
+    return baseAddress;
+  }
+
+  return `${name}, ${baseAddress}`;
+}
+
 function toLocationSuggestion(result: NominatimResult, index: number): LocationSuggestion {
-  const displayName = result.display_name?.trim() ?? result.name?.trim() ?? "Ort";
+  const displayName =
+    formatGermanAddress(result) ??
+    result.display_name?.trim() ??
+    result.name?.trim() ??
+    "Ort";
   const [primary, ...rest] = displayName
     .split(",")
     .map((part) => part.trim())

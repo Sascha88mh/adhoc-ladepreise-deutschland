@@ -58,8 +58,15 @@ describe("geocoder helpers", () => {
               place_id: 2,
               lat: "52.520008",
               lon: "13.404954",
-              name: "Brandenburger Tor",
-              display_name: "Brandenburger Tor, Pariser Platz, Berlin, Deutschland",
+              name: "176",
+              display_name: "176, Invalidenstraße, Mitte, Berlin, 10115, Deutschland",
+              address: {
+                house_number: "176",
+                road: "Invalidenstraße",
+                postcode: "10115",
+                city: "Berlin",
+                country: "Deutschland",
+              },
             }),
             {
               status: 200,
@@ -76,7 +83,8 @@ describe("geocoder helpers", () => {
 
     const result = await reverseGeocodeLocation(52.520008, 13.404954);
 
-    expect(result?.label).toBe("Brandenburger Tor");
-    expect(result?.secondaryLabel).toContain("Berlin");
+    expect(result?.label).toBe("176");
+    expect(result?.inputLabel).toBe("Invalidenstraße 176, 10115 Berlin");
+    expect(result?.secondaryLabel).toBe("10115 Berlin");
   });
 });

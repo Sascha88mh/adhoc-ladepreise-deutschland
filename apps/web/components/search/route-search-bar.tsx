@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
   ArrowRight,
   Crosshair,
   LocateFixed,
   MapPinned,
   Search,
+  X,
 } from "lucide-react";
 import type { LocationSuggestion } from "@adhoc/shared";
 import {
@@ -49,12 +50,44 @@ function fallbackCurrentLocation(lat: number, lng: number): LocationSuggestion {
 }
 
 export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const [activeField, setActiveField] = useState<FieldName | null>(null);
   const [suggestions, setSuggestions] = useState<LocationSuggestion[]>([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [currentLocationLoading, setCurrentLocationLoading] = useState(false);
   const [currentLocationError, setCurrentLocationError] = useState<string | null>(null);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
+
+  const originInputRef = useRef<HTMLInputElement>(null);
+  const locationInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (mobileExpanded) {
+      // Focus after a brief timeout to let the CSS transition run
+      setTimeout(() => {
+        if (query.mode === "route") {
+          originInputRef.current?.focus();
+        } else {
+          locationInputRef.current?.focus();
+        }
+      }, 50);
+    }
+  }, [mobileExpanded, query.mode]);
+
+  function fullSummaryLabel(label: string, fallback: string) {
+    const trimmed = label.trim();
+    return trimmed || fallback;
+  }
+
+  const getSearchSummary = () => {
+    if (query.mode === "route") {
+      const from = query.originLabel ? query.originLabel.split(",")[0] : 'Start';
+      const to = query.destinationLabel ? query.destinationLabel.split(",")[0] : 'Ziel';
+      if (!query.originLabel && !query.destinationLabel) return 'Route planen';
+      return `${from} → ${to}`;
+    }
+    return fullSummaryLabel(query.locationLabel, 'Wo möchtest du laden?');
+  };
 
   const activeValue =
     activeField === "origin"
@@ -359,9 +392,23 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
   }
 
   return (
-    <section className="p-4 pb-2 sm:p-5">
-      <div className="relative flex flex-col gap-3">
-        <div className="flex flex-wrap items-center justify-between gap-1">
+    <>
+      {/* Mobile Pill (Collapsed) */}
+      <button 
+        type="button" 
+        onClick={() => setMobileExpanded(true)}
+        className={`flex w-full items-center gap-3 px-5 py-3.5 text-left transition hover:bg-white/50 sm:hidden ${mobileExpanded ? 'hidden' : 'flex'}`}
+      >
+        <Search className="h-[18px] w-[18px] shrink-0 text-[var(--muted)]" />
+        <span className="flex-1 truncate font-medium text-[var(--foreground)] tracking-tight">
+          {getSearchSummary()}
+        </span>
+      </button>
+
+      {/* Expanded Interface & Desktop */}
+      <section className={`flex-col p-4 pb-2 sm:p-5 ${mobileExpanded ? 'flex' : 'hidden sm:flex'}`}>
+        <div className="relative flex flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-1">
           <p className="metric-label flex items-center gap-2">
             <MapPinned className="h-3.5 w-3.5" />
             Ladesaeulen-Suche
@@ -412,8 +459,8 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
           {query.mode === "route" ? (
             <>
               <div className="flex flex-col gap-2">
-                <label className="glass-panel flex items-center gap-2 rounded-2xl px-4 py-2.5">
-                  <LocateFixed className="h-4 w-4 text-[var(--muted)]" />
+                <label className="glass-panel relative flex items-center gap-2 rounded-2xl px-4 py-2.5">
+                  <LocateFixed className="h-4 w-4 shrink-0 text-[var(--muted)]" />
                   <input
                     value={query.originLabel}
                     onFocus={() => {
@@ -439,16 +486,30 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
                         setHighlightedIndex(0);
                       }
                     }}
+                    ref={originInputRef}
                     placeholder="Start"
-                    className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--muted)]"
+                    className="w-full bg-transparent pr-6 text-sm outline-none placeholder:text-[var(--muted)]"
                   />
+                  {query.originLabel && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setFieldText("origin", "");
+                        originInputRef.current?.focus();
+                      }}
+                      className="absolute right-3 p-1 text-[var(--muted)] hover:text-[var(--foreground)] outline-none"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </label>
                 {suggestionPanel("origin")}
               </div>
 
               <div className="flex flex-col gap-2">
-                <label className="glass-panel flex items-center gap-2 rounded-2xl px-4 py-2.5">
-                  <ArrowRight className="h-4 w-4 text-[var(--muted)]" />
+                <label className="glass-panel relative flex items-center gap-2 rounded-2xl px-4 py-2.5">
+                  <ArrowRight className="h-4 w-4 shrink-0 text-[var(--muted)]" />
                   <input
                     value={query.destinationLabel}
                     onFocus={() => {
@@ -475,16 +536,28 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
                       }
                     }}
                     placeholder="Ziel"
-                    className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--muted)]"
+                    className="w-full bg-transparent pr-6 text-sm outline-none placeholder:text-[var(--muted)]"
                   />
+                  {query.destinationLabel && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setFieldText("destination", "");
+                      }}
+                      className="absolute right-3 p-1 text-[var(--muted)] hover:text-[var(--foreground)] outline-none"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </label>
                 {suggestionPanel("destination")}
               </div>
             </>
           ) : (
             <div className="flex flex-col gap-2">
-              <label className="glass-panel flex items-center gap-2 rounded-2xl px-4 py-2.5">
-                <LocateFixed className="h-4 w-4 text-[var(--muted)]" />
+              <label className="glass-panel relative flex items-center gap-2 rounded-2xl px-4 py-2.5">
+                <LocateFixed className="h-4 w-4 shrink-0 text-[var(--muted)]" />
                 <input
                   value={query.locationLabel}
                   onFocus={() => {
@@ -510,9 +583,23 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
                       setHighlightedIndex(0);
                     }
                   }}
+                  ref={locationInputRef}
                   placeholder="Ort oder Adresse"
-                  className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--muted)]"
+                  className="w-full bg-transparent pr-6 text-sm outline-none placeholder:text-[var(--muted)]"
                 />
+                {query.locationLabel && (
+                  <button
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setFieldText("location", "");
+                      locationInputRef.current?.focus();
+                    }}
+                    className="absolute right-3 p-1 text-[var(--muted)] hover:text-[var(--foreground)] outline-none"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </label>
               {suggestionPanel("location")}
             </div>
@@ -520,13 +607,26 @@ export function RouteSearchBar({ query, onChange, onSubmit, pending }: Props) {
 
           <button
             type="button"
-            onClick={onSubmit}
+            onClick={() => {
+              onSubmit();
+              setMobileExpanded(false);
+            }}
             className="mt-1 rounded-2xl bg-[var(--accent)] px-5 py-3 text-sm font-semibold text-[var(--accent-fg)] shadow-[0_10px_20px_rgba(21,111,99,0.2)] transition hover:brightness-110"
           >
-            {pending ? "..." : query.mode === "route" ? "Route suchen" : "Standort suchen"}
+            {pending ? "..." : query.mode === "route" ? "Route berechnen" : "Standort suchen"}
+          </button>
+
+          {/* Mobile close button */}
+          <button
+            type="button"
+            onClick={() => setMobileExpanded(false)}
+            className="sm:hidden mt-2 w-full text-center text-sm font-medium text-[var(--muted)] py-2 active:opacity-60"
+          >
+            Schließen
           </button>
         </div>
-      </div>
-    </section>
+        </div>
+      </section>
+    </>
   );
 }
