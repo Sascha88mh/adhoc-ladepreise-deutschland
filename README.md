@@ -246,7 +246,7 @@ APP_DATA_SOURCE=db DATABASE_URL=postgresql://... pnpm --filter ingest bootstrap:
 3. Pro Static-Feed einmal `Sync` ausfuehren
 4. Pruefen, dass Stationen, Charge Points und Tarife in der DB liegen
 5. Dynamic-Feeds anlegen
-6. Dynamic-Feeds einmal `Testen`, dann `Sync`
+6. Pull-/Hybrid-Dynamic-Feeds einmal `Testen`, dann `Sync`; Push-only-Feeds erst per Mobilithek-Test-Push prüfen
 7. Erst danach Public-Traffic auf DB-Modus verwenden
 
 ### 8. Webhooks anschliessen

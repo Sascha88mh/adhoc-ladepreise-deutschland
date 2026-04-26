@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import { gunzipSync } from "node:zlib";
 import type { FeedConfig, SyncRun, TariffSummary } from "../domain/types";
 import {
   parseDynamicMobilithekPayload,
@@ -47,7 +48,58 @@ function intervalMinutesFor(feed: FeedConfig) {
     return feed.pollIntervalMinutes ?? 2;
   }
 
+  if (feed.mode === "push") {
+    return null;
+  }
+
   return feed.reconciliationIntervalMinutes;
+}
+
+function sanitizeWebhookPayload(raw: string): string {
+  return raw
+    .replace(/\u0000/g, "")
+    .replace(/\\u0000/gi, "")
+    .replace(/\\u\{([0-9a-fA-F]+)\}/g, (_, hex) => {
+      const cp = Number.parseInt(hex, 16);
+      if (Number.isNaN(cp) || cp > 0x10ffff) return "";
+      return String.fromCodePoint(cp);
+    })
+    .replace(/\\u(?![0-9a-fA-F]{4})/gi, "\\uFFFD")
+    .replace(/\\uD[89AB][0-9A-F]{2}(?!\\uD[CDEF][0-9A-F]{2})/gi, "\\uFFFD")
+    .replace(/(^|[^\\])(\\uD[CDEF][0-9A-F]{2})/gi, (_, prefix) => `${prefix}\\uFFFD`);
+}
+
+export function decodeMobilithekWebhookPayload(
+  rawBody: ArrayBuffer | Buffer | Uint8Array,
+  contentEncoding?: string | null,
+) {
+  const buffer = Buffer.isBuffer(rawBody)
+    ? rawBody
+    : rawBody instanceof Uint8Array
+      ? Buffer.from(rawBody)
+      : Buffer.from(rawBody);
+  const normalizedEncoding = contentEncoding?.toLowerCase() ?? "";
+  const looksGzip = buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
+  const diagnostics: Record<string, unknown> = {
+    bodyLen: buffer.length,
+    first8Hex: buffer.slice(0, 8).toString("hex"),
+    contentEncoding: contentEncoding ?? null,
+    looksGzip,
+  };
+
+  let raw: string;
+  if (looksGzip || normalizedEncoding.includes("gzip")) {
+    raw = gunzipSync(buffer).toString("utf-8");
+    diagnostics.gunzipped = true;
+  } else {
+    raw = buffer.toString("utf-8");
+    diagnostics.decodedAsUtf8 = true;
+  }
+
+  return {
+    payload: sanitizeWebhookPayload(raw),
+    diagnostics,
+  };
 }
 
 function shouldRunFeed(feed: FeedConfig) {
@@ -1028,6 +1080,19 @@ async function markFeedSuccess(
   );
 }
 
+async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
+  await updateFeedConfigDb(
+    feed.id,
+    {
+      ...feed,
+      lastErrorMessage: null,
+      consecutiveFailures: 0,
+      errorRate: 0,
+    },
+    client,
+  );
+}
+
 /**
  * Hard cap per feed. A single slow/hung upstream (Vaylens mTLS timeout, huge
  * payload) must never block other feeds in the cycle. Configurable via
@@ -1096,6 +1161,7 @@ export async function runFeedAction(
       let message = "Keine Änderungen";
       let cursorState = feed.cursorState ?? null;
       let lastSnapshotAt = feed.lastSnapshotAt;
+      let noRemoteWork = false;
 
       if (feed.type === "static") {
         const payload = prefetchedStaticPayload ?? (await fetchStaticMobilithekPayload(feed));
@@ -1114,6 +1180,9 @@ export async function runFeedAction(
           await upsertStaticCatalog(client, feed, parsed);
           lastSnapshotAt = new Date().toISOString();
         }
+      } else if (feed.mode === "push" && !options?.payload) {
+        noRemoteWork = true;
+        message = "Push-only Dynamic-Feed: kein Pull-Endpunkt, wartet auf Mobilithek-Webhook";
       } else {
         const dynamic = options?.payload
           ? {
@@ -1156,11 +1225,15 @@ export async function runFeedAction(
       }
 
       if (!options?.dryRun) {
-        await markFeedSuccess(client, feed, {
-          lastSnapshotAt,
-          lastDeltaCount: deltaCount,
-          cursorState,
-        });
+        if (noRemoteWork) {
+          await markFeedNoopSuccess(client, feed);
+        } else {
+          await markFeedSuccess(client, feed, {
+            lastSnapshotAt,
+            lastDeltaCount: deltaCount,
+            cursorState,
+          });
+        }
       }
       await finishRun(client, runId, {
         status: "success",

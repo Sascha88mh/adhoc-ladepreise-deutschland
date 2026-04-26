@@ -9,5 +9,10 @@
     "lint": "pnpm -r --if-present lint",
     "test": "pnpm -r --if-present test",
     "ingest:sync": "pnpm --filter ingest sync"
+  },
+  "dependencies": {
+    "axios": "^1.15.0",
+    "pg": "^8.20.0",
+    "zod": "^4.3.6"
   }
 }

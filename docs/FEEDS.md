@@ -244,11 +244,11 @@ Bei Fehlern die `sync_runs`-Zeile lesen — `message` ist immer aussagekräftig.
 
 Sequenz in `runFeedAction` ([ingest/index.ts](../packages/shared/src/ingest/index.ts)):
 
-1. **Lock:** `pg_try_advisory_lock(hash(feedId))`. Wenn belegt → eigenes `sync_runs`-Entry
+1. **Lock:** `pg_try_advisory_xact_lock(hash(feedId))`. Wenn belegt → eigenes `sync_runs`-Entry
    mit `status=failed, message="Feed wird bereits verarbeitet (Lock belegt)"`, dann Exit.
    (Seit Migration 002: Lock-Kollisionen sind im Admin-UI sichtbar, nicht mehr stumm.)
 2. **Run-Row:** `INSERT INTO sync_runs status='running'`.
-3. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`).
+3. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook).
    - Gzip verpflichtend (Accept-Encoding). axios dekomprimiert automatisch.
    - 204 / 304 → als „keine Änderung" behandelt, kein Fehler.
 4. **Raw-Payload persistieren** (`raw_feed_payloads`):
