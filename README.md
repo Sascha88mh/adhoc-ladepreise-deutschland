@@ -218,6 +218,9 @@ Netlify-Env fuer die App setzen:
 MOBILITHEK_FORWARD_SECRET=...
 ```
 
+Nach dem Setzen oder Aendern des Secrets einen Production-Deploy ausloesen,
+damit Edge Function und interner Next-Endpunkt denselben Wert verwenden.
+
 Mobilithek-Ziel-URL:
 
 ```text
