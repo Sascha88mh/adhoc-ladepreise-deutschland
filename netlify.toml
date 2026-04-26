@@ -14,9 +14,9 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
-# Mobilithek-Push sollte in Produktion ueber apps/mobilithek-gateway laufen,
-# weil Netlify gzip+application/json Bodies als Text an die Runtime geben kann.
-# Diese Redirects bleiben als Fallback fuer unkomprimierte Testpayloads bestehen.
+# Mobilithek-Push wird zuerst von netlify/edge-functions/mobilithek-webhook.ts
+# verarbeitet. Diese Redirects bleiben als Fallback fuer unkomprimierte Payloads
+# bestehen, falls die Edge Function einmal nicht greift.
 [[redirects]]
   from = "/api/admin/mobilithek/webhook/:feedId"
   to = "/.netlify/functions/mobilithek-webhook/:feedId"

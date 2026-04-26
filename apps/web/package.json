@@ -21,6 +21,7 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@netlify/edge-functions": "^3.0.6",
     "@netlify/functions": "^3",
     "@netlify/plugin-nextjs": "^5",
     "@tailwindcss/postcss": "^4",

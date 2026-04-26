@@ -207,9 +207,10 @@ Empfehlung:
 ### 5b. Mobilithek-Push-Gateway
 
 Mobilithek sendet Dynamic-Push-Payloads gzip-komprimiert mit `Content-Type: application/json`.
-Netlify Functions koennen diesen Body in dieser Form vor der Funktion als Text dekodieren; die
-gzip-Bytes sind dann nicht mehr rekonstruierbar. Deshalb bleibt die App auf Netlify, aber der
-Mobilithek-Push-Eingang kann ueber den Cloudflare Worker unter `apps/mobilithek-gateway` laufen.
+Der produktive Eingang laeuft deshalb ueber die Netlify Edge Function
+`apps/web/netlify/edge-functions/mobilithek-webhook.ts`. Sie liest den Roh-Body,
+entpackt gzip und leitet sauberes JSON an den internen App-Endpunkt weiter. Die
+serverless Function bleibt nur als Fallback fuer unkomprimierte Payloads bestehen.
 
 Netlify-Env fuer die App setzen:
 
@@ -217,7 +218,15 @@ Netlify-Env fuer die App setzen:
 MOBILITHEK_FORWARD_SECRET=...
 ```
 
-Worker konfigurieren und deployen:
+Mobilithek-Ziel-URL:
+
+```text
+https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
+```
+
+Falls Netlify Edge fuer diesen Anbieter wider Erwarten ebenfalls keine Rohbytes
+liefert, liegt als Reserve ein Cloudflare Worker unter `apps/mobilithek-gateway`
+bereit:
 
 ```bash
 cd apps/mobilithek-gateway
@@ -232,9 +241,6 @@ Mobilithek-Ziel-URL danach auf den Worker umstellen, z. B.:
 ```text
 https://adhoc-mobilithek-gateway.<account>.workers.dev/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
 ```
-
-Der Worker entpackt gzip, normalisiert den Body zu JSON und leitet intern an
-`https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook?feedId=...` weiter.
 
 ### 6. Feeds im Admin anlegen
 

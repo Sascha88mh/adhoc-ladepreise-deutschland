@@ -78,6 +78,9 @@ importers:
         specifier: ^4.1.12
         version: 4.3.6
     devDependencies:
+      '@netlify/edge-functions':
+        specifier: ^3.0.6
+        version: 3.0.6
       '@netlify/functions':
         specifier: ^3
         version: 3.1.10
@@ -1079,6 +1082,10 @@ packages:
   '@netlify/dev-utils@2.2.0':
     resolution: {integrity: sha512-5XUvZuffe3KetyhbWwd4n2ktd7wraocCYw10tlM+/u/95iAz29GjNiuNxbCD1T6Bn1MyGc4QLVNKOWhzJkVFAw==}
     engines: {node: ^14.16.0 || >=16.0.0}
+
+  '@netlify/edge-functions@3.0.6':
+    resolution: {integrity: sha512-xkVcTcpAuQKAY5GXKOjPTIct5Mz53NPHXOasggA+LTAxDDV4ohqSM8BIaXh1SgbcniHZyFhBqhc5hxZ+fFz5bQ==}
+    engines: {node: '>=18.0.0'}
 
   '@netlify/functions@3.1.10':
     resolution: {integrity: sha512-sI93kcJ2cUoMgDRPnrEm0lZhuiDVDqM6ngS/UbHTApIH3+eg3yZM5p/0SDFQQq9Bad0/srFmgBmTdXushzY5kg==}
@@ -4988,6 +4995,10 @@ snapshots:
       parse-gitignore: 2.0.0
       uuid: 11.1.0
       write-file-atomic: 6.0.0
+
+  '@netlify/edge-functions@3.0.6':
+    dependencies:
+      '@netlify/types': 2.6.0
 
   '@netlify/functions@3.1.10':
     dependencies:
