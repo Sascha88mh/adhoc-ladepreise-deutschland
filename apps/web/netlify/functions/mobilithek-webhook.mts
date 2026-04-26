@@ -71,6 +71,7 @@ const handler = async (request: Request) => {
     Object.assign(diag, decoded.diagnostics);
     diag.contentType = request.headers.get("content-type");
     diag.runtime = "netlify-function-proxy";
+    const payload = JSON.stringify(JSON.parse(decoded.payload));
 
     const response = await fetch(target, {
       method: "POST",
@@ -80,7 +81,7 @@ const handler = async (request: Request) => {
           ? { "x-webhook-secret": request.headers.get("x-webhook-secret")! }
           : {}),
       },
-      body: decoded.payload,
+      body: payload,
     });
 
     const body = await response.text();
