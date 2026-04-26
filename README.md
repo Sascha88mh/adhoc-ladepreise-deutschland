@@ -140,6 +140,7 @@ Es werden zwei laufende Komponenten benoetigt:
 
 - `apps/web`: Next.js App fuer Public-APIs und Admin
 - `apps/ingest`: Scheduler-Worker
+- optional `apps/mobilithek-gateway`: kleiner Raw-Body Webhook-Gateway fuer Mobilithek-Push-Feeds
 
 Builds:
 
@@ -202,6 +203,38 @@ Empfehlung:
 
 - Hosting-Cronjob jede Minute
 - gleicher Env-Satz wie bei `apps/web`
+
+### 5b. Mobilithek-Push-Gateway
+
+Mobilithek sendet Dynamic-Push-Payloads gzip-komprimiert mit `Content-Type: application/json`.
+Netlify Functions koennen diesen Body in dieser Form vor der Funktion als Text dekodieren; die
+gzip-Bytes sind dann nicht mehr rekonstruierbar. Deshalb bleibt die App auf Netlify, aber der
+Mobilithek-Push-Eingang kann ueber den Cloudflare Worker unter `apps/mobilithek-gateway` laufen.
+
+Netlify-Env fuer die App setzen:
+
+```bash
+MOBILITHEK_FORWARD_SECRET=...
+```
+
+Worker konfigurieren und deployen:
+
+```bash
+cd apps/mobilithek-gateway
+pnpm install
+pnpm typecheck
+wrangler secret put MOBILITHEK_FORWARD_SECRET
+pnpm deploy
+```
+
+Mobilithek-Ziel-URL danach auf den Worker umstellen, z. B.:
+
+```text
+https://adhoc-mobilithek-gateway.<account>.workers.dev/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
+```
+
+Der Worker entpackt gzip, normalisiert den Body zu JSON und leitet intern an
+`https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook?feedId=...` weiter.
 
 ### 6. Feeds im Admin anlegen
 

@@ -1,0 +1,10 @@
+name = "adhoc-mobilithek-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-04-26"
+
+[vars]
+UPSTREAM_WEBHOOK_URL = "https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook"
+
+# Set the same value on Netlify as MOBILITHEK_FORWARD_SECRET.
+# Do not commit real secrets here:
+# wrangler secret put MOBILITHEK_FORWARD_SECRET

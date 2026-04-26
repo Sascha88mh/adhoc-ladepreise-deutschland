@@ -96,6 +96,9 @@ export const handler: Handler = async (event) => {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        ...(process.env.MOBILITHEK_FORWARD_SECRET
+          ? { "x-mobilithek-forward-secret": process.env.MOBILITHEK_FORWARD_SECRET }
+          : {}),
         ...(event.headers["x-webhook-secret"]
           ? { "x-webhook-secret": event.headers["x-webhook-secret"] }
           : {}),

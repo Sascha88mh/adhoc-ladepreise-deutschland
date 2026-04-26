@@ -10,6 +10,14 @@ export async function POST(request: Request) {
     );
   }
 
+  const expectedForwardSecret = process.env.MOBILITHEK_FORWARD_SECRET;
+  if (
+    expectedForwardSecret &&
+    request.headers.get("x-mobilithek-forward-secret") !== expectedForwardSecret
+  ) {
+    return Response.json({ error: "Invalid forward secret" }, { status: 401 });
+  }
+
   const url = new URL(request.url);
   let feedId = url.searchParams.get("feedId");
   const subscriptionId = url.searchParams.get("subscriptionId");
