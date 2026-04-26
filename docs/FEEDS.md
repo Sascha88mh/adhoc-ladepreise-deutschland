@@ -35,6 +35,23 @@
                                         price_snapshots, raw_feed_payloads
 ```
 
+Push-Feeds laufen parallel dazu ueber einen separaten Eingang:
+
+```
+Mobilithek Push
+  POST /api/admin/mobilithek/webhook/:feedId
+      │
+      ▼
+Netlify Edge Function mobilithek-webhook.ts
+  liest Raw-Body, entpackt gzip, normalisiert JSON
+      │ x-mobilithek-forward-secret
+      ▼
+Next Route /api/internal/mobilithek/webhook?feedId=...
+      │
+      ▼
+processFeedWebhook() → runFeedAction(feedId, "webhook")
+```
+
 Wichtige Module:
 
 | Zweck                        | Datei                                                          |
@@ -44,6 +61,8 @@ Wichtige Module:
 | Ingest-Orchestrierung        | [packages/shared/src/ingest/index.ts](../packages/shared/src/ingest/index.ts) |
 | Feed-CRUD (DB)               | [packages/shared/src/db/admin.ts](../packages/shared/src/db/admin.ts) |
 | Scheduled Function           | [apps/web/netlify/functions/ingest-sync.mts](../apps/web/netlify/functions/ingest-sync.mts) |
+| Push Webhook Edge Function   | [apps/web/netlify/edge-functions/mobilithek-webhook.ts](../apps/web/netlify/edge-functions/mobilithek-webhook.ts) |
+| Interner Webhook-Forward     | [apps/web/app/api/internal/mobilithek/webhook/route.ts](../apps/web/app/api/internal/mobilithek/webhook/route.ts) |
 | DB-Schema / Migrationen      | [db/schema.sql](../db/schema.sql), [db/migrations/](../db/migrations/) |
 
 ---
@@ -57,12 +76,13 @@ Mobilithek bietet pro Subscription **genau einen** Typ und Modus:
 | type  | `static`       | Voller Katalog aller Standorte. Selten (täglich/mehrtägig) via Pull.      |
 |       | `dynamic`      | Nur Änderungen an Status/Preisen.                                         |
 | mode  | `pull`         | Wir holen (HTTP GET). Jede paar Minuten.                                  |
-|       | `push`         | Mobilithek pusht per Webhook. Reconciliation-Pull dient als Fallback.    |
+|       | `push`         | Mobilithek pusht per Webhook. Kein automatischer Pull; Pull-404 ist normal bei echten Push-only-Feeds. |
 |       | `hybrid`       | Push bevorzugt, regelmäßiger Pull als Sicherheitsnetz.                    |
 
 ### Intervall-Felder (zeitlich)
 - `poll_interval_minutes` — nur für `static` oder `dynamic + mode=pull`. Wie oft voll pullen.
-- `reconciliation_interval_minutes` — nur für `dynamic + mode=push|hybrid`. Wie oft als Fallback pullen, falls Pushes ausfallen.
+- `reconciliation_interval_minutes` — nur für `dynamic + mode=hybrid`. Wie oft als Fallback pullen, falls Pushes ausfallen.
+- Bei `dynamic + mode=push`: leer lassen. `intervalMinutesFor()` gibt `null` zurück; der Cron wartet bewusst auf Webhooks.
 
 Die Logik lebt in `intervalMinutesFor()` und `shouldRunFeed()` in
 [packages/shared/src/ingest/index.ts](../packages/shared/src/ingest/index.ts).
@@ -85,6 +105,7 @@ Vom CPO / Mobilithek brauchst du:
 - **subscription_id** (z.B. `982312651690225664`) — numerisch, technisch. **Nicht** die menschlich sichtbare Angebots-ID aus dem Mobilithek-Portal.
 - **type**: `static` oder `dynamic` (steht auf dem Subscription-Detail im Mobilithek-Portal).
 - **mode**: `pull`, `push` oder `hybrid` (ebenso).
+- **Bei Push-Feeds:** die Ziel-URL aus §3.6 in Mobilithek setzen und einen Testlauf im Mobilithek-Portal ausloesen.
 - **URL** (nur wenn abweichend vom Standard `https://m2m.mobilithek.info`): dann in `url_override` speichern. Sonst `null` lassen, damit der Default-Base aus `client.ts` greift.
 - **Client-Zertifikat**: Mobilithek nutzt mTLS auf Azure Application Gateway.
   - Entweder **PKCS#12 (.p12)** + Passwort (empfohlen, ein File),
@@ -227,6 +248,7 @@ INSERT INTO feed_configs (
 - ✅ `credential_ref` leer lassen, wenn der globale `MOBILITHEK_*`-Secret reicht.
 - ❌ Niemals die sichtbare Angebots-ID aus dem Mobilithek-Portal als `subscription_id` eintragen — das ist eine andere Zahl. Siehe EAAZE-Einträge im Repo mit Notiz „Sichtbare Angebots-ID als Platzhalter…".
 - ✅ Neue Feeds `is_active = false` erstellen und per Admin-UI „Test-Sync" grün bekommen, dann aktivieren.
+- ✅ Push-only Dynamic-Feeds sind ein Sonderfall: Admin-UI „Sync/Test" darf keinen Pull erzwingen. Erfolgsmeldung ist sinngemaess `Push-only Dynamic-Feed: kein Pull-Endpunkt, wartet auf Mobilithek-Webhook`. Der echte Test passiert ueber den Mobilithek-Push-Test in §3.6.
 
 ### 3.5 Test-Sync
 
@@ -238,6 +260,87 @@ curl -X POST https://adhoc.../api/admin/feeds/<feed-id>/sync
 
 Bei Fehlern die `sync_runs`-Zeile lesen — `message` ist immer aussagekräftig.
 
+### 3.6 Push-Webhook fuer Dynamic-Feeds einrichten
+
+**Standard-Ziel-URL fuer Mobilithek:**
+
+```text
+https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/<feed-id>
+```
+
+Beispiel EnBW Dynamic:
+
+```text
+https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
+```
+
+**Wichtig:** Diese URL nimmt die interne `feed_configs.id` (`uuid`), nicht die Mobilithek-Angebots-ID
+und nicht zwingend die Subscription-ID. Alternativ kann `/api/mobilithek/webhook?subscriptionId=<id>`
+verwendet werden, wenn die Subscription-ID eindeutig ist; fuer Agenten ist die Feed-ID-URL robuster.
+
+**Warum Edge Function?**
+Mobilithek sendet Dynamic-Push-Payloads gzip-komprimiert mit `Content-Type: application/json`.
+Normale Netlify Functions bekommen diesen Body in dieser Kombination als bereits beschädigten
+UTF-8-String (`\u001f�\b...`) und koennen ihn nicht mehr gunzippen. Die Netlify Edge Function
+bekommt den Raw-Body vorher, entpackt gzip und leitet normales JSON intern weiter.
+
+**Pflicht-Env in Netlify:**
+
+| Variable | Zweck |
+|---|---|
+| `MOBILITHEK_FORWARD_SECRET` | Shared Secret zwischen Edge Function und internem Next-Endpunkt. Muss in Netlify gesetzt sein. |
+
+Nach Setzen oder Aendern von `MOBILITHEK_FORWARD_SECRET` immer einen Production-Deploy ausloesen,
+damit Edge Function und Next Route denselben Wert sehen.
+
+**Live-Checks nach jedem neuen Push-Feed:**
+
+```sh
+# Healthcheck: muss netlify-edge-function melden
+curl -i https://adhoc-plattform.netlify.app/api/mobilithek/webhook
+
+# Mobilithek-artiger gzip-Test gegen Feed-ID-URL: muss 200 liefern
+printf '{"messageContainer":{"payload":[]}}' | gzip | \
+  curl -i -X POST \
+    'https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/<feed-id>' \
+    -H 'Content-Type: application/json' \
+    -H 'Content-Encoding: gzip' \
+    --data-binary @-
+
+# Interner Endpunkt ohne Forward-Secret: muss 401 liefern
+curl -i -X POST \
+  'https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook?feedId=<feed-id>' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"messageContainer":{"payload":[]}}'
+```
+
+Erwartung:
+
+| Check | Erfolg |
+|---|---|
+| GET `/api/mobilithek/webhook` | `200` und `{"ok":true,"runtime":"netlify-edge-function"}` |
+| gzip POST auf `/api/admin/mobilithek/webhook/<feed-id>` | `200` und `{"ok":true,"feedId":"..."}` |
+| POST auf `/api/internal/mobilithek/webhook?...` ohne Secret | `401 Invalid forward secret` |
+
+Wenn der gzip-Test stattdessen `runtime":"netlify-legacy-function-proxy"` oder `Unexpected token '\u001f'`
+zeigt, greift die Edge Function nicht. Dann zuerst `netlify.toml` pruefen:
+
+```toml
+[[edge_functions]]
+  path = "/api/admin/mobilithek/webhook/*"
+  function = "mobilithek-webhook"
+
+[[edge_functions]]
+  path = "/api/mobilithek/webhook"
+  function = "mobilithek-webhook"
+```
+
+Danach per Netlify Remote Build deployen, nicht nur lokale Artefakte hochladen:
+
+```sh
+netlify deploy --trigger --prod --site <site-id> --filter web
+```
+
 ---
 
 ## 4. Was bei jedem Sync passiert
@@ -248,7 +351,7 @@ Sequenz in `runFeedAction` ([ingest/index.ts](../packages/shared/src/ingest/inde
    mit `status=failed, message="Feed wird bereits verarbeitet (Lock belegt)"`, dann Exit.
    (Seit Migration 002: Lock-Kollisionen sind im Admin-UI sichtbar, nicht mehr stumm.)
 2. **Run-Row:** `INSERT INTO sync_runs status='running'`.
-3. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook).
+3. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook und wird bei manuellen Tests als Noop-Erfolg markiert).
    - Gzip verpflichtend (Accept-Encoding). axios dekomprimiert automatisch.
    - 204 / 304 → als „keine Änderung" behandelt, kein Fehler.
 4. **Raw-Payload persistieren** (`raw_feed_payloads`):
@@ -281,6 +384,7 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 | `RAW_PAYLOAD_MAX_BYTES`   | `524288`    | Ab dieser Größe wird der Raw-Payload zusammengefasst    |
 | `MOBILITHEK_BASE_URL`     | `https://m2m.mobilithek.info` | Override für Staging/Testing             |
 | `MOBILITHEK_USE_FIXTURES` | _(unset)_   | `=1` verwendet die Fixtures aus `db/fixtures/`          |
+| `MOBILITHEK_FORWARD_SECRET` | _(unset)_ | Schuetzt `/api/internal/mobilithek/webhook`; in Produktion setzen |
 | `PG_POOL_MAX`             | `10`        | Max. offene PG-Connections                             |
 
 ---
@@ -320,6 +424,26 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 
 ### `Unexpected token … in JSON`
 → Payload kam truncated an. Historisch: `maxContentLength` zu klein. Aktueller Default 200 MB; falls das überschritten wird, in `client.ts` anpassen.
+
+### `Unexpected token '\u001f', "\u001f�\b..." is not valid JSON` beim Mobilithek-Push
+→ Mobilithek hat gzip gesendet, aber die Anfrage ist nicht ueber die Edge Function gelaufen.
+Das ist der alte Netlify-Function-Fallback, der gzip+`Content-Type: application/json` als
+kaputten UTF-8-String sieht.
+
+Checkliste:
+1. `GET /api/mobilithek/webhook` muss `runtime = "netlify-edge-function"` liefern.
+2. In `netlify.toml` muessen die zwei `[[edge_functions]]`-Regeln aus §3.6 existieren.
+3. Der letzte Netlify-Deploy muss `1 edge function deployed` zeigen.
+4. Danach den gzip-Test aus §3.6 erneut ausfuehren.
+
+Nicht versuchen, den kaputten String in der Serverless Function zu reparieren: das Byte `0x8b`
+ist dann bereits durch Unicode Replacement ersetzt und die gzip-Datei ist irreversibel beschaedigt.
+
+### Push-only Dynamic-Feed liefert 404 beim Pull
+→ Bei echten Push-only-Feeds ist das normal. Beispiel EnBW Dynamic:
+`GET /mobilithek/api/v1.0/subscription?subscriptionID=...` lieferte `404`, waehrend der
+Mobilithek-Push-Test erfolgreich ist. `mode = push`, `poll_interval_minutes = NULL`,
+`reconciliation_interval_minutes = NULL` setzen und den Webhook aus §3.6 nutzen.
 
 ### Parser produziert keine/leere `catalog`-Einträge (0 Stationen verarbeitet)
 → Koordinaten oder Adresse fehlen. Zwei häufige Ursachen:
@@ -379,6 +503,18 @@ Dieser Abschnitt dokumentiert bekannte Abweichungen vom Standard-Verhalten für 
 
 ### EnBW / EAAZE
 - Globales `MOBILITHEK_*`-Cert reicht.
+- **EnBW Dynamic ist Push-only.**
+  Der Pull-Endpunkt `/mobilithek/api/v1.0/subscription?subscriptionID=...` kann `404` liefern.
+  Das ist kein Feed-Defekt. Entscheidend ist der Mobilithek-Push-Test auf
+  `/api/admin/mobilithek/webhook/<feed-id>`.
+- **Netlify-Push-URL fuer EnBW Dynamic (Stand 2026-04-26):**
+  `https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45`.
+  Mobilithek-Angebots-ID und Abonnement-ID im Portal koennen davon abweichen; die URL verwendet die interne Feed-ID.
+- **Getestetes Fehlerbild vor dem Fix:**
+  Mobilithek-Testlauf antwortete `500` mit
+  `Unexpected token '\u001f', "\u001f�\b..." is not valid JSON` und Diagnose
+  `contentEncoding=gzip`, `runtime=netlify-legacy-function-proxy`.
+  Nach dem Edge-Fix muss derselbe gzip-Test `200` liefern.
 - EnBW liefert in der echten Payload `operator.externalIdentifier[0].identifier = "EBW"` und `name = "ENBW"`.
   `feed_configs.cpo_id` daher entweder leer lassen oder exakt an der Payload ausrichten; nicht blind `enbw` erzwingen.
 - **Tarifidentität:**
@@ -447,6 +583,9 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
 | Dynamic-Feed schreibt keine Statusänderungen obwohl Payload ok aussieht | Delta enthält `refillPointStatus`, aber DB bleibt unverändert | Prüfen, ob der Feed `aegiRefillPointStatus` statt `aegiElectricChargingPointStatus` nutzt; beide Varianten müssen geparst werden |
 | Payload > 200 MB | axios-Timeout oder silent truncation | `MAX_RESPONSE_BYTES` in `client.ts` hochsetzen (aktuell 200 MB) |
 | `APP_DATA_SOURCE` nicht gesetzt | DB-Fallback für Credentials wird übersprungen | Netlify Env: `APP_DATA_SOURCE=db` setzen |
+| Mobilithek-Push gzip endet mit `Unexpected token '\u001f'` | Request landet in `netlify-legacy-function-proxy` statt Edge Function | `[[edge_functions]]`-Regeln in `netlify.toml` pruefen, Remote Build triggern, Healthcheck muss `runtime=netlify-edge-function` melden (§3.6/§7) |
+| Interner Webhook ist von außen nutzbar | POST auf `/api/internal/mobilithek/webhook?...` liefert `200` ohne Secret | `MOBILITHEK_FORWARD_SECRET` in Netlify setzen und Production-Deploy ausloesen. Danach muss derselbe POST `401` liefern |
+| Push-only Feed wird dauernd als Pull-Fehler markiert | Admin zeigt `404` auf `/subscription?subscriptionID=...` | `mode=push`, `poll_interval_minutes=NULL`, `reconciliation_interval_minutes=NULL`; manuell testen ueber Mobilithek-Push-Test, nicht Remote-Pull |
 | Falsche Ladepunkt-Anzahl / Leistung (EnBW-Muster) | Frontend zeigt z.B. „2 Ladepunkte, 150 kW" statt „8 Ladepunkte, 300 kW" | Mehrere `energyInfrastructureStation` pro Site werden nicht aggregiert. Parser ab 2026-04-19 fasst alles per Site zusammen (§9 EnBW). Nach Code-Änderung Feed manuell neu synchronisieren. |
 | Geister-Stationen nach Grouping-Änderung | Neue aggregierte Station erscheint korrekt, aber alte Einzel-Einträge bleiben sichtbar | `upsertStaticCatalog` nutzt Cleanup-Query mit `cpo_id = any(parsed_cpo_ids)` — nur wirksam wenn Sync mit neuem Code läuft. `feed_configs.cpo_id = null` ist korrekt; Cleanup greift dann auf geparsede CPO-IDs. Sicherstellen dass der manuelle Sync nach der Code-Änderung über die lokale Dev-Instanz läuft (nicht Netlify-Deployment mit altem Code). |
 | Leistungsangaben bei Tesla = 0 oder leer | Stationen erscheinen mit 0 kW im Frontend | `availableChargingPower` ist in Tesla-Payloads generell `null`. Leistung kommt aus `connector.maxPowerAtSocket` (Watt). Parser-Fallback ab 2026-04-19 aktiv (§9 Tesla). |
@@ -455,6 +594,11 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
 
 ## 11. Änderungshistorie dieser Doku
 
+- **2026-04-26 v6** — Mobilithek-Push-Feeds produktionsfest dokumentiert:
+  1. **Netlify Edge Webhook-Pfad** (§1, §3.6, §7, §10): gzip+`application/json` muss ueber `apps/web/netlify/edge-functions/mobilithek-webhook.ts` laufen; normaler Netlify-Function-Fallback kann gzip irreversibel beschaedigen.
+  2. **Forward-Secret** (§3.6, §5, §10): `MOBILITHEK_FORWARD_SECRET` schuetzt den internen `/api/internal/mobilithek/webhook`-Forward. Ohne Secret muss dieser Endpunkt `401` liefern.
+  3. **Push-only Dynamic-Regeln** (§2, §3.4, §4, §7, §9 EnBW, §10): kein automatischer Pull/Reconciliation fuer `mode=push`; Pull-404 ist bei EnBW Dynamic erwartbar, Mobilithek-Push-Test ist massgeblich.
+  4. **Live-Runbook fuer neue Feeds** (§3.6): Healthcheck, gzip-Test, interner 401-Test und Remote-Build-Hinweis ergaenzt.
 - **2026-04-20 v5** — Preis-/Statuslogik für neue CPOs geschärft:
   1. **Tarifinstanzen statt globalem Tarifcode** (§9 EnBW, §10): `tariff_code` darf nicht mehr als global eindeutiger Schlüssel verstanden werden; neue Regel ist `tariff_key = scope + scopeCode + externalTariffCode`.
   2. **Dynamic-Statusvarianten dokumentiert** (§9 Tesla, §9 EnBW, §10): Tesla-Beispiele nutzen `aegiElectricChargingPointStatus`, EnBW-Beispiele `aegiRefillPointStatus`; beide sind zu unterstützen.
