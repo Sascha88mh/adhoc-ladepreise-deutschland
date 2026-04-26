@@ -5,7 +5,7 @@ function decodeWebhookBody(rawBody: ArrayBuffer, contentEncoding?: string | null
   const normalizedEncoding = contentEncoding?.toLowerCase() ?? "";
   const looksGzip = buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
 
-  if (looksGzip || normalizedEncoding.includes("gzip")) {
+  if (looksGzip) {
     return {
       payload: gunzipSync(buffer).toString("utf-8"),
       diagnostics: { bodyLen: buffer.length, looksGzip, gunzipped: true },
@@ -14,7 +14,13 @@ function decodeWebhookBody(rawBody: ArrayBuffer, contentEncoding?: string | null
 
   return {
     payload: buffer.toString("utf-8"),
-    diagnostics: { bodyLen: buffer.length, looksGzip, decodedAsUtf8: true },
+    diagnostics: {
+      bodyLen: buffer.length,
+      contentEncoding: contentEncoding ?? null,
+      looksGzip,
+      decodedAsUtf8: true,
+      upstreamAlreadyDecoded: normalizedEncoding.includes("gzip"),
+    },
   };
 }
 
