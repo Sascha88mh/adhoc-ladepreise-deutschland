@@ -136,6 +136,10 @@ const ENBW_DYNAMIC_REFILL_POINT = JSON.stringify({
   },
 });
 
+const ENBW_DYNAMIC_TOP_LEVEL_PAYLOAD = JSON.stringify({
+  payload: JSON.parse(ENBW_DYNAMIC_REFILL_POINT).messageContainer.payload,
+});
+
 describe("Mobilithek parser", () => {
   it("parses static station payloads from the official AFIR example", () => {
     const result = parseStaticMobilithekPayload(STATIC_FIXTURE);
@@ -200,5 +204,13 @@ describe("Mobilithek parser", () => {
     expect(result.updates[0]?.statusCanonical).toBe("OUT_OF_SERVICE");
     expect(result.updates[0]?.tariffs[0]?.id).toBe("charge_point|DE*EBW*ONE|adHoc");
     expect(result.updates[0]?.tariffs[0]?.pricePerKwh).toBe(0.59);
+  });
+
+  it("parses dynamic status updates from Mobilithek top-level payload envelopes", () => {
+    const result = parseDynamicMobilithekPayload(ENBW_DYNAMIC_TOP_LEVEL_PAYLOAD);
+
+    expect(result.updates).toHaveLength(1);
+    expect(result.updates[0]?.chargePointId).toBe("DE*EBW*ONE");
+    expect(result.updates[0]?.statusCanonical).toBe("OUT_OF_SERVICE");
   });
 });

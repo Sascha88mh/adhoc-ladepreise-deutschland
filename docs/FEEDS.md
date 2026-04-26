@@ -598,7 +598,9 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
   1. **Netlify Edge Webhook-Pfad** (§1, §3.6, §7, §10): gzip+`application/json` muss ueber `apps/web/netlify/edge-functions/mobilithek-webhook.ts` laufen; normaler Netlify-Function-Fallback kann gzip irreversibel beschaedigen.
   2. **Forward-Secret** (§3.6, §5, §10): `MOBILITHEK_FORWARD_SECRET` schuetzt den internen `/api/internal/mobilithek/webhook`-Forward. Ohne Secret muss dieser Endpunkt `401` liefern.
   3. **Push-only Dynamic-Regeln** (§2, §3.4, §4, §7, §9 EnBW, §10): kein automatischer Pull/Reconciliation fuer `mode=push`; Pull-404 ist bei EnBW Dynamic erwartbar, Mobilithek-Push-Test ist massgeblich.
-  4. **Live-Runbook fuer neue Feeds** (§3.6): Healthcheck, gzip-Test, interner 401-Test und Remote-Build-Hinweis ergaenzt.
+  4. **Top-Level-`payload`-Envelope**: Mobilithek-Testpushes koennen ohne `messageContainer` kommen. Dynamic-Parser muss sowohl `messageContainer.payload` als auch top-level `payload` akzeptieren.
+  5. **Status-Frische**: Jeder Status-Push muss `last_status_update_at` und Stations-Aggregation aktualisieren, auch wenn sich der Statuswert nicht geaendert hat. Sonst wirkt das Frontend stale.
+  6. **Live-Runbook fuer neue Feeds** (§3.6): Healthcheck, gzip-Test, interner 401-Test und Remote-Build-Hinweis ergaenzt.
 - **2026-04-20 v5** — Preis-/Statuslogik für neue CPOs geschärft:
   1. **Tarifinstanzen statt globalem Tarifcode** (§9 EnBW, §10): `tariff_code` darf nicht mehr als global eindeutiger Schlüssel verstanden werden; neue Regel ist `tariff_key = scope + scopeCode + externalTariffCode`.
   2. **Dynamic-Statusvarianten dokumentiert** (§9 Tesla, §9 EnBW, §10): Tesla-Beispiele nutzen `aegiElectricChargingPointStatus`, EnBW-Beispiele `aegiRefillPointStatus`; beide sind zu unterstützen.

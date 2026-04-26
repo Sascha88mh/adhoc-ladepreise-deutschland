@@ -602,9 +602,13 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
         }>;
       }
     | undefined;
+  const topLevelPayload = Array.isArray(parsed.payload)
+    ? (parsed.payload as Array<NonNullable<NonNullable<typeof messageContainer>["payload"]>[number]>)
+    : undefined;
+  const payloadItems = messageContainer?.payload ?? topLevelPayload ?? [];
 
   const updates =
-    messageContainer?.payload?.flatMap((item) =>
+    payloadItems.flatMap((item) =>
         (item.aegiEnergyInfrastructureStatusPublication?.energyInfrastructureSiteStatus ?? []).flatMap((site) =>
           (site.energyInfrastructureStationStatus ?? []).flatMap((station) =>
           (station.refillPointStatus ?? []).flatMap((pointStatus) => {
@@ -638,7 +642,7 @@ export function parseDynamicMobilithekPayload(payload: string | Record<string, u
           }),
         ),
       ),
-    ) ?? [];
+    );
 
   return { updates };
 }

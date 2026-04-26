@@ -976,11 +976,7 @@ async function applyDynamicUpdates(
     const chargePoint = chargePointResult.rows[0];
     const updateTime = update.lastUpdatedAt ?? nowIso;
 
-    if (
-      feed.ingestStatus &&
-      (chargePoint.last_status_raw !== update.statusRaw ||
-        chargePoint.last_status_canonical !== update.statusCanonical)
-    ) {
+    if (feed.ingestStatus) {
       await client.query(
         `update charge_points
             set last_status_raw = $2,
