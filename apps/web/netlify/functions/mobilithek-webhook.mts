@@ -1,14 +1,17 @@
+import type { Handler } from "@netlify/functions";
 import { gunzipSync } from "node:zlib";
 
-function decodeWebhookBody(rawBody: ArrayBuffer, contentEncoding?: string | null) {
-  const buffer = Buffer.from(rawBody);
+function decodeWebhookBody(body: string | null, isBase64Encoded: boolean, contentEncoding?: string) {
+  const buffer = isBase64Encoded
+    ? Buffer.from(body ?? "", "base64")
+    : Buffer.from(body ?? "", "utf-8");
   const normalizedEncoding = contentEncoding?.toLowerCase() ?? "";
   const looksGzip = buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
 
   if (looksGzip) {
     return {
       payload: gunzipSync(buffer).toString("utf-8"),
-      diagnostics: { bodyLen: buffer.length, looksGzip, gunzipped: true },
+      diagnostics: { bodyLen: buffer.length, contentEncoding: contentEncoding ?? null, looksGzip, gunzipped: true },
     };
   }
 
@@ -17,6 +20,7 @@ function decodeWebhookBody(rawBody: ArrayBuffer, contentEncoding?: string | null
     diagnostics: {
       bodyLen: buffer.length,
       contentEncoding: contentEncoding ?? null,
+      isBase64Encoded,
       looksGzip,
       decodedAsUtf8: true,
       upstreamAlreadyDecoded: normalizedEncoding.includes("gzip"),
@@ -24,18 +28,17 @@ function decodeWebhookBody(rawBody: ArrayBuffer, contentEncoding?: string | null
   };
 }
 
-function resolveWebhookTarget(requestUrl: string) {
-  const url = new URL(requestUrl);
+function targetFromEvent(rawUrl: string, path: string, query: Record<string, string | undefined>) {
+  const url = new URL(rawUrl);
   const target = new URL("/api/internal/mobilithek/webhook", url.origin);
-  const pathMatch = url.pathname.match(/\/(?:mobilithek\/webhook|mobilithek-webhook)\/([^/?#]+)/);
+  const pathMatch = path.match(/\/(?:mobilithek\/webhook|mobilithek-webhook)\/([^/?#]+)/);
 
   if (pathMatch) {
     target.searchParams.set("feedId", decodeURIComponent(pathMatch[1]!));
     return target;
   }
 
-  const subscriptionId =
-    url.searchParams.get("subscriptionId") ?? url.searchParams.get("subscriptionID");
+  const subscriptionId = query.subscriptionId ?? query.subscriptionID;
   if (subscriptionId) {
     target.searchParams.set("subscriptionId", subscriptionId);
     return target;
@@ -44,57 +47,73 @@ function resolveWebhookTarget(requestUrl: string) {
   return null;
 }
 
-const handler = async (request: Request) => {
-  if (request.method === "HEAD") {
-    return new Response(null, { status: 204 });
+export const handler: Handler = async (event) => {
+  if (event.httpMethod === "HEAD") {
+    return { statusCode: 204, body: "" };
   }
 
-  if (request.method === "GET") {
-    return Response.json({ ok: true });
+  if (event.httpMethod === "GET") {
+    return {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: true }),
+    };
   }
 
-  if (request.method !== "POST") {
-    return Response.json({ error: "Method not allowed" }, { status: 405 });
+  if (event.httpMethod !== "POST") {
+    return {
+      statusCode: 405,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ error: "Method not allowed" }),
+    };
   }
 
-  const target = resolveWebhookTarget(request.url);
+  const rawUrl =
+    event.rawUrl ??
+    `${event.headers["x-forwarded-proto"] ?? "https"}://${event.headers.host}${event.rawQuery ? `${event.path}?${event.rawQuery}` : event.path}`;
+  const target = targetFromEvent(rawUrl, event.path, event.queryStringParameters ?? {});
   if (!target) {
-    return Response.json({ error: "Missing feedId path or subscriptionId query" }, { status: 400 });
+    return {
+      statusCode: 400,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ error: "Missing feedId path or subscriptionId query" }),
+    };
   }
 
   const diag: Record<string, unknown> = {};
   try {
     const decoded = decodeWebhookBody(
-      await request.arrayBuffer(),
-      request.headers.get("content-encoding"),
+      event.body,
+      Boolean(event.isBase64Encoded),
+      event.headers["content-encoding"],
     );
     Object.assign(diag, decoded.diagnostics);
-    diag.contentType = request.headers.get("content-type");
-    diag.runtime = "netlify-function-proxy";
+    diag.contentType = event.headers["content-type"] ?? null;
+    diag.runtime = "netlify-legacy-function-proxy";
     const payload = JSON.stringify(JSON.parse(decoded.payload));
 
     const response = await fetch(target, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(request.headers.get("x-webhook-secret")
-          ? { "x-webhook-secret": request.headers.get("x-webhook-secret")! }
+        ...(event.headers["x-webhook-secret"]
+          ? { "x-webhook-secret": event.headers["x-webhook-secret"] }
           : {}),
       },
       body: payload,
     });
 
-    const body = await response.text();
-    return new Response(body, {
-      status: response.status,
-      headers: {
-        "content-type": response.headers.get("content-type") ?? "application/json",
-      },
-    });
+    return {
+      statusCode: response.status,
+      headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
+      body: await response.text(),
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Webhook processing failed";
-    return Response.json({ error: message, diag }, { status: 500 });
+    return {
+      statusCode: 500,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ error: message, diag }),
+    };
   }
 };
-
-export default handler;
