@@ -284,6 +284,10 @@ Normale Netlify Functions bekommen diesen Body in dieser Kombination als bereits
 UTF-8-String (`\u001f�\b...`) und koennen ihn nicht mehr gunzippen. Die Netlify Edge Function
 bekommt den Raw-Body vorher, entpackt gzip und leitet normales JSON intern weiter.
 
+Der Mobilithek-Portal-Test kann nur einen `testRequest` ohne echte
+`aegiEnergyInfrastructureStatusPublication` senden. Dieser Test beweist dann nur, dass der
+Transport funktioniert; er erzeugt bewusst keine Live-Statusdaten im Frontend.
+
 **Pflicht-Env in Netlify:**
 
 | Variable | Zweck |
