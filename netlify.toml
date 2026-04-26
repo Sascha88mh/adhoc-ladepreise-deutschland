@@ -13,22 +13,6 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  external_node_modules = ["axios", "pg", "zod"]
-  included_files = [
-    "../../node_modules/axios",
-    "../../node_modules/axios/**",
-    "../../node_modules/pg",
-    "../../node_modules/pg/**",
-    "../../node_modules/zod",
-    "../../node_modules/zod/**",
-    "node_modules/axios",
-    "node_modules/axios/**",
-    "node_modules/pg",
-    "node_modules/pg/**",
-    "node_modules/zod",
-    "node_modules/zod/**",
-    "../../node_modules/.pnpm/**",
-  ]
 
 # Mobilithek sendet den Webhook-Body gzip-kodiert. Der @netlify/plugin-nextjs
 # Adapter dekodiert den Body als UTF-8 bevor er die Route erreicht (mangelt also
