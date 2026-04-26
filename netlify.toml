@@ -14,6 +14,14 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+[[edge_functions]]
+  path = "/api/admin/mobilithek/webhook/*"
+  function = "mobilithek-webhook"
+
+[[edge_functions]]
+  path = "/api/mobilithek/webhook"
+  function = "mobilithek-webhook"
+
 # Mobilithek-Push wird zuerst von netlify/edge-functions/mobilithek-webhook.ts
 # verarbeitet. Diese Redirects bleiben als Fallback fuer unkomprimierte Payloads
 # bestehen, falls die Edge Function einmal nicht greift.

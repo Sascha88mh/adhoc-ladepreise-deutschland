@@ -1,4 +1,4 @@
-import type { Config, Context } from "@netlify/edge-functions";
+import type { Context } from "@netlify/edge-functions";
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -125,8 +125,4 @@ export default async (request: Request, _context: Context) => {
       500,
     );
   }
-};
-
-export const config: Config = {
-  path: ["/api/admin/mobilithek/webhook/*", "/api/mobilithek/webhook"],
 };
