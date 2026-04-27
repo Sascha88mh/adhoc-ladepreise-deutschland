@@ -50,6 +50,12 @@ CREATE TABLE sync_runs (
 );
 
 CREATE INDEX idx_sync_runs_feed_started ON sync_runs(feed_id, started_at DESC);
+CREATE UNIQUE INDEX idx_sync_runs_one_running_per_feed
+  ON sync_runs(feed_id)
+  WHERE status = 'running';
+CREATE INDEX idx_sync_runs_running_started
+  ON sync_runs(started_at)
+  WHERE status = 'running';
 
 CREATE TABLE webhook_deliveries (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

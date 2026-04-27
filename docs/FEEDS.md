@@ -23,8 +23,9 @@
                                   ▼
                    ┌─────────────────────────┐
                    │  runFeedAction          │
-                   │  (pro Feed, parallel,    │
-                   │   mit Timeout + Lock)    │
+                   │  (pro Feed, begrenzt     │
+                   │   parallel, Timeout +    │
+                   │   DB-Claim)              │
                    └──┬──────────────────────┘
                       │
         ┌─────────────┼──────────────────────┐
@@ -351,21 +352,22 @@ netlify deploy --trigger --prod --site <site-id> --filter web
 
 Sequenz in `runFeedAction` ([ingest/index.ts](../packages/shared/src/ingest/index.ts)):
 
-1. **Lock:** `pg_try_advisory_xact_lock(hash(feedId))`. Wenn belegt → eigenes `sync_runs`-Entry
-   mit `status=failed, message="Feed wird bereits verarbeitet (Lock belegt)"`, dann Exit.
-   (Seit Migration 002: Lock-Kollisionen sind im Admin-UI sichtbar, nicht mehr stumm.)
-2. **Run-Row:** `INSERT INTO sync_runs status='running'`.
-3. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook und wird bei manuellen Tests als Noop-Erfolg markiert).
+1. **Run-Claim:** `INSERT INTO sync_runs status='running' ... ON CONFLICT DO NOTHING`.
+   Migration 003 erzwingt per Unique-Index, dass pro Feed nur ein laufender Sync existiert.
+   Wenn bereits ein Lauf aktiv ist, geben Scheduler und manuelle Pulls den bestehenden Lauf zurück,
+   statt einen Fehler zu schreiben. Webhooks werfen in diesem Fall einen Fehler, damit der Sender
+   retryen kann.
+2. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook und wird bei manuellen Tests als Noop-Erfolg markiert).
    - Gzip verpflichtend (Accept-Encoding). axios dekomprimiert automatisch.
    - 204 / 304 → als „keine Änderung" behandelt, kein Fehler.
-4. **Raw-Payload persistieren** (`raw_feed_payloads`):
+3. **Parse** (`parseStaticMobilithekPayload` / `parseDynamicMobilithekPayload`).
+4. **Raw-Payload persistieren** (`raw_feed_payloads`) in einer kurzen DB-Transaktion:
    - Bei > `RAW_PAYLOAD_MAX_BYTES` (Default 512 KB) wird nur eine **strukturelle Zusammenfassung** gespeichert (`__truncated=true`, Kopf/Fuß-Preview, Size). Vaylens' ~40 MB Payloads würden sonst die jsonb-Spalte sprengen.
-5. **Parse** (`parseStaticMobilithekPayload` / `parseDynamicMobilithekPayload`).
-6. **Upsert** in `stations`, `charge_points`, `connectors`, `tariffs*`, bzw. Deltas in `availability_snapshots`, `price_snapshots`.
-7. **`feed_configs` updaten** (`last_success_at`, `last_delta_count`, `cursor_state.lastModified`, Fehler-Counter zurücksetzen).
-8. **`sync_runs` finalisieren** (`status='success'`, `finished_at`, `message`, `delta_count`).
+5. **Upsert** in `stations`, `charge_points`, `connectors`, `tariffs*`, bzw. Deltas in `availability_snapshots`, `price_snapshots`.
+6. **`feed_configs` updaten** (`last_success_at`, `last_delta_count`, `cursor_state.lastModified`, Fehler-Counter zurücksetzen).
+7. **`sync_runs` finalisieren** (`status='success'`, `finished_at`, `message`, `delta_count`).
 
-Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecutive_failures++`,
+Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt `last_error_message`, `consecutive_failures++`,
 `sync_runs.status='failed'`. Der Error wird zurückgegeben (und von `runDueFeedCycle` geloggt).
 
 ---
@@ -374,8 +376,15 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 
 [apps/web/netlify/functions/ingest-sync.mts](../apps/web/netlify/functions/ingest-sync.mts) ruft `runDueFeedCycle()` auf. Eigenschaften:
 
-- **Parallel.** Alle fälligen Feeds werden via `Promise.allSettled` gleichzeitig angestoßen. Ein hängendes Vaylens kann Tesla nicht mehr blockieren.
-- **Hard Timeout pro Feed:** `FEED_RUN_TIMEOUT_MS` (Default 90 s). Nach Ablauf wird der konkrete Feed abgebrochen (Timeout-Fehler landet in `sync_runs`), der Cycle läuft weiter.
+- **Begrenzt parallel.** Der Cycle arbeitet fällige Feeds mit `FEED_CYCLE_CONCURRENCY` ab
+  (Default `min(PG_POOL_MAX, 4)`). Dadurch bleiben Datenbank-Pool, Netlify-Invocation und
+  Mobilithek auch bei 100+ konfigurierten Feeds stabil.
+- **Hard Timeout pro Feed:** `FEED_RUN_TIMEOUT_MS` (Default 90 s). Nach Ablauf wartet der Cycle
+  nicht weiter auf diesen Feed und arbeitet weiter; der laufende `sync_runs`-Claim verhindert
+  Doppelarbeit, bis der Lauf erfolgreich endet oder vom Stuck-Run-Cleanup freigegeben wird.
+- **Durable Claim:** Überlappende Cron-Invocations erzeugen keine `failed`-Lock-Einträge mehr.
+  Ein zweiter Lauf sieht die bestehende `running`-Zeile und überspringt den Feed ohne neuen
+  Mobilithek-Abruf.
 - **Top-Level Try/Catch:** Selbst eine geworfene Exception aus `runDueFeedCycle` killt die Netlify-Invocation nicht — damit der nächste Cron-Tick nicht ausgesetzt wird.
 - **Stuck-Run Cleanup:** Vor jedem Cycle werden `sync_runs` mit `status='running'` und `started_at < now() - 5m` auf `failed` gesetzt.
 
@@ -384,6 +393,7 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 | Variable                  | Default     | Zweck                                                  |
 | ------------------------- | ----------- | ------------------------------------------------------ |
 | `FEED_RUN_TIMEOUT_MS`     | `90000`     | Max. Laufzeit eines Einzel-Feeds im Cycle              |
+| `FEED_CYCLE_CONCURRENCY`  | `min(PG_POOL_MAX, 4)` | Max. gleichzeitige Feed-Aktionen pro Cron-Cycle |
 | `MOBILITHEK_TIMEOUT_MS`   | `60000`     | axios-Timeout pro HTTP-Request                         |
 | `RAW_PAYLOAD_MAX_BYTES`   | `524288`    | Ab dieser Größe wird der Raw-Payload zusammengefasst    |
 | `MOBILITHEK_BASE_URL`     | `https://m2m.mobilithek.info` | Override für Staging/Testing             |
@@ -420,11 +430,14 @@ Bei Exception in 3–6: `markFeedFailure` setzt `last_error_message`, `consecuti
 ### „stale seit N Std." im Admin-UI, `FEHLER: Keine`
 → Der Cycle hat den Feed nicht erreicht. Ursachen-Checkliste:
 1. Netlify Function Logs von `ingest-sync`. Gibt es Invocations? Errors?
-2. `SELECT status, started_at, message FROM sync_runs WHERE feed_id = '<id>' ORDER BY started_at DESC LIMIT 20;` — siehst du Lock-busy-Einträge? Dann hängt eine andere Invocation fest.
+2. `SELECT status, started_at, message FROM sync_runs WHERE feed_id = '<id>' ORDER BY started_at DESC LIMIT 20;` — siehst du einen alten `running`-Eintrag? Dann hängt eine frühere Invocation fest.
 3. `SELECT id, status, started_at FROM sync_runs WHERE status='running' AND started_at < now() - interval '10 minutes';` → sollten automatisch gecleaned werden, sonst manuell via `DELETE /api/admin/sync-runs`.
 
-### „Feed wird bereits verarbeitet (Lock belegt)"
-→ Eine parallele Invocation hält den Advisory-Lock. Normal bei überlappenden manuellen + geplanten Syncs. Wenn das dauerhaft auftritt: auf gestauete PG-Connections prüfen (Supabase Pooler-Status).
+### „Feed wird bereits verarbeitet"
+→ Ein anderer Lauf verarbeitet denselben Feed. Seit Migration 003 ist das normalerweise kein
+Admin-Fehler mehr: Scheduler und manuelle Pulls bekommen den bereits laufenden `sync_runs`-Eintrag
+zurück und starten keinen zweiten Mobilithek-Abruf. Wenn die Meldung bei Webhooks dauerhaft
+auftaucht, prüfen ob ein alter `running`-Lauf hängt und `DELETE /api/admin/sync-runs` ausführen.
 
 ### `Unexpected token … in JSON`
 → Payload kam truncated an. Historisch: `maxContentLength` zu klein. Aktueller Default 200 MB; falls das überschritten wird, in `client.ts` anpassen.
@@ -580,7 +593,7 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
 |-------|---------|--------|
 | `app_secrets`-INSERT vergessen | „Kein Mobilithek-Client-Zertifikat" für Feeds ohne Netlify-Env-Var | INSERT für `MOBILITHEK_CERT_P12_BASE64` + `MOBILITHEK_CERT_PASSWORD` — Werte in §3.3 |
 | `description`-Spalte fehlt in `app_secrets` | SQL-Fehler beim INSERT mit `description` | Die Spalte existiert nur wenn Migration 002 mit der aktuellen Datei lief. INSERT ohne `description` funktioniert immer |
-| Advisory Lock hängt (pgBouncer Transaction Mode) | Feed stale, FEHLER=Keine, Lock-belegt-Einträge in sync_runs | Seit 2026-04-19 `pg_try_advisory_xact_lock` — Locks lösen sich beim Commit/Rollback |
+| Alte Lock-belegt-Einträge nach Cron-Überlappung | Admin zeigt `failed` mit „Lock belegt" obwohl Mobilithek ok ist | Migration 003 + aktueller Code nutzen einen durable `sync_runs`-Claim. Alte Einträge bleiben historisch sichtbar, neue Scheduler-Überlappungen schreiben keinen Fehler mehr. |
 | `0 Stationen verarbeitet` bei neuem CPO | Feed sync grün, aber keine Marker auf Karte | `locationReference` prüfen — ist sie auf Site- oder Station-Ebene? Troubleshooting §7 |
 | Testlauf wirkt wie echter Sync | `last_success_at`/`last_delta_count` sehen grün aus, aber `stations` bleibt unverändert | Nur `kind = manual`/Scheduler-Läufe persistieren Katalogdaten. `kind = test` ist Dry-Run und darf nicht als produktiver Erfolg interpretiert werden |
 | Falsche Tarifüberschreibung bei CPOs mit wiederverwendetem Tarifcode | Preise eines Standorts überschreiben Preise eines anderen | Tarife immer über `tariff_key = scope + scopeCode + externalTariffCode` identifizieren, nie nur über `tariff_code` |
@@ -598,6 +611,13 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
 
 ## 11. Änderungshistorie dieser Doku
 
+- **2026-04-26 v7** — Static-Pull-Stabilität und Skalierung:
+  1. `sync_runs`-Claim statt Advisory-Lock: pro Feed kann nur noch ein `running`-Lauf existieren.
+     Überlappende Cron-Invocations schreiben keine `failed`-Lock-Einträge mehr.
+  2. Static-Payloads werden erst nach erfolgreichem Run-Claim von Mobilithek geladen.
+     Dadurch erzeugt ein überfälliger großer Static-Feed keine parallelen 40–80-MB-Abrufe.
+  3. `FEED_CYCLE_CONCURRENCY` begrenzt die parallelen Feed-Aktionen pro Cron-Cycle
+     (Default `min(PG_POOL_MAX, 4)`) für 100+ konfigurierte Feeds.
 - **2026-04-26 v6** — Mobilithek-Push-Feeds produktionsfest dokumentiert:
   1. **Netlify Edge Webhook-Pfad** (§1, §3.6, §7, §10): gzip+`application/json` muss ueber `apps/web/netlify/edge-functions/mobilithek-webhook.ts` laufen; normaler Netlify-Function-Fallback kann gzip irreversibel beschaedigen.
   2. **Forward-Secret** (§3.6, §5, §10): `MOBILITHEK_FORWARD_SECRET` schuetzt den internen `/api/internal/mobilithek/webhook`-Forward. Ohne Secret muss dieser Endpunkt `401` liefern.

@@ -22,15 +22,6 @@ import { getPool } from "../db/pool";
 
 type FeedAction = "test" | "manual" | "reconciliation" | "webhook";
 
-function hashLockKey(input: string) {
-  let hash = 0;
-  for (let index = 0; index < input.length; index += 1) {
-    hash = (hash << 5) - hash + input.charCodeAt(index);
-    hash |= 0;
-  }
-  return hash;
-}
-
 function payloadKindFor(feed: FeedConfig, action: FeedAction) {
   if (action === "webhook") {
     return "webhook";
@@ -247,66 +238,46 @@ function parsePayloadJson(payload: string) {
   return JSON.parse(sanitizeMobilithekJsonPayload(payload)) as Record<string, unknown>;
 }
 
-async function withFeedLock<T>(
-  feedId: string,
-  work: (client: PoolClient) => Promise<T>,
-): Promise<{ ok: true; value: T } | { ok: false; reason: "busy" }> {
-  const client = await getPool().connect();
-  const lockKey = hashLockKey(feedId);
-  let committed = false;
-
-  try {
-    await client.query("BEGIN");
-
-    const lock = await client.query<{ locked: boolean }>(
-      // Transaction-level advisory lock: released automatically on COMMIT/ROLLBACK.
-      // This works correctly with Supabase pgBouncer (transaction mode) where
-      // session-level locks can leak across pool connections.
-      `select pg_try_advisory_xact_lock($1) as locked`,
-      [lockKey],
-    );
-
-    if (!lock.rows[0]?.locked) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "busy" };
-    }
-
-    // Run work, capturing errors so we can COMMIT before re-throwing.
-    // Always committing ensures sync_runs audit entries (incl. failure records
-    // written inside work's own catch block) are persisted even on errors.
-    let workError: unknown = undefined;
-    let workResult: T | undefined;
-    try {
-      workResult = await work(client);
-    } catch (err) {
-      workError = err;
-    }
-
-    await client.query("COMMIT");
-    committed = true;
-
-    if (workError !== undefined) {
-      throw workError;
-    }
-
-    return { ok: true, value: workResult as T };
-  } catch (error) {
-    if (!committed) {
-      await client.query("ROLLBACK").catch(() => undefined);
-    }
-    throw error;
-  } finally {
-    client.release();
-  }
+function mapSyncRun(row: Record<string, unknown>): SyncRun {
+  return {
+    id: String(row.id),
+    feedId: String(row.feed_id),
+    kind: row.kind as SyncRun["kind"],
+    status: row.status as SyncRun["status"],
+    startedAt: new Date(String(row.started_at)).toISOString(),
+    finishedAt: row.finished_at ? new Date(String(row.finished_at)).toISOString() : null,
+    message: String(row.message ?? ""),
+    deltaCount: Number(row.delta_count ?? 0),
+  };
 }
 
-async function createRun(
-  client: PoolClient,
-  feedId: string,
-  kind: FeedAction,
-  message: string,
-) {
-  const result = await client.query(
+async function loadRun(client: PoolClient, runId: string) {
+  const result = await client.query<Record<string, unknown>>(
+    `select *
+       from sync_runs
+      where id = $1::uuid`,
+    [runId],
+  );
+
+  return result.rows[0] ? mapSyncRun(result.rows[0]) : null;
+}
+
+async function loadRunningRun(feedId: string) {
+  const result = await getPool().query<Record<string, unknown>>(
+    `select *
+       from sync_runs
+      where feed_id = $1::uuid
+        and status = 'running'
+      order by started_at asc
+      limit 1`,
+    [feedId],
+  );
+
+  return result.rows[0] ? mapSyncRun(result.rows[0]) : null;
+}
+
+async function claimFeedRun(feedId: string, kind: FeedAction, message: string) {
+  const insertClaim = () => getPool().query<Record<string, unknown>>(
     `insert into sync_runs (
         feed_id,
         kind,
@@ -316,11 +287,32 @@ async function createRun(
         message,
         delta_count
       ) values ($1::uuid, $2, 'running', now(), null, $3, 0)
-      returning id::text`,
+      on conflict (feed_id) where status = 'running' do nothing
+      returning *`,
     [feedId, kind, message],
   );
+  const result = await insertClaim();
 
-  return String(result.rows[0].id);
+  if (result.rows[0]) {
+    return { claimed: true as const, run: mapSyncRun(result.rows[0]) };
+  }
+
+  const running = await loadRunningRun(feedId);
+  if (running) {
+    return { claimed: false as const, run: running };
+  }
+
+  // The conflicting run may have finished between ON CONFLICT and the lookup.
+  // Retry once so manual actions do not fail spuriously on that tiny race.
+  const retry = await insertClaim();
+  if (retry.rows[0]) {
+    return { claimed: true as const, run: mapSyncRun(retry.rows[0]) };
+  }
+
+  return {
+    claimed: false as const,
+    run: await loadRunningRun(feedId),
+  };
 }
 
 async function finishRun(
@@ -1095,6 +1087,10 @@ async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
  * FEED_RUN_TIMEOUT_MS. Default 90s — enough for a 40 MB Vaylens pull + parse.
  */
 const FEED_RUN_TIMEOUT_MS = Number(process.env.FEED_RUN_TIMEOUT_MS ?? 90_000);
+const FEED_CYCLE_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.FEED_CYCLE_CONCURRENCY ?? Math.min(Number(process.env.PG_POOL_MAX ?? 10), 4)),
+);
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -1112,6 +1108,40 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+async function runWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+
+      try {
+        results[index] = {
+          status: "fulfilled",
+          value: await worker(items[index]!, index),
+        };
+      } catch (error) {
+        results[index] = {
+          status: "rejected",
+          reason: error,
+        };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker()),
+  );
+
+  return results;
+}
+
 export async function runFeedAction(
   feedId: string,
   action: FeedAction,
@@ -1120,104 +1150,95 @@ export async function runFeedAction(
     dryRun?: boolean;
   },
 ) {
-  let prefetchedStaticPayload: string | undefined = options?.payload;
-  let prefetchedStaticParsed: ParsedStaticFeed | undefined;
-
-  if (!prefetchedStaticPayload) {
-    const feed = await getFeedConfigDb(feedId);
-    if (!feed) {
-      throw new Error("Feed not found");
-    }
-
-    if (feed.type === "static") {
-      prefetchedStaticPayload = await fetchStaticMobilithekPayload(feed);
-      prefetchedStaticParsed = parseStaticMobilithekPayload(prefetchedStaticPayload);
-    }
-  } else {
-    const feed = await getFeedConfigDb(feedId);
-    if (!feed) {
-      throw new Error("Feed not found");
-    }
-
-    if (feed.type === "static") {
-      prefetchedStaticParsed = parseStaticMobilithekPayload(prefetchedStaticPayload);
-    }
+  const feed = await getFeedConfigDb(feedId);
+  if (!feed) {
+    throw new Error("Feed not found");
   }
 
-  const lockResult = await withFeedLock(feedId, async (client) => {
-    const feed = await getFeedConfigDb(feedId, client);
-    if (!feed) {
-      throw new Error("Feed not found");
+  const claim = await claimFeedRun(
+    feed.id,
+    action,
+    options?.dryRun ? "Feed-Test gestartet" : "Feed-Sync gestartet",
+  );
+
+  if (!claim.claimed) {
+    if (action === "webhook") {
+      throw new Error("Feed wird bereits verarbeitet");
+    }
+    return claim.run;
+  }
+
+  const runId = claim.run.id;
+
+  try {
+    let deltaCount = 0;
+    let message = "Keine Änderungen";
+    let cursorState = feed.cursorState ?? null;
+    let lastSnapshotAt = feed.lastSnapshotAt;
+    let noRemoteWork = false;
+    let payloadToRecord: string | null = null;
+    let parsedStatic: ParsedStaticFeed | null = null;
+    let parsedDynamic: ReturnType<typeof parseDynamicMobilithekPayload> | null = null;
+
+    if (feed.type === "static") {
+      payloadToRecord = options?.payload ?? (await fetchStaticMobilithekPayload(feed));
+      parsedStatic = parseStaticMobilithekPayload(payloadToRecord);
+      deltaCount = parsedStatic.catalog.length;
+      message = `${parsedStatic.catalog.length} Stationen verarbeitet`;
+    } else if (feed.mode === "push" && !options?.payload) {
+      noRemoteWork = true;
+      message = "Push-only Dynamic-Feed: kein Pull-Endpunkt, wartet auf Mobilithek-Webhook";
+    } else {
+      const dynamic = options?.payload
+        ? {
+            payload: options.payload,
+            lastModified:
+              typeof feed.cursorState?.lastModified === "string"
+                ? feed.cursorState.lastModified
+                : null,
+          }
+        : await pullDynamicMobilithekPayload(
+            feed,
+            typeof feed.cursorState?.lastModified === "string"
+              ? feed.cursorState.lastModified
+              : null,
+          );
+
+      if (!dynamic) {
+        message = "Keine Änderungen seit dem letzten Pull";
+      } else {
+        payloadToRecord = dynamic.payload;
+        parsedDynamic = parseDynamicMobilithekPayload(dynamic.payload);
+        deltaCount = parsedDynamic.updates.length;
+        message = `${parsedDynamic.updates.length} Delta-Updates verarbeitet`;
+        cursorState = {
+          ...(feed.cursorState ?? {}),
+          lastModified: dynamic.lastModified,
+          lastWebhookAt: action === "webhook" ? new Date().toISOString() : feed.cursorState?.lastWebhookAt,
+        };
+      }
     }
 
-    const runId = await createRun(client, feed.id, action, options?.dryRun ? "Feed-Test gestartet" : "Feed-Sync gestartet");
-
+    const client = await getPool().connect();
     try {
-      let deltaCount = 0;
-      let message = "Keine Änderungen";
-      let cursorState = feed.cursorState ?? null;
-      let lastSnapshotAt = feed.lastSnapshotAt;
-      let noRemoteWork = false;
+      await client.query("BEGIN");
 
-      if (feed.type === "static") {
-        const payload = prefetchedStaticPayload ?? (await fetchStaticMobilithekPayload(feed));
+      if (payloadToRecord) {
         await recordPayload(client, {
           runId,
           feedId: feed.id,
           payloadKind: payloadKindFor(feed, action),
-          payload,
+          payload: payloadToRecord,
         });
+      }
 
-        const parsed = prefetchedStaticParsed ?? parseStaticMobilithekPayload(payload);
-        deltaCount = parsed.catalog.length;
-        message = `${parsed.catalog.length} Stationen verarbeitet`;
+      if (!options?.dryRun && parsedStatic) {
+        await upsertStaticCatalog(client, feed, parsedStatic);
+        lastSnapshotAt = new Date().toISOString();
+      }
 
-        if (!options?.dryRun) {
-          await upsertStaticCatalog(client, feed, parsed);
-          lastSnapshotAt = new Date().toISOString();
-        }
-      } else if (feed.mode === "push" && !options?.payload) {
-        noRemoteWork = true;
-        message = "Push-only Dynamic-Feed: kein Pull-Endpunkt, wartet auf Mobilithek-Webhook";
-      } else {
-        const dynamic = options?.payload
-          ? {
-              payload: options.payload,
-              lastModified:
-                typeof feed.cursorState?.lastModified === "string"
-                  ? feed.cursorState.lastModified
-                  : null,
-            }
-          : await pullDynamicMobilithekPayload(
-              feed,
-              typeof feed.cursorState?.lastModified === "string"
-                ? feed.cursorState.lastModified
-                : null,
-            );
-
-        if (!dynamic) {
-          message = "Keine Änderungen seit dem letzten Pull";
-        } else {
-          await recordPayload(client, {
-            runId,
-            feedId: feed.id,
-            payloadKind: payloadKindFor(feed, action),
-            payload: dynamic.payload,
-          });
-          const parsed = parseDynamicMobilithekPayload(dynamic.payload);
-          deltaCount = parsed.updates.length;
-          message = `${parsed.updates.length} Delta-Updates verarbeitet`;
-
-          if (!options?.dryRun) {
-            deltaCount = await applyDynamicUpdates(client, feed, parsed.updates);
-          }
-
-          cursorState = {
-            ...(feed.cursorState ?? {}),
-            lastModified: dynamic.lastModified,
-            lastWebhookAt: action === "webhook" ? new Date().toISOString() : feed.cursorState?.lastWebhookAt,
-          };
-        }
+      if (!options?.dryRun && parsedDynamic) {
+        deltaCount = await applyDynamicUpdates(client, feed, parsedDynamic.updates);
       }
 
       if (!options?.dryRun) {
@@ -1231,78 +1252,45 @@ export async function runFeedAction(
           });
         }
       }
+
       await finishRun(client, runId, {
         status: "success",
         message,
         deltaCount,
       });
+
+      const run = await loadRun(client, runId);
+      await client.query("COMMIT");
+      return run;
     } catch (error) {
-      const message = errorMessage(error);
-      try {
-        await markFeedFailure(client, feed, message);
-        await finishRun(client, runId, {
-          status: "failed",
-          message,
-          deltaCount: 0,
-        });
-      } catch (recordError) {
-        console.error(
-          `[ingest] failed to persist failure state for ${feed.id}:`,
-          errorMessage(recordError),
-        );
-      }
+      await client.query("ROLLBACK").catch(() => undefined);
       throw error;
+    } finally {
+      client.release();
     }
-
-    const result = await client.query(
-      `select *
-         from sync_runs
-        where id = $1::uuid`,
-      [runId],
-    );
-
-    return result.rows[0]
-      ? ({
-          id: String(result.rows[0].id),
-          feedId: String(result.rows[0].feed_id),
-          kind: result.rows[0].kind,
-          status: result.rows[0].status,
-          startedAt: new Date(String(result.rows[0].started_at)).toISOString(),
-          finishedAt: result.rows[0].finished_at
-            ? new Date(String(result.rows[0].finished_at)).toISOString()
-            : null,
-          message: String(result.rows[0].message ?? ""),
-          deltaCount: Number(result.rows[0].delta_count ?? 0),
-        } satisfies SyncRun)
-      : null;
-  });
-
-  if (!lockResult.ok) {
-    // Another worker already holds the advisory lock. Persist a short
-    // sync_runs entry so the admin UI sees the skip instead of silently
-    // going stale, and bump the feed's lastErrorMessage for diagnostics.
+  } catch (error) {
+    const message = errorMessage(error);
+    const client = await getPool().connect();
     try {
-      const feed = await getFeedConfigDb(feedId);
-      if (feed) {
-        const client = await getPool().connect();
-        try {
-          const runId = await createRun(client, feed.id, action, "Lock belegt");
-          await finishRun(client, runId, {
-            status: "failed",
-            message: "Feed wird bereits verarbeitet (Lock belegt)",
-            deltaCount: 0,
-          });
-        } finally {
-          client.release();
-        }
-      }
-    } catch (err) {
-      console.error(`[ingest] failed to record lock-busy run for ${feedId}:`, errorMessage(err));
+      await client.query("BEGIN");
+      await markFeedFailure(client, feed, message);
+      await finishRun(client, runId, {
+        status: "failed",
+        message,
+        deltaCount: 0,
+      });
+      await client.query("COMMIT");
+    } catch (recordError) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      console.error(
+        `[ingest] failed to persist failure state for ${feed.id}:`,
+        errorMessage(recordError),
+      );
+    } finally {
+      client.release();
     }
-    throw new Error("Feed wird bereits verarbeitet");
+    throw error;
   }
-
-  return lockResult.value;
 }
 
 export async function runDueFeedCycle() {
@@ -1328,15 +1316,16 @@ export async function runDueFeedCycle() {
     return 0;
   }
 
-  // Parallelise — one slow/hung feed must not starve others. Each call is
-  // additionally bounded by FEED_RUN_TIMEOUT_MS so the whole cycle has a
-  // predictable upper bound.
-  const results = await Promise.allSettled(
-    dueFeeds.map((feed) => {
+  // Bounded parallelism: one slow feed must not starve the rest, but a large
+  // backlog should also not open 100 upstream requests and DB transactions.
+  const results = await runWithConcurrency(
+    dueFeeds,
+    FEED_CYCLE_CONCURRENCY,
+    async (feed) => {
       const kind: FeedAction =
         feed.type === "dynamic" && feed.mode !== "pull" ? "reconciliation" : "manual";
       return withTimeout(runFeedAction(feed.id, kind), FEED_RUN_TIMEOUT_MS, feed.name);
-    }),
+    },
   );
 
   results.forEach((result, index) => {
