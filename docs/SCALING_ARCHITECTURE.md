@@ -255,6 +255,9 @@ Erfolgskriterium:
 Ziel: Haeufige Kartenansichten sollen ohne DB-Hit beantwortet werden.
 
 - Cache-Key nach Zoom/Tile oder normalisierten Bounds bilden.
+  Status: erster Schritt umgesetzt. Die Karten-API bietet einen GET-Pfad mit
+  kurzen Cache-Headern; der Client rundet Bounds nach aussen, damit aehnliche
+  Kartenbewegungen dieselbe URL verwenden koennen.
 - Filtergruppen in den Cache-Key aufnehmen, aber nur fuer stabile, haeufige Filter.
 - Kurze TTL fuer statusnahe Daten nutzen.
 - Versionierte Cache-Keys verwenden, damit Feed-Syncs betroffene Tiles gezielt

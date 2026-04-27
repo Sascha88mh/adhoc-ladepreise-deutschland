@@ -103,12 +103,34 @@ export async function fetchMapStations(payload: {
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number };
   filters: CandidateFilters;
 }) {
-  const response = await requestJson<unknown>("/api/public/stations/map", {
-    method: "POST",
-    body: JSON.stringify(payload),
+  const bounds = quantizeMapBounds(payload.bounds);
+  const params = new URLSearchParams({
+    minLat: String(bounds.minLat),
+    minLng: String(bounds.minLng),
+    maxLat: String(bounds.maxLat),
+    maxLng: String(bounds.maxLng),
+    filters: JSON.stringify(payload.filters ?? {}),
   });
 
+  const response = await requestJson<unknown>(`/api/public/stations/map?${params.toString()}`);
+
   return publicMapStationsResponseSchema.parse(response).data;
+}
+
+function quantizeMapBounds(bounds: {
+  minLat: number;
+  minLng: number;
+  maxLat: number;
+  maxLng: number;
+}) {
+  const precision = 100;
+
+  return {
+    minLat: Math.floor(bounds.minLat * precision) / precision,
+    minLng: Math.floor(bounds.minLng * precision) / precision,
+    maxLat: Math.ceil(bounds.maxLat * precision) / precision,
+    maxLng: Math.ceil(bounds.maxLng * precision) / precision,
+  };
 }
 
 export async function fetchStationDetail(stationId: string): Promise<StationDetail> {
