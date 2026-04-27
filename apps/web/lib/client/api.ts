@@ -21,7 +21,7 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit) {
   const response = await fetch(input, {
     ...init,
     headers: {
-      "content-type": "application/json",
+      ...(init?.body ? { "content-type": "application/json" } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -111,8 +111,10 @@ export async function fetchMapStations(payload: {
     maxLng: String(bounds.maxLng),
     filters: JSON.stringify(payload.filters ?? {}),
   });
+  const baseUrl =
+    process.env.NEXT_PUBLIC_MAP_STATIONS_URL ?? "/api/public/stations/map";
 
-  const response = await requestJson<unknown>(`/api/public/stations/map?${params.toString()}`);
+  const response = await requestJson<unknown>(`${baseUrl}?${params.toString()}`);
 
   return publicMapStationsResponseSchema.parse(response).data;
 }

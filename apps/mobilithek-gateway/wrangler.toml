@@ -4,6 +4,7 @@ compatibility_date = "2026-04-26"
 
 [vars]
 UPSTREAM_WEBHOOK_URL = "https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook"
+MAP_STATIONS_UPSTREAM_URL = "https://adhoc-plattform.netlify.app/api/public/stations/map"
 
 # Set the same value on Netlify as MOBILITHEK_FORWARD_SECRET.
 # Do not commit real secrets here:

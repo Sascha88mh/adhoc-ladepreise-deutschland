@@ -1,7 +1,17 @@
 type Env = {
   UPSTREAM_WEBHOOK_URL: string;
+  MAP_STATIONS_UPSTREAM_URL?: string;
   MOBILITHEK_FORWARD_SECRET?: string;
 };
+
+type CloudflareCacheStorage = CacheStorage & {
+  default: Cache;
+};
+
+const ALLOWED_ORIGINS = new Set([
+  "https://adhoc-plattform.netlify.app",
+  "https://main--adhoc-plattform.netlify.app",
+]);
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -11,6 +21,84 @@ function json(body: unknown, status = 200) {
       "cache-control": "no-store",
     },
   });
+}
+
+function corsHeaders(request: Request) {
+  const origin = request.headers.get("origin");
+  const allowOrigin = origin && ALLOWED_ORIGINS.has(origin) ? origin : "*";
+
+  return {
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400",
+  };
+}
+
+function withCors(response: Response, request: Request) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders(request))) {
+    headers.set(key, value);
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function mapStationsTarget(request: Request, upstreamBase: string) {
+  const url = new URL(request.url);
+  const target = new URL(upstreamBase);
+  target.search = url.search;
+  return target;
+}
+
+async function handleMapStations(request: Request, env: Env, context: ExecutionContext) {
+  if (!env.MAP_STATIONS_UPSTREAM_URL) {
+    return withCors(json({ error: "MAP_STATIONS_UPSTREAM_URL is not configured" }, 500), request);
+  }
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders(request) });
+  }
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return withCors(json({ error: "Method not allowed" }, 405), request);
+  }
+
+  const cache = (caches as CloudflareCacheStorage).default;
+  const target = mapStationsTarget(request, env.MAP_STATIONS_UPSTREAM_URL);
+  const cacheKey = new Request(target.toString(), { method: "GET" });
+  const cached = await cache.match(cacheKey);
+
+  if (cached) {
+    const response = new Response(request.method === "HEAD" ? null : cached.body, cached);
+    response.headers.set("x-adhoc-cache", "hit");
+    return withCors(response, request);
+  }
+
+  const upstream = await fetch(target, {
+    headers: {
+      accept: "application/json",
+    },
+  });
+  const headers = new Headers(upstream.headers);
+  headers.set("cache-control", "public, max-age=20, s-maxage=60, stale-while-revalidate=120");
+  headers.set("x-adhoc-cache", "miss");
+
+  const response = new Response(request.method === "HEAD" ? null : upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+
+  if (upstream.ok && request.method === "GET") {
+    context.waitUntil(cache.put(cacheKey, response.clone()));
+  }
+
+  return withCors(response, request);
 }
 
 function targetFromRequest(request: Request, upstreamBase: string) {
@@ -72,7 +160,13 @@ async function decodeBody(request: Request) {
 }
 
 export default {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env, context: ExecutionContext) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/map-stations") {
+      return handleMapStations(request, env, context);
+    }
+
     if (request.method === "HEAD") {
       return new Response(null, { status: 204 });
     }
