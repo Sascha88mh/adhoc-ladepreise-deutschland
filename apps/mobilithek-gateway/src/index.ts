@@ -49,10 +49,22 @@ function withCors(response: Response, request: Request) {
 }
 
 function mapStationsTarget(request: Request, upstreamBase: string) {
-  const url = new URL(request.url);
   const target = new URL(upstreamBase);
-  target.search = url.search;
   return target;
+}
+
+function mapStationsPayload(request: Request) {
+  const url = new URL(request.url);
+
+  return {
+    bounds: {
+      minLat: Number(url.searchParams.get("minLat")),
+      minLng: Number(url.searchParams.get("minLng")),
+      maxLat: Number(url.searchParams.get("maxLat")),
+      maxLng: Number(url.searchParams.get("maxLng")),
+    },
+    filters: JSON.parse(url.searchParams.get("filters") ?? "{}"),
+  };
 }
 
 async function handleMapStations(request: Request, env: Env, context: ExecutionContext) {
@@ -70,7 +82,7 @@ async function handleMapStations(request: Request, env: Env, context: ExecutionC
 
   const cache = (caches as CloudflareCacheStorage).default;
   const target = mapStationsTarget(request, env.MAP_STATIONS_UPSTREAM_URL);
-  const cacheKey = new Request(target.toString(), { method: "GET" });
+  const cacheKey = new Request(request.url, { method: "GET" });
   const cached = await cache.match(cacheKey);
 
   if (cached) {
@@ -80,9 +92,12 @@ async function handleMapStations(request: Request, env: Env, context: ExecutionC
   }
 
   const upstream = await fetch(target, {
+    method: "POST",
     headers: {
       accept: "application/json",
+      "content-type": "application/json",
     },
+    body: JSON.stringify(mapStationsPayload(request)),
   });
   const headers = new Headers(upstream.headers);
   headers.set("cache-control", "public, max-age=20, s-maxage=60, stale-while-revalidate=120");
