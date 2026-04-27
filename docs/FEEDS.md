@@ -269,10 +269,22 @@ Bei Fehlern die `sync_runs`-Zeile lesen — `message` ist immer aussagekräftig.
 https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/<feed-id>
 ```
 
+**Neue Ziel-URL ueber Cloudflare Gateway:**
+
+```text
+https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/webhook/<feed-id>
+```
+
+Der Cloudflare Worker `apps/mobilithek-gateway` ist der bevorzugte Eingang fuer
+neue und umgestellte Push-Feeds. Er liest den Raw-Body, entpackt gzip und leitet
+sauberes JSON mit `x-mobilithek-forward-secret` an den internen Netlify-Endpunkt
+weiter. Die alte Netlify-URL bleibt zunaechst als Fallback dokumentiert, bis alle
+Mobilithek-Subscriptions im Portal umgestellt und getestet sind.
+
 Beispiel EnBW Dynamic:
 
 ```text
-https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
+https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/webhook/472eae23-52f2-4f7c-a25e-7f45ce509b45
 ```
 
 **Wichtig:** Diese URL nimmt die interne `feed_configs.id` (`uuid`), nicht die Mobilithek-Angebots-ID
@@ -301,13 +313,13 @@ damit Edge Function und Next Route denselben Wert sehen.
 **Live-Checks nach jedem neuen Push-Feed:**
 
 ```sh
-# Healthcheck: muss netlify-edge-function melden
-curl -i https://adhoc-plattform.netlify.app/api/mobilithek/webhook
+# Healthcheck: muss mobilithek-gateway melden
+curl -i https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/
 
 # Mobilithek-artiger gzip-Test gegen Feed-ID-URL: muss 200 liefern
 printf '{"messageContainer":{"payload":[]}}' | gzip | \
   curl -i -X POST \
-    'https://adhoc-plattform.netlify.app/api/admin/mobilithek/webhook/<feed-id>' \
+    'https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/webhook/<feed-id>' \
     -H 'Content-Type: application/json' \
     -H 'Content-Encoding: gzip' \
     --data-binary @-
@@ -323,12 +335,15 @@ Erwartung:
 
 | Check | Erfolg |
 |---|---|
-| GET `/api/mobilithek/webhook` | `200` und `{"ok":true,"runtime":"netlify-edge-function"}` |
-| gzip POST auf `/api/admin/mobilithek/webhook/<feed-id>` | `200` und `{"ok":true,"feedId":"..."}` |
+| GET Cloudflare Gateway | `200` und `{"ok":true,"service":"mobilithek-gateway"}` |
+| gzip POST auf `/webhook/<feed-id>` | `200` und `{"ok":true,"feedId":"..."}` |
 | POST auf `/api/internal/mobilithek/webhook?...` ohne Secret | `401 Invalid forward secret` |
 
-Wenn der gzip-Test stattdessen `runtime":"netlify-legacy-function-proxy"` oder `Unexpected token '\u001f'`
-zeigt, greift die Edge Function nicht. Dann zuerst `netlify.toml` pruefen:
+Wenn der gzip-Test ueber die alte Netlify-URL stattdessen
+`runtime":"netlify-legacy-function-proxy"` oder `Unexpected token '\u001f'` zeigt,
+greift die Netlify Edge Function nicht. Dann bevorzugt die Mobilithek-URL auf das
+Cloudflare Gateway umstellen. Falls die Netlify-URL als Fallback gebraucht wird,
+zuerst `netlify.toml` pruefen:
 
 ```toml
 [[edge_functions]]

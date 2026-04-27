@@ -33,6 +33,13 @@ type StationRow = {
   last_status_update_at: string | null;
 };
 
+type StationBounds = {
+  minLat: number;
+  minLng: number;
+  maxLat: number;
+  maxLng: number;
+};
+
 type TariffRow = {
   station_id: string;
   tariff_key: string;
@@ -187,8 +194,22 @@ async function getTariffSchemaCapabilities(client?: PoolClient) {
   };
 }
 
-async function loadStationRows(stationCode?: string, client?: PoolClient) {
+function normalizeBounds(bounds: StationBounds) {
+  return {
+    minLat: Math.min(bounds.minLat, bounds.maxLat),
+    minLng: Math.min(bounds.minLng, bounds.maxLng),
+    maxLat: Math.max(bounds.minLat, bounds.maxLat),
+    maxLng: Math.max(bounds.minLng, bounds.maxLng),
+  };
+}
+
+async function loadStationRows(
+  stationCode?: string,
+  client?: PoolClient,
+  bounds?: StationBounds,
+) {
   const executor = client ?? getPool();
+  const normalizedBounds = bounds ? normalizeBounds(bounds) : null;
   const result = await executor.query<StationRow>(
     `select
         s.id::text as station_id,
@@ -219,9 +240,19 @@ async function loadStationRows(stationCode?: string, client?: PoolClient) {
  left join station_overrides o
         on o.station_id = s.id
      where ($1::text is null or s.station_code = $1::text)
+       and (
+         $2::float8 is null
+         or s.geom && ST_MakeEnvelope($2::float8, $3::float8, $4::float8, $5::float8, 4326)
+       )
        and coalesce(o.is_hidden, false) = false
      order by c.name asc, name asc`,
-    [stationCode ?? null],
+    [
+      stationCode ?? null,
+      normalizedBounds?.minLng ?? null,
+      normalizedBounds?.minLat ?? null,
+      normalizedBounds?.maxLng ?? null,
+      normalizedBounds?.maxLat ?? null,
+    ],
   );
 
   return result.rows;
@@ -325,8 +356,7 @@ export async function loadChargePointRowsDb(stationCode: string, client?: PoolCl
   return result.rows;
 }
 
-export async function listStationRecordsDb(stationCode?: string, client?: PoolClient) {
-  const stationRows = await loadStationRows(stationCode, client);
+async function mapStationRowsToRecords(stationRows: StationRow[], client?: PoolClient) {
   const { tariffs, components } = await loadTariffRows(
     stationRows.map((row) => row.station_id),
     client,
@@ -383,4 +413,15 @@ export async function listStationRecordsDb(stationCode?: string, client?: PoolCl
       notes: [],
     }),
   );
+}
+
+export async function listStationRecordsDb(stationCode?: string, client?: PoolClient) {
+  return mapStationRowsToRecords(await loadStationRows(stationCode, client), client);
+}
+
+export async function listStationRecordsInBoundsDb(
+  bounds: StationBounds,
+  client?: PoolClient,
+) {
+  return mapStationRowsToRecords(await loadStationRows(undefined, client, bounds), client);
 }

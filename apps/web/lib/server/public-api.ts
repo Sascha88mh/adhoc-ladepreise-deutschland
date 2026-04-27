@@ -11,7 +11,12 @@ import {
   type CandidateFilters,
   type RoutePlan,
 } from "@adhoc/shared";
-import { listStationRecordsDb, loadChargePointRowsDb, usingDatabase } from "@adhoc/shared/db";
+import {
+  listStationRecordsDb,
+  listStationRecordsInBoundsDb,
+  loadChargePointRowsDb,
+  usingDatabase,
+} from "@adhoc/shared/db";
 
 function requirePublicDatabase() {
   if (!usingDatabase()) {
@@ -81,7 +86,22 @@ async function stationRecords() {
   return listStationRecordsDb();
 }
 
+function expandedRouteBounds(route: RoutePlan) {
+  const latPadding = route.corridorKm / 111;
+  const midLat = (route.bounds.minLat + route.bounds.maxLat) / 2;
+  const lngKm = Math.max(20, 111 * Math.cos((Math.abs(midLat) * Math.PI) / 180));
+  const lngPadding = route.corridorKm / lngKm;
+
+  return {
+    minLat: route.bounds.minLat - latPadding,
+    minLng: route.bounds.minLng - lngPadding,
+    maxLat: route.bounds.maxLat + latPadding,
+    maxLng: route.bounds.maxLng + lngPadding,
+  };
+}
+
 export async function buildCandidateResponse(route: RoutePlan, filters: CandidateFilters) {
+  requirePublicDatabase();
   const effectiveRoute =
     filters.corridorKm && filters.corridorKm !== route.corridorKm
       ? routePlanSchema.parse({
@@ -92,7 +112,7 @@ export async function buildCandidateResponse(route: RoutePlan, filters: Candidat
   const results = findCandidatesForRoute(
     effectiveRoute,
     filters,
-    await stationRecords(),
+    await listStationRecordsInBoundsDb(expandedRouteBounds(effectiveRoute)),
   );
 
   return {
@@ -140,5 +160,6 @@ export async function listMapStations(
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
   filters: CandidateFilters,
 ) {
-  return findStationsInView(bounds, filters, await stationRecords());
+  requirePublicDatabase();
+  return findStationsInView(bounds, filters, await listStationRecordsInBoundsDb(bounds));
 }
