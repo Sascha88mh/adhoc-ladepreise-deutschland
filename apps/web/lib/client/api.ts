@@ -126,12 +126,21 @@ function quantizeMapBounds(bounds: {
   maxLng: number;
 }) {
   const precision = 100;
+  const latSpan = Math.max(0.02, bounds.maxLat - bounds.minLat);
+  const lngSpan = Math.max(0.02, bounds.maxLng - bounds.minLng);
+  const paddingFactor = 0.75;
+  const paddedBounds = {
+    minLat: Math.max(-90, bounds.minLat - latSpan * paddingFactor),
+    minLng: Math.max(-180, bounds.minLng - lngSpan * paddingFactor),
+    maxLat: Math.min(90, bounds.maxLat + latSpan * paddingFactor),
+    maxLng: Math.min(180, bounds.maxLng + lngSpan * paddingFactor),
+  };
 
   return {
-    minLat: Math.floor(bounds.minLat * precision) / precision,
-    minLng: Math.floor(bounds.minLng * precision) / precision,
-    maxLat: Math.ceil(bounds.maxLat * precision) / precision,
-    maxLng: Math.ceil(bounds.maxLng * precision) / precision,
+    minLat: Math.floor(paddedBounds.minLat * precision) / precision,
+    minLng: Math.floor(paddedBounds.minLng * precision) / precision,
+    maxLat: Math.ceil(paddedBounds.maxLat * precision) / precision,
+    maxLng: Math.ceil(paddedBounds.maxLng * precision) / precision,
   };
 }
 
