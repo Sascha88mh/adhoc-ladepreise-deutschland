@@ -5,6 +5,7 @@ import {
   publicCandidatesResponseSchema,
   publicReverseLocationResponseSchema,
   publicRoutePlanResponseSchema,
+  publicStationStatsResponseSchema,
   stationOverridesResponseSchema,
   stationDetailResponseSchema,
   type AdminStationRecord,
@@ -14,6 +15,7 @@ import {
   type RouteCandidate,
   type RoutePlan,
   type StationDetail,
+  type StationStats,
   type SyncRun,
 } from "@adhoc/shared";
 
@@ -43,6 +45,16 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit) {
 
   return (await response.json()) as T;
 }
+
+const MAP_STATIONS_CACHE_TTL_MS = 60_000;
+const mapStationsCache = new Map<
+  string,
+  { expiresAt: number; data: RouteCandidate[] }
+>();
+const stationStatsCache = new Map<
+  string,
+  { expiresAt: number; data: StationStats }
+>();
 
 export async function fetchRoutePlan(payload: {
   origin: string;
@@ -102,6 +114,7 @@ export async function fetchRouteCandidates(payload: {
 export async function fetchMapStations(payload: {
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number };
   filters: CandidateFilters;
+  signal?: AbortSignal;
 }) {
   const bounds = quantizeMapBounds(payload.bounds);
   const params = new URLSearchParams({
@@ -113,10 +126,68 @@ export async function fetchMapStations(payload: {
   });
   const baseUrl =
     process.env.NEXT_PUBLIC_MAP_STATIONS_URL ?? "/api/public/stations/map";
+  const url = `${baseUrl}?${params.toString()}`;
+  const cacheKey = url;
+  const cached = mapStationsCache.get(cacheKey);
 
-  const response = await requestJson<unknown>(`${baseUrl}?${params.toString()}`);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
 
-  return publicMapStationsResponseSchema.parse(response).data;
+  const response = await requestJson<unknown>(url, { signal: payload.signal });
+  const data = publicMapStationsResponseSchema.parse(response).data;
+
+  mapStationsCache.set(cacheKey, {
+    expiresAt: Date.now() + MAP_STATIONS_CACHE_TTL_MS,
+    data,
+  });
+
+  if (mapStationsCache.size > 80) {
+    const oldestKey = mapStationsCache.keys().next().value;
+    if (oldestKey) {
+      mapStationsCache.delete(oldestKey);
+    }
+  }
+
+  return data;
+}
+
+export async function fetchStationStats(payload: {
+  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number };
+  filters: CandidateFilters;
+  signal?: AbortSignal;
+}) {
+  const bounds = quantizeMapBounds(payload.bounds);
+  const params = new URLSearchParams({
+    minLat: String(bounds.minLat),
+    minLng: String(bounds.minLng),
+    maxLat: String(bounds.maxLat),
+    maxLng: String(bounds.maxLng),
+    filters: JSON.stringify(payload.filters ?? {}),
+  });
+  const url = `/api/public/stations/stats?${params.toString()}`;
+  const cached = stationStatsCache.get(url);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
+  const response = await requestJson<unknown>(url, { signal: payload.signal });
+  const data = publicStationStatsResponseSchema.parse(response).data;
+
+  stationStatsCache.set(url, {
+    expiresAt: Date.now() + MAP_STATIONS_CACHE_TTL_MS,
+    data,
+  });
+
+  if (stationStatsCache.size > 80) {
+    const oldestKey = stationStatsCache.keys().next().value;
+    if (oldestKey) {
+      stationStatsCache.delete(oldestKey);
+    }
+  }
+
+  return data;
 }
 
 function quantizeMapBounds(bounds: {
@@ -149,8 +220,36 @@ export async function fetchStationDetail(stationId: string): Promise<StationDeta
   return stationDetailResponseSchema.parse(response).data;
 }
 
-export async function fetchAdminFeeds(): Promise<FeedConfig[]> {
-  const response = await requestJson<{ data: FeedConfig[] }>("/api/admin/feeds");
+export type AdminFeedFilters = {
+  query?: string;
+  cpoId?: string;
+  type?: FeedConfig["type"];
+  mode?: FeedConfig["mode"];
+  isActive?: boolean;
+  ingestCatalog?: boolean;
+  ingestPrices?: boolean;
+  ingestStatus?: boolean;
+  sort?: "nameAsc" | "nameDesc" | "createdAtAsc" | "createdAtDesc";
+};
+
+function feedFilterParams(filters: AdminFeedFilters) {
+  const params = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === "") {
+      continue;
+    }
+
+    params.set(key, String(value));
+  }
+
+  return params;
+}
+
+export async function fetchAdminFeeds(filters: AdminFeedFilters = {}): Promise<FeedConfig[]> {
+  const params = feedFilterParams(filters);
+  const url = params.size ? `/api/admin/feeds?${params.toString()}` : "/api/admin/feeds";
+  const response = await requestJson<{ data: FeedConfig[] }>(url);
   return response.data;
 }
 

@@ -82,8 +82,9 @@ Mobilithek bietet pro Subscription **genau einen** Typ und Modus:
 
 ### Intervall-Felder (zeitlich)
 - `poll_interval_minutes` — nur für `static` oder `dynamic + mode=pull`. Wie oft voll pullen.
-- `reconciliation_interval_minutes` — nur für `dynamic + mode=hybrid`. Wie oft als Fallback pullen, falls Pushes ausfallen.
-- Bei `dynamic + mode=push`: leer lassen. `intervalMinutesFor()` gibt `null` zurück; der Cron wartet bewusst auf Webhooks.
+- `reconciliation_interval_minutes` — für `dynamic + mode=hybrid` und für Push-Feeds mit bewusstem Pull-Fallback. Wie oft als Sicherheitsnetz pullen, falls Pushes leer bleiben oder ausfallen.
+- Bei echtem `dynamic + mode=push-only`: leer lassen. `intervalMinutesFor()` gibt dann `null` zurück; der Cron wartet bewusst auf Webhooks.
+- Bei `dynamic + mode=push` mit gesetztem `reconciliation_interval_minutes` läuft zusätzlich ein Pull-Fallback. Beispiel: Tesla Dynamic AFIR nutzt Push-Webhook plus 5-Minuten-Fallback.
 
 Die Logik lebt in `intervalMinutesFor()` und `shouldRunFeed()` in
 [packages/shared/src/ingest/index.ts](../packages/shared/src/ingest/index.ts).
@@ -367,11 +368,12 @@ netlify deploy --trigger --prod --site <site-id> --filter web
 
 Sequenz in `runFeedAction` ([ingest/index.ts](../packages/shared/src/ingest/index.ts)):
 
-1. **Run-Claim:** `INSERT INTO sync_runs status='running' ... ON CONFLICT DO NOTHING`.
-   Migration 003 erzwingt per Unique-Index, dass pro Feed nur ein laufender Sync existiert.
-   Wenn bereits ein Lauf aktiv ist, geben Scheduler und manuelle Pulls den bestehenden Lauf zurück,
-   statt einen Fehler zu schreiben. Webhooks werfen in diesem Fall einen Fehler, damit der Sender
-   retryen kann.
+1. **Run-Claim:** Manuelle Admin-Syncs werden zuerst als `sync_runs.status='queued'`
+   persistiert. Der Cron/Ingest-Zyklus promoted diese Rows zu `running` und verarbeitet
+   sie. Migration 004 erzwingt per Unique-Index, dass pro Feed nur ein aktiver Sync
+   existiert (`queued` oder `running`). Wenn bereits ein Lauf aktiv ist, geben Scheduler
+   und manuelle Pulls den bestehenden Lauf zurück, statt einen zweiten großen Abruf zu
+   starten. Webhooks werfen in diesem Fall einen Fehler, damit der Sender retryen kann.
 2. **HTTP-Call** (Static: `GET /mobilithek/api/v1.0/publication/{subId}`, Dynamic Pull/Hybrid: `GET /mobilithek/api/v1.0/subscription?subscriptionID={subId}` mit `If-Modified-Since`; Dynamic Push-only: kein Pull, wartet auf Webhook und wird bei manuellen Tests als Noop-Erfolg markiert).
    - Gzip verpflichtend (Accept-Encoding). axios dekomprimiert automatisch.
    - 204 / 304 → als „keine Änderung" behandelt, kein Fehler.
@@ -382,26 +384,53 @@ Sequenz in `runFeedAction` ([ingest/index.ts](../packages/shared/src/ingest/inde
 6. **`feed_configs` updaten** (`last_success_at`, `last_delta_count`, `cursor_state.lastModified`, Fehler-Counter zurücksetzen).
 7. **`sync_runs` finalisieren** (`status='success'`, `finished_at`, `message`, `delta_count`).
 
+Während langer Läufe schreibt `runFeedAction` Live-Fortschritt nach `sync_runs`:
+`progress_stage`, `progress_detail`, `heartbeat_at`, `payload_size_bytes`,
+`processed_count`, `total_count`. Vor der Schreibtransaktion werden diese Werte separat
+aktualisiert; innerhalb der Schreibtransaktion laufen sie über dieselbe DB-Verbindung.
+So bleiben sie im Admin sichtbar und blockieren auch bei kleinen Poolgrößen
+(`PG_POOL_MAX=1`) nicht auf eine zweite Verbindung.
+
 Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt `last_error_message`, `consecutive_failures++`,
 `sync_runs.status='failed'`. Der Error wird zurückgegeben (und von `runDueFeedCycle` geloggt).
 
 ---
 
-## 5. Der Netlify-Cron (jede Minute)
+## 5. Cron, Queue und Worker-Ausführung
 
-[apps/web/netlify/functions/ingest-sync.mts](../apps/web/netlify/functions/ingest-sync.mts) ruft `runDueFeedCycle()` auf. Eigenschaften:
+[apps/web/netlify/functions/ingest-sync.mts](../apps/web/netlify/functions/ingest-sync.mts) stößt
+`ingest-sync-background` an; die Background Function ruft `runDueFeedCycle()` auf.
+Der Cron proxyt bewusst nicht mehr über den Next-SSR-Handler, weil große Static-Syncs sonst
+vom Web-Request-Pfad abgewürgt werden können. Background Functions sind für längere Jobs
+geeignet, während die Scheduled Function selbst schnell antwortet. Eigenschaften:
+
+Im Zielbild mit Cloudflare bleibt dieser Pfad ein austauschbarer Scheduler/Worker-Einstieg:
+Cloudflare übernimmt Webhook-Gateway und Karten-Cache, schwere Pull-Syncs laufen über die
+persistente `sync_runs`-Queue und können ebenso von `apps/ingest` oder einem dedizierten
+Cron-Service verarbeitet werden. Wichtige Regel: Admin/API-Requests starten keine langen
+Downloads direkt, sondern schreiben/claimen nur Jobs.
 
 - **Begrenzt parallel.** Der Cycle arbeitet fällige Feeds mit `FEED_CYCLE_CONCURRENCY` ab
   (Default `min(PG_POOL_MAX, 4)`). Dadurch bleiben Datenbank-Pool, Netlify-Invocation und
   Mobilithek auch bei 100+ konfigurierten Feeds stabil.
-- **Hard Timeout pro Feed:** `FEED_RUN_TIMEOUT_MS` (Default 90 s). Nach Ablauf wartet der Cycle
-  nicht weiter auf diesen Feed und arbeitet weiter; der laufende `sync_runs`-Claim verhindert
-  Doppelarbeit, bis der Lauf erfolgreich endet oder vom Stuck-Run-Cleanup freigegeben wird.
+- **Durable Queue:** Admin-Syncs laufen nicht als kurzlebige Serverless-Hintergrundarbeit.
+  Der Button schreibt einen echten `queued`-Run; der nächste Cron-Tick übernimmt ihn.
+  Wenn Queue-Runs vorhanden sind, verarbeitet der Cycle nur diese Queue-Arbeit und startet
+  im selben Durchlauf keine weiteren automatisch fälligen Feeds.
+- **Hard Timeout pro Feed:** `FEED_RUN_TIMEOUT_MS` (Default 90 s). Nach Ablauf bricht der Cycle
+  den Mobilithek-HTTP-Call per AbortSignal ab; der Run wird als `failed` finalisiert oder
+  spätestens vom Stuck-Run-Cleanup freigegeben.
 - **Durable Claim:** Überlappende Cron-Invocations erzeugen keine `failed`-Lock-Einträge mehr.
-  Ein zweiter Lauf sieht die bestehende `running`-Zeile und überspringt den Feed ohne neuen
-  Mobilithek-Abruf.
+  Ein zweiter Lauf sieht die bestehende aktive Zeile (`queued`/`running`) und überspringt den
+  Feed ohne neuen Mobilithek-Abruf.
+- **Failure Backoff:** Fehlgeschlagene Feeds werden nicht sofort in jedem Cron-Tick neu
+  gestartet. Static-Feeds starten mit 60 Minuten Backoff, Dynamic-Feeds mit 2 Minuten;
+  der Wert wächst mit `consecutive_failures` bis zu einem Cap. Manuelle Admin-Syncs
+  umgehen diesen Backoff bewusst.
 - **Top-Level Try/Catch:** Selbst eine geworfene Exception aus `runDueFeedCycle` killt die Netlify-Invocation nicht — damit der nächste Cron-Tick nicht ausgesetzt wird.
-- **Stuck-Run Cleanup:** Vor jedem Cycle werden `sync_runs` mit `status='running'` und `started_at < now() - 5m` auf `failed` gesetzt.
+- **Stuck-Run Cleanup:** Vor jedem Cycle und beim Laden der Admin-Runs werden `running`-Runs
+  älter als 5 Minuten auf `failed` gesetzt; `queued`-Runs laufen erst nach 60 Minuten als
+  Queue-Timeout ab.
 
 **Env-Knöpfe:**
 
@@ -409,6 +438,7 @@ Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt
 | ------------------------- | ----------- | ------------------------------------------------------ |
 | `FEED_RUN_TIMEOUT_MS`     | `90000`     | Max. Laufzeit eines Einzel-Feeds im Cycle              |
 | `FEED_CYCLE_CONCURRENCY`  | `min(PG_POOL_MAX, 4)` | Max. gleichzeitige Feed-Aktionen pro Cron-Cycle |
+| `FEED_CYCLE_QUEUE_LIMIT`  | `FEED_CYCLE_CONCURRENCY` | Max. Queue-Runs, die ein Cron-Tick zuerst übernimmt |
 | `MOBILITHEK_TIMEOUT_MS`   | `60000`     | axios-Timeout pro HTTP-Request                         |
 | `RAW_PAYLOAD_MAX_BYTES`   | `524288`    | Ab dieser Größe wird der Raw-Payload zusammengefasst    |
 | `MOBILITHEK_BASE_URL`     | `https://m2m.mobilithek.info` | Override für Staging/Testing             |
@@ -445,7 +475,7 @@ Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt
 ### „stale seit N Std." im Admin-UI, `FEHLER: Keine`
 → Der Cycle hat den Feed nicht erreicht. Ursachen-Checkliste:
 1. Netlify Function Logs von `ingest-sync`. Gibt es Invocations? Errors?
-2. `SELECT status, started_at, message FROM sync_runs WHERE feed_id = '<id>' ORDER BY started_at DESC LIMIT 20;` — siehst du einen alten `running`-Eintrag? Dann hängt eine frühere Invocation fest.
+2. `SELECT status, started_at, message FROM sync_runs WHERE feed_id = '<id>' ORDER BY started_at DESC LIMIT 20;` — siehst du einen alten `running`- oder `queued`-Eintrag? Dann hängt eine frühere Invocation oder ein Queue-Claim fest.
 3. `SELECT id, status, started_at FROM sync_runs WHERE status='running' AND started_at < now() - interval '10 minutes';` → sollten automatisch gecleaned werden, sonst manuell via `DELETE /api/admin/sync-runs`.
 
 ### „Feed wird bereits verarbeitet"
@@ -453,6 +483,18 @@ Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt
 Admin-Fehler mehr: Scheduler und manuelle Pulls bekommen den bereits laufenden `sync_runs`-Eintrag
 zurück und starten keinen zweiten Mobilithek-Abruf. Wenn die Meldung bei Webhooks dauerhaft
 auftaucht, prüfen ob ein alter `running`-Lauf hängt und `DELETE /api/admin/sync-runs` ausführen.
+
+### Static-Feed landet im Timeout, obwohl Mobilithek schnell antwortet
+→ Zuerst im Admin auf `progress_stage` schauen:
+- `downloading`: Mobilithek/mTLS/Netzwerk hängt.
+- `parsing`: Payload ist da, Parser arbeitet oder Payload ist beschädigt.
+- `writing_*`, `cleanup_stale_rows`, `aggregating_status`: Datenbank-Schreibphase ist der Engpass.
+
+EnBW Static wurde lokal am 27.04.2026 kontrolliert: ca. 67 MB Download in ~1,9 s,
+Parse in ~0,5 s, 2.508 Stationen. Wenn der Live-Run trotzdem im Timeout landet,
+ist nicht Mobilithek der primäre Engpass, sondern Serverless-Laufzeit oder DB-Upsert.
+Große Static-Feeds sollten langfristig über den dedizierten `apps/ingest` Worker/Cron
+laufen, nicht über kurzlebige Web-Functions.
 
 ### `Unexpected token … in JSON`
 → Payload kam truncated an. Historisch: `maxContentLength` zu klein. Aktueller Default 200 MB; falls das überschritten wird, in `client.ts` anpassen.
@@ -501,7 +543,7 @@ Der Parser sucht `FacilityLocation` (Großbuchstabe) und `facilityLocation` (kle
 
 ## 8. Wartung
 
-- **Stuck Syncs manuell cleanen:** `DELETE /api/admin/sync-runs` → setzt alle `running`-Läufe > 5 min auf `failed`.
+- **Stuck Syncs manuell cleanen:** `DELETE /api/admin/sync-runs` → setzt alle `running`-Läufe > 5 min und `queued`-Läufe > 60 min auf `failed`.
 - **Raw-Payloads aufräumen:** Migration 002 speichert zusätzlich `payload_size_bytes` und `truncated`. Pruning-Job (noch nicht implementiert) sollte `raw_feed_payloads` > 30 Tage löschen.
 - **Pool-Status:** `SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'node%';`.
 

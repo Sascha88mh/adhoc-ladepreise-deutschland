@@ -6,7 +6,7 @@ import {
   parseStaticMobilithekPayload,
   sanitizeMobilithekJsonPayload,
 } from "../mobilithek/parser";
-import type { ParsedStaticFeed, ParsedTariff } from "../mobilithek/types";
+import type { ParsedChargePoint, ParsedStaticFeed, ParsedStationCatalog, ParsedTariff } from "../mobilithek/types";
 import {
   fetchStaticMobilithekPayload,
   pullDynamicMobilithekPayload,
@@ -40,10 +40,10 @@ function intervalMinutesFor(feed: FeedConfig) {
   }
 
   if (feed.mode === "push") {
-    return null;
+    return feed.reconciliationIntervalMinutes;
   }
 
-  return feed.reconciliationIntervalMinutes;
+  return feed.reconciliationIntervalMinutes ?? feed.pollIntervalMinutes ?? 2;
 }
 
 function sanitizeWebhookPayload(raw: string): string {
@@ -93,7 +93,14 @@ export function decodeMobilithekWebhookPayload(
   };
 }
 
-function shouldRunFeed(feed: FeedConfig) {
+function failureBackoffMinutesFor(feed: FeedConfig) {
+  const failures = Math.max(feed.consecutiveFailures, 1);
+  const baseMinutes = feed.type === "static" ? 60 : 2;
+  const maxMinutes = feed.type === "static" ? 6 * 60 : 30;
+  return Math.min(maxMinutes, baseMinutes * 2 ** Math.min(failures - 1, 6));
+}
+
+function shouldRunFeed(feed: FeedConfig, latestRun?: SyncRun) {
   if (!feed.isActive) {
     return false;
   }
@@ -104,6 +111,21 @@ function shouldRunFeed(feed: FeedConfig) {
 
   if (feed.type === "dynamic" && !feed.ingestPrices && !feed.ingestStatus) {
     return false;
+  }
+
+  if (latestRun?.status === "queued" || latestRun?.status === "running") {
+    return false;
+  }
+
+  if (latestRun?.status === "failed") {
+    const backoffMinutes = failureBackoffMinutesFor(feed);
+    const failedAt = latestRun.finishedAt ?? latestRun.startedAt;
+    if (
+      backoffMinutes > 0 &&
+      Date.now() - new Date(failedAt).getTime() < backoffMinutes * 60_000
+    ) {
+      return false;
+    }
   }
 
   const interval = intervalMinutesFor(feed);
@@ -230,6 +252,77 @@ function mergeTariffShapes(
   };
 }
 
+function mergeUniqueValues<T>(...lists: T[][]): T[] {
+  return Array.from(new Set(lists.flat()));
+}
+
+function mergeChargePoints(
+  existing: ParsedChargePoint,
+  incoming: ParsedChargePoint,
+): ParsedChargePoint {
+  return {
+    ...existing,
+    currentType: existing.currentType === "DC" ? existing.currentType : incoming.currentType,
+    maxPowerKw: Math.max(existing.maxPowerKw ?? 0, incoming.maxPowerKw ?? 0),
+    connectors: Array.from(
+      new Map(
+        [...existing.connectors, ...incoming.connectors].map((connector) => [
+          `${connector.connectorType}|${connector.maxPowerKw ?? ""}`,
+          connector,
+        ]),
+      ).values(),
+    ),
+    tariffs: Array.from(
+      new Map(
+        [...existing.tariffs, ...incoming.tariffs].map((tariff) => [tariff.id, tariff]),
+      ).values(),
+    ),
+  };
+}
+
+function mergeStationCatalogEntries(
+  existing: ParsedStationCatalog,
+  incoming: ParsedStationCatalog,
+): ParsedStationCatalog {
+  const chargePoints = Array.from(
+    [...existing.chargePoints, ...incoming.chargePoints]
+      .reduce<Map<string, ParsedChargePoint>>((acc, point) => {
+        const current = acc.get(point.chargePointCode);
+        acc.set(point.chargePointCode, current ? mergeChargePoints(current, point) : point);
+        return acc;
+      }, new Map())
+      .values(),
+  );
+
+  return {
+    ...existing,
+    chargePointCount: Math.max(existing.chargePointCount, incoming.chargePointCount, chargePoints.length),
+    currentTypes: mergeUniqueValues(existing.currentTypes, incoming.currentTypes),
+    connectorTypes: mergeUniqueValues(existing.connectorTypes, incoming.connectorTypes),
+    paymentMethods: mergeUniqueValues(existing.paymentMethods, incoming.paymentMethods),
+    maxPowerKw: Math.max(existing.maxPowerKw ?? 0, incoming.maxPowerKw ?? 0),
+    chargePoints,
+    notes: mergeUniqueValues(existing.notes, incoming.notes),
+  };
+}
+
+function dedupeStaticCatalog(parsed: ParsedStaticFeed): ParsedStaticFeed {
+  const catalog = Array.from(
+    parsed.catalog
+      .reduce<Map<string, ParsedStationCatalog>>((acc, station) => {
+        const current = acc.get(station.stationCode);
+        acc.set(station.stationCode, current ? mergeStationCatalogEntries(current, station) : station);
+        return acc;
+      }, new Map())
+      .values(),
+  );
+
+  return {
+    catalog,
+    stations: parsed.stations,
+  };
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unbekannter Fehler";
 }
@@ -248,6 +341,12 @@ function mapSyncRun(row: Record<string, unknown>): SyncRun {
     finishedAt: row.finished_at ? new Date(String(row.finished_at)).toISOString() : null,
     message: String(row.message ?? ""),
     deltaCount: Number(row.delta_count ?? 0),
+    progressStage: row.progress_stage ? String(row.progress_stage) : null,
+    progressDetail: row.progress_detail ? String(row.progress_detail) : null,
+    heartbeatAt: row.heartbeat_at ? new Date(String(row.heartbeat_at)).toISOString() : null,
+    payloadSizeBytes: row.payload_size_bytes == null ? null : Number(row.payload_size_bytes),
+    processedCount: row.processed_count == null ? null : Number(row.processed_count),
+    totalCount: row.total_count == null ? null : Number(row.total_count),
   };
 }
 
@@ -267,7 +366,7 @@ async function loadRunningRun(feedId: string) {
     `select *
        from sync_runs
       where feed_id = $1::uuid
-        and status = 'running'
+        and status in ('queued', 'running')
       order by started_at asc
       limit 1`,
     [feedId],
@@ -276,7 +375,31 @@ async function loadRunningRun(feedId: string) {
   return result.rows[0] ? mapSyncRun(result.rows[0]) : null;
 }
 
+async function cleanupStaleActiveRun(feedId: string) {
+  await getPool().query(
+    `update sync_runs
+        set status = 'failed',
+            finished_at = now(),
+            message = case
+              when status = 'queued' then 'Abgebrochen (Queue-Timeout)'
+              else 'Abgebrochen (Timeout)'
+            end,
+            progress_stage = 'failed',
+            progress_detail = 'Timeout-Cleanup',
+            heartbeat_at = now()
+      where feed_id = $1::uuid
+        and (
+          (status = 'running' and started_at < now() - interval '5 minutes')
+          or
+          (status = 'queued' and started_at < now() - interval '60 minutes')
+        )`,
+    [feedId],
+  );
+}
+
 async function claimFeedRun(feedId: string, kind: FeedAction, message: string) {
+  await cleanupStaleActiveRun(feedId);
+
   const insertClaim = () => getPool().query<Record<string, unknown>>(
     `insert into sync_runs (
         feed_id,
@@ -285,9 +408,12 @@ async function claimFeedRun(feedId: string, kind: FeedAction, message: string) {
         started_at,
         finished_at,
         message,
-        delta_count
-      ) values ($1::uuid, $2, 'running', now(), null, $3, 0)
-      on conflict (feed_id) where status = 'running' do nothing
+        delta_count,
+        progress_stage,
+        heartbeat_at,
+        processed_count
+      ) values ($1::uuid, $2, 'running', now(), null, $3, 0, 'starting', now(), 0)
+      on conflict (feed_id) where status in ('queued', 'running') do nothing
       returning *`,
     [feedId, kind, message],
   );
@@ -315,6 +441,167 @@ async function claimFeedRun(feedId: string, kind: FeedAction, message: string) {
   };
 }
 
+async function promoteQueuedRun(runId: string, message: string) {
+  const result = await getPool().query<Record<string, unknown>>(
+    `update sync_runs
+        set status = 'running',
+            started_at = now(),
+            finished_at = null,
+            message = $2,
+            delta_count = 0,
+            progress_stage = 'starting',
+            progress_detail = null,
+            heartbeat_at = now(),
+            payload_size_bytes = null,
+            processed_count = 0,
+            total_count = null
+      where id = $1::uuid
+        and status = 'queued'
+      returning *`,
+    [runId, message],
+  );
+
+  return result.rows[0] ? mapSyncRun(result.rows[0]) : null;
+}
+
+async function loadQueuedRuns(limit: number) {
+  const result = await getPool().query<Record<string, unknown>>(
+    `select sr.*
+       from sync_runs sr
+       join feed_configs fc
+         on fc.id = sr.feed_id
+      where sr.status = 'queued'
+      order by sr.started_at asc, sr.id asc
+      limit $1`,
+    [limit],
+  );
+
+  return result.rows.map((row) => mapSyncRun(row));
+}
+
+async function loadLatestRunsByFeed() {
+  const result = await getPool().query<Record<string, unknown>>(
+    `select distinct on (feed_id) *
+       from sync_runs
+      order by feed_id, started_at desc, id desc`,
+  );
+
+  return new Map(result.rows.map((row) => {
+    const run = mapSyncRun(row);
+    return [run.feedId, run] as const;
+  }));
+}
+
+async function assertRunStillRunning(client: PoolClient, runId: string) {
+  const run = await loadRun(client, runId);
+  if (!run || run.status !== "running") {
+    throw new Error("Feed-Lauf wurde abgebrochen");
+  }
+}
+
+async function updateRunProgress(
+  runId: string,
+  input: {
+    stage: string;
+    detail?: string | null;
+    message?: string;
+    payloadSizeBytes?: number | null;
+    processedCount?: number | null;
+    totalCount?: number | null;
+  },
+  client?: PoolClient,
+) {
+  const executor = client ?? getPool();
+  await executor.query(
+    `update sync_runs
+        set progress_stage = $2,
+            progress_detail = $3,
+            heartbeat_at = now(),
+            message = coalesce($4, message),
+            payload_size_bytes = coalesce($5, payload_size_bytes),
+            processed_count = coalesce($6, processed_count),
+            total_count = coalesce($7, total_count)
+      where id = $1::uuid
+        and status in ('queued', 'running')`,
+    [
+      runId,
+      input.stage,
+      input.detail ?? null,
+      input.message ?? null,
+      input.payloadSizeBytes ?? null,
+      input.processedCount ?? null,
+      input.totalCount ?? null,
+    ],
+  );
+}
+
+export async function enqueueFeedSync(feedId: string) {
+  const feed = await getFeedConfigDb(feedId);
+  if (!feed) {
+    throw new Error("Feed not found");
+  }
+
+  await cleanupStaleActiveRun(feed.id);
+
+  const result = await getPool().query<Record<string, unknown>>(
+    `insert into sync_runs (
+        feed_id,
+        kind,
+        status,
+        started_at,
+        finished_at,
+        message,
+        delta_count,
+        progress_stage,
+        progress_detail,
+        heartbeat_at,
+        processed_count
+      ) values ($1::uuid, 'manual', 'queued', now(), null, 'Feed-Sync wartet auf Verarbeitung', 0, 'queued', 'Wartet auf nächsten Ingest-Zyklus', now(), 0)
+      on conflict (feed_id) where status in ('queued', 'running') do nothing
+      returning *`,
+    [feed.id],
+  );
+
+  if (result.rows[0]) {
+    return mapSyncRun(result.rows[0]);
+  }
+
+  const active = await loadRunningRun(feed.id);
+  if (active) {
+    return active;
+  }
+
+  const retry = await getPool().query<Record<string, unknown>>(
+    `insert into sync_runs (
+        feed_id,
+        kind,
+        status,
+        started_at,
+        finished_at,
+        message,
+        delta_count,
+        progress_stage,
+        progress_detail,
+        heartbeat_at,
+        processed_count
+      ) values ($1::uuid, 'manual', 'queued', now(), null, 'Feed-Sync wartet auf Verarbeitung', 0, 'queued', 'Wartet auf nächsten Ingest-Zyklus', now(), 0)
+      on conflict (feed_id) where status in ('queued', 'running') do nothing
+      returning *`,
+    [feed.id],
+  );
+
+  if (retry.rows[0]) {
+    return mapSyncRun(retry.rows[0]);
+  }
+
+  const racedActive = await loadRunningRun(feed.id);
+  if (!racedActive) {
+    throw new Error("Sync run could not be queued");
+  }
+
+  return racedActive;
+}
+
 async function finishRun(
   client: PoolClient,
   runId: string,
@@ -329,8 +616,13 @@ async function finishRun(
         set status = $2,
             finished_at = now(),
             message = $3,
-            delta_count = $4
-      where id = $1::uuid`,
+            delta_count = $4,
+            progress_stage = $2,
+            progress_detail = $3,
+            heartbeat_at = now(),
+            processed_count = case when $2 = 'success' then $4 else processed_count end
+      where id = $1::uuid
+        and status = 'running'`,
     [runId, input.status, input.message, input.deltaCount],
   );
 }
@@ -612,10 +904,19 @@ async function upsertStaticCatalog(
   client: PoolClient,
   feed: FeedConfig,
   parsed: ParsedStaticFeed,
+  runId?: string,
 ) {
   if (!parsed.catalog.length) return 0;
 
   // ── 1. CPOs (deduplicated, one bulk upsert) ───────────────────────────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "writing_cpos",
+      detail: "Betreiber werden gespeichert",
+      processedCount: 0,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   const cpoMap = new Map<string, { name: string; countryCode: string }>();
   for (const s of parsed.catalog) cpoMap.set(s.cpoId, { name: s.cpoName, countryCode: s.countryCode });
   const cpoIds = [...cpoMap.keys()];
@@ -628,6 +929,14 @@ async function upsertStaticCatalog(
   );
 
   // ── 2. Stations (one bulk upsert, returns station_code → id map) ──────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "writing_stations",
+      detail: `${parsed.catalog.length} Stationen werden gespeichert`,
+      processedCount: 0,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   const c = parsed.catalog;
   const stationResult = await client.query<{ station_code: string; id: string }>(
     `insert into stations (
@@ -681,8 +990,16 @@ async function upsertStaticCatalog(
   const stationIdMap = new Map(stationResult.rows.map((r) => [r.station_code, r.id]));
 
   // ── 3. Charge points (one bulk upsert) ────────────────────────────────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "preparing_charge_points",
+      detail: "Ladepunkte werden vorbereitet",
+      processedCount: stationIdMap.size,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   type FlatCp = { stationCode: string; stationId: string; code: string; currentType: string; maxPowerKw: number | null; connectors: typeof parsed.catalog[0]["chargePoints"][0]["connectors"]; tariffs: typeof parsed.catalog[0]["chargePoints"][0]["tariffs"] };
-  const allCps: FlatCp[] = [];
+  let allCps: FlatCp[] = [];
   for (const station of c) {
     const stationId = stationIdMap.get(station.stationCode);
     if (!stationId) continue;
@@ -690,7 +1007,43 @@ async function upsertStaticCatalog(
       allCps.push({ stationCode: station.stationCode, stationId, code: cp.chargePointCode, currentType: cp.currentType, maxPowerKw: cp.maxPowerKw ?? null, connectors: cp.connectors, tariffs: cp.tariffs });
     }
   }
+  allCps = Array.from(
+    allCps
+      .reduce<Map<string, FlatCp>>((acc, cp) => {
+        const current = acc.get(cp.code);
+        acc.set(
+          cp.code,
+          current
+            ? {
+                ...current,
+                maxPowerKw: Math.max(current.maxPowerKw ?? 0, cp.maxPowerKw ?? 0),
+                connectors: Array.from(
+                  new Map(
+                    [...current.connectors, ...cp.connectors].map((connector) => [
+                      `${connector.connectorType}|${connector.maxPowerKw ?? ""}`,
+                      connector,
+                    ]),
+                  ).values(),
+                ),
+                tariffs: Array.from(
+                  new Map([...current.tariffs, ...cp.tariffs].map((tariff) => [tariff.id, tariff])).values(),
+                ),
+              }
+            : cp,
+        );
+        return acc;
+      }, new Map())
+      .values(),
+  );
 
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "writing_charge_points",
+      detail: `${allCps.length} Ladepunkte werden gespeichert`,
+      processedCount: stationIdMap.size,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   const cpResult = await client.query<{ charge_point_code: string; id: string }>(
     `insert into charge_points (station_id, charge_point_code, current_type, max_power_kw, last_status_raw, last_status_canonical, last_status_update_at)
      select t.sid::uuid, t.code, t.cur_type, t.max_kw, 'UNKNOWN', 'UNKNOWN', now()
@@ -704,6 +1057,14 @@ async function upsertStaticCatalog(
   const allCpIds = cpResult.rows.map((r) => r.id);
 
   // ── 4. Connectors (bulk delete + insert) ─────────────────────────────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "writing_connectors",
+      detail: "Stecker werden gespeichert",
+      processedCount: stationIdMap.size,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   if (allCpIds.length) {
     await client.query(`delete from connectors where charge_point_id = any($1::uuid[])`, [allCpIds]);
   }
@@ -723,6 +1084,14 @@ async function upsertStaticCatalog(
   }
 
   // ── 5. Tariffs (bulk upsert per charge-point, then components) ─────────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "preparing_tariffs",
+      detail: "Tarife werden vorbereitet",
+      processedCount: stationIdMap.size,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   const tariffRows: TariffShapeRow[] = [];
   for (const cp of allCps) {
     const cpId = cpIdMap.get(cp.code) ?? null;
@@ -750,6 +1119,14 @@ async function upsertStaticCatalog(
   ];
 
   if (uniqueTariffRows.length) {
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "writing_tariffs",
+        detail: `${uniqueTariffRows.length} Tarife werden gespeichert`,
+        processedCount: stationIdMap.size,
+        totalCount: parsed.catalog.length,
+      }, client);
+    }
     const tariffResult = await client.query<{ tariff_key: string; id: string }>(
       `insert into tariffs (station_id, charge_point_id, tariff_key, tariff_code, tariff_scope, label, currency, is_complete, updated_at)
        select t.sid::uuid, t.cpid::uuid, t.tkey, t.tcode, t.tscope, t.label, t.currency, t.complete, now()
@@ -878,6 +1255,14 @@ async function upsertStaticCatalog(
   }
 
   // ── 6. Cleanup: remove stale charge_points, tariffs, stations ─────────────
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "cleanup_stale_rows",
+      detail: "Veraltete Datensätze werden entfernt",
+      processedCount: stationIdMap.size,
+      totalCount: parsed.catalog.length,
+    }, client);
+  }
   const stationIdsByCode = [...stationIdMap.values()];
   if (stationIdsByCode.length) {
     await client.query(
@@ -901,11 +1286,62 @@ async function upsertStaticCatalog(
     );
   }
 
-  for (const stationId of stationIdsByCode) {
-    await aggregateStationStatus(client, stationId, null);
+  if (stationIdsByCode.length) {
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "aggregating_status",
+        detail: `${stationIdsByCode.length} Stationsstatus werden aggregiert`,
+        processedCount: 0,
+        totalCount: stationIdsByCode.length,
+      }, client);
+    }
+    await aggregateStationStatuses(client, stationIdsByCode, null);
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "aggregating_status",
+        detail: `${stationIdsByCode.length}/${stationIdsByCode.length} Stationsstatus aggregiert`,
+        processedCount: stationIdsByCode.length,
+        totalCount: stationIdsByCode.length,
+      }, client);
+    }
   }
 
   return parsed.catalog.length;
+}
+
+async function aggregateStationStatuses(
+  client: PoolClient,
+  stationIds: string[],
+  touchedAt: string | null,
+) {
+  if (!stationIds.length) {
+    return;
+  }
+
+  await client.query(
+    `with status_counts as (
+        select
+          station_id,
+          count(*) filter (where last_status_canonical = 'AVAILABLE') as available_count,
+          count(*) filter (where last_status_canonical in ('CHARGING', 'RESERVED', 'BLOCKED')) as occupied_count,
+          count(*) filter (where last_status_canonical in ('OUT_OF_SERVICE', 'MAINTENANCE')) as out_of_service_count,
+          count(*) filter (where last_status_canonical = 'UNKNOWN') as unknown_count,
+          max(last_status_update_at) as max_status_update_at
+        from charge_points
+        where station_id = any($1::uuid[])
+        group by station_id
+      )
+      update stations s
+         set available_count = c.available_count,
+             occupied_count = c.occupied_count,
+             out_of_service_count = c.out_of_service_count,
+             unknown_count = c.unknown_count,
+             last_status_update_at = coalesce($2::timestamptz, c.max_status_update_at, s.last_status_update_at),
+             updated_at = now()
+        from status_counts c
+       where s.id = c.station_id`,
+    [stationIds, touchedAt],
+  );
 }
 
 async function aggregateStationStatus(
@@ -943,39 +1379,107 @@ async function applyDynamicUpdates(
   client: PoolClient,
   feed: FeedConfig,
   updates: ReturnType<typeof parseDynamicMobilithekPayload>["updates"],
+  runId?: string,
 ) {
   const touchedStations = new Set<string>();
   let deltaCount = 0;
   const nowIso = new Date().toISOString();
 
-  for (const update of updates) {
-    const chargePointResult = await client.query<{
+  const uniqueChargePointCodes = [...new Set(updates.map((update) => update.chargePointId))];
+  const chargePointResult = uniqueChargePointCodes.length
+    ? await client.query<{
       id: string;
+      charge_point_code: string;
       station_id: string;
-      last_status_raw: string | null;
-      last_status_canonical: string | null;
     }>(
-      `select id::text, station_id::text, last_status_raw, last_status_canonical
+      `select id::text, charge_point_code, station_id::text
          from charge_points
-        where charge_point_code = $1`,
-      [update.chargePointId],
-    );
+        where charge_point_code = any($1::text[])`,
+      [uniqueChargePointCodes],
+    )
+    : { rows: [] };
+  const chargePointByCode = new Map(
+    chargePointResult.rows.map((row) => [row.charge_point_code, row]),
+  );
 
-    if (!chargePointResult.rows[0]) {
-      continue;
+  if (runId) {
+    await updateRunProgress(runId, {
+      stage: "applying_updates",
+      detail: `${updates.length} Dynamic-Updates werden abgeglichen`,
+      processedCount: 0,
+      totalCount: updates.length,
+      message: "Dynamic-Updates werden geschrieben",
+    }, client);
+  }
+
+  if (feed.ingestStatus) {
+    const snapshotRows: Array<{
+      chargePointId: string;
+      statusRaw: string;
+      statusCanonical: string;
+      updateTime: string;
+    }> = [];
+    const latestStatusByChargePoint = new Map<string, {
+      chargePointId: string;
+      statusRaw: string;
+      statusCanonical: string;
+      updateTime: string;
+      updateTimeMs: number;
+    }>();
+
+    for (const update of updates) {
+      const chargePoint = chargePointByCode.get(update.chargePointId);
+      if (!chargePoint) {
+        continue;
+      }
+
+      const updateTime = update.lastUpdatedAt ?? nowIso;
+      const updateTimeMs = Date.parse(updateTime) || 0;
+      snapshotRows.push({
+        chargePointId: chargePoint.id,
+        statusRaw: update.statusRaw,
+        statusCanonical: update.statusCanonical,
+        updateTime,
+      });
+      touchedStations.add(chargePoint.station_id);
+      deltaCount += 1;
+
+      const current = latestStatusByChargePoint.get(chargePoint.id);
+      if (!current || updateTimeMs >= current.updateTimeMs) {
+        latestStatusByChargePoint.set(chargePoint.id, {
+          chargePointId: chargePoint.id,
+          statusRaw: update.statusRaw,
+          statusCanonical: update.statusCanonical,
+          updateTime,
+          updateTimeMs,
+        });
+      }
     }
 
-    const chargePoint = chargePointResult.rows[0];
-    const updateTime = update.lastUpdatedAt ?? nowIso;
-
-    if (feed.ingestStatus) {
+    if (snapshotRows.length) {
+      const latestStatusRows = [...latestStatusByChargePoint.values()];
       await client.query(
-        `update charge_points
-            set last_status_raw = $2,
-                last_status_canonical = $3,
-                last_status_update_at = $4::timestamptz
-          where id = $1::uuid`,
-        [chargePoint.id, update.statusRaw, update.statusCanonical, updateTime],
+        `with incoming as (
+           select *
+             from unnest(
+               $1::uuid[],
+               $2::text[],
+               $3::text[],
+               $4::timestamptz[]
+             ) as t(charge_point_id, status_raw, status_canonical, update_time)
+         )
+         update charge_points cp
+            set last_status_raw = incoming.status_raw,
+                last_status_canonical = incoming.status_canonical,
+                last_status_update_at = incoming.update_time
+           from incoming
+          where cp.id = incoming.charge_point_id`,
+        [
+          latestStatusRows.map((row) => row.chargePointId),
+          latestStatusRows.map((row) => row.statusRaw),
+          latestStatusRows.map((row) => row.statusCanonical),
+          latestStatusRows.map((row) => row.updateTime),
+        ],
       );
       await client.query(
         `insert into availability_snapshots (
@@ -983,14 +1487,44 @@ async function applyDynamicUpdates(
             recorded_at,
             status_raw,
             status_canonical
-          ) values ($1::uuid, $2::timestamptz, $3, $4)`,
-        [chargePoint.id, updateTime, update.statusRaw, update.statusCanonical],
+          )
+         select *
+           from unnest(
+             $1::uuid[],
+             $2::timestamptz[],
+             $3::text[],
+             $4::text[]
+           ) as t(charge_point_id, recorded_at, status_raw, status_canonical)`,
+        [
+          snapshotRows.map((row) => row.chargePointId),
+          snapshotRows.map((row) => row.updateTime),
+          snapshotRows.map((row) => row.statusRaw),
+          snapshotRows.map((row) => row.statusCanonical),
+        ],
       );
-      touchedStations.add(chargePoint.station_id);
-      deltaCount += 1;
     }
 
-    if (feed.ingestPrices) {
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "applying_updates",
+        detail: `${snapshotRows.length}/${updates.length} Status-Updates geschrieben`,
+        processedCount: snapshotRows.length,
+        totalCount: updates.length,
+        message: "Status-Updates geschrieben",
+      }, client);
+    }
+  }
+
+  if (feed.ingestPrices) {
+    let processedPriceUpdates = 0;
+    for (const update of updates) {
+      const chargePoint = chargePointByCode.get(update.chargePointId);
+      if (!chargePoint) {
+        continue;
+      }
+
+      const updateTime = update.lastUpdatedAt ?? nowIso;
+
       for (const tariff of update.tariffs) {
         const before = await loadCurrentTariffFingerprint(client, tariff.id);
         const tariffId = await insertTariffShape(client, {
@@ -1020,11 +1554,31 @@ async function applyDynamicUpdates(
           deltaCount += 1;
         }
       }
+
+      processedPriceUpdates += 1;
+      if (runId && processedPriceUpdates % 100 === 0) {
+        await updateRunProgress(runId, {
+          stage: "applying_prices",
+          detail: `${processedPriceUpdates}/${updates.length} Preis-Updates geprüft`,
+          processedCount: processedPriceUpdates,
+          totalCount: updates.length,
+          message: "Preis-Updates werden geprüft",
+        }, client);
+      }
     }
   }
 
-  for (const stationId of touchedStations) {
-    await aggregateStationStatus(client, stationId, nowIso);
+  if (touchedStations.size) {
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "aggregating_status",
+        detail: `${touchedStations.size} Stationsstatus werden aggregiert`,
+        processedCount: 0,
+        totalCount: touchedStations.size,
+        message: "Stationsstatus werden aggregiert",
+      }, client);
+    }
+    await aggregateStationStatuses(client, [...touchedStations], nowIso);
   }
 
   return deltaCount;
@@ -1073,6 +1627,7 @@ async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
     feed.id,
     {
       ...feed,
+      lastSuccessAt: new Date().toISOString(),
       lastErrorMessage: null,
       consecutiveFailures: 0,
       errorRate: 0,
@@ -1091,21 +1646,46 @@ const FEED_CYCLE_CONCURRENCY = Math.max(
   1,
   Number(process.env.FEED_CYCLE_CONCURRENCY ?? Math.min(Number(process.env.PG_POOL_MAX ?? 10), 4)),
 );
+const FEED_CYCLE_QUEUE_LIMIT = Math.max(
+  1,
+  Number(process.env.FEED_CYCLE_QUEUE_LIMIT ?? FEED_CYCLE_CONCURRENCY),
+);
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout nach ${ms}ms: ${label}`)), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
+function abortMessage(signal?: AbortSignal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error) {
+    return reason.message;
+  }
+  if (typeof reason === "string") {
+    return reason;
+  }
+  return "Feed-Verarbeitung wurde abgebrochen";
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new Error(abortMessage(signal));
+  }
+}
+
+async function runFeedActionWithTimeout(
+  feed: FeedConfig,
+  kind: FeedAction,
+  queuedRunId?: string,
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Timeout nach ${FEED_RUN_TIMEOUT_MS}ms: ${feed.name}`));
+  }, FEED_RUN_TIMEOUT_MS);
+
+  try {
+    return await runFeedAction(feed.id, kind, {
+      queuedRunId,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function runWithConcurrency<T, R>(
@@ -1148,6 +1728,8 @@ export async function runFeedAction(
   options?: {
     payload?: string;
     dryRun?: boolean;
+    queuedRunId?: string;
+    signal?: AbortSignal;
   },
 ) {
   const feed = await getFeedConfigDb(feedId);
@@ -1155,11 +1737,26 @@ export async function runFeedAction(
     throw new Error("Feed not found");
   }
 
-  const claim = await claimFeedRun(
-    feed.id,
-    action,
-    options?.dryRun ? "Feed-Test gestartet" : "Feed-Sync gestartet",
-  );
+  throwIfAborted(options?.signal);
+
+  const claim = options?.queuedRunId
+    ? {
+        claimed: true as const,
+        run: await promoteQueuedRun(options.queuedRunId, "Feed-Sync gestartet"),
+      }
+    : await claimFeedRun(
+        feed.id,
+        action,
+        options?.dryRun ? "Feed-Test gestartet" : "Feed-Sync gestartet",
+      );
+
+  if (!claim.run) {
+    const active = await loadRunningRun(feed.id);
+    if (active) {
+      return active;
+    }
+    throw new Error("Sync run could not be claimed");
+  }
 
   if (!claim.claimed) {
     if (action === "webhook") {
@@ -1181,14 +1778,62 @@ export async function runFeedAction(
     let parsedDynamic: ReturnType<typeof parseDynamicMobilithekPayload> | null = null;
 
     if (feed.type === "static") {
-      payloadToRecord = options?.payload ?? (await fetchStaticMobilithekPayload(feed));
-      parsedStatic = parseStaticMobilithekPayload(payloadToRecord);
+      await updateRunProgress(runId, {
+        stage: "downloading",
+        detail: "Static-Payload wird von Mobilithek geladen",
+        message: "Mobilithek-Download gestartet",
+      });
+      payloadToRecord = options?.payload ?? (await fetchStaticMobilithekPayload(feed, options?.signal));
+      if (!payloadToRecord) {
+        noRemoteWork = true;
+        message = "Keine Static-Daten verfügbar (204 No Content)";
+        await updateRunProgress(runId, {
+          stage: "not_modified",
+          detail: message,
+          message,
+        });
+      } else {
+      const payloadSizeBytes = Buffer.byteLength(payloadToRecord, "utf8");
+      await updateRunProgress(runId, {
+        stage: "downloaded",
+        detail: `${Math.round(payloadSizeBytes / 1024 / 1024)} MB geladen`,
+        payloadSizeBytes,
+        message: "Mobilithek-Download abgeschlossen",
+      });
+      throwIfAborted(options?.signal);
+      await updateRunProgress(runId, {
+        stage: "parsing",
+        detail: "Static-Payload wird geparst",
+        message: "Payload wird geparst",
+        payloadSizeBytes,
+      });
+      parsedStatic = dedupeStaticCatalog(parseStaticMobilithekPayload(payloadToRecord));
+      throwIfAborted(options?.signal);
       deltaCount = parsedStatic.catalog.length;
       message = `${parsedStatic.catalog.length} Stationen verarbeitet`;
-    } else if (feed.mode === "push" && !options?.payload) {
+      await updateRunProgress(runId, {
+        stage: "parsed",
+        detail: `${parsedStatic.catalog.length} Stationen erkannt`,
+        processedCount: 0,
+        totalCount: parsedStatic.catalog.length,
+        payloadSizeBytes,
+        message: `${parsedStatic.catalog.length} Stationen erkannt`,
+      });
+      }
+    } else if (feed.mode === "push" && !options?.payload && !feed.reconciliationIntervalMinutes) {
       noRemoteWork = true;
       message = "Push-only Dynamic-Feed: kein Pull-Endpunkt, wartet auf Mobilithek-Webhook";
+      await updateRunProgress(runId, {
+        stage: "noop",
+        detail: message,
+        message,
+      });
     } else {
+      await updateRunProgress(runId, {
+        stage: options?.payload ? "received_webhook" : "downloading",
+        detail: options?.payload ? "Webhook-Payload wird verarbeitet" : "Dynamic-Payload wird von Mobilithek geladen",
+        message: options?.payload ? "Webhook wird verarbeitet" : "Mobilithek-Download gestartet",
+      });
       const dynamic = options?.payload
         ? {
             payload: options.payload,
@@ -1202,15 +1847,44 @@ export async function runFeedAction(
             typeof feed.cursorState?.lastModified === "string"
               ? feed.cursorState.lastModified
               : null,
+            options?.signal,
           );
 
       if (!dynamic) {
         message = "Keine Änderungen seit dem letzten Pull";
+        await updateRunProgress(runId, {
+          stage: "not_modified",
+          detail: message,
+          message,
+        });
       } else {
         payloadToRecord = dynamic.payload;
+        const payloadSizeBytes = Buffer.byteLength(dynamic.payload, "utf8");
+        await updateRunProgress(runId, {
+          stage: "downloaded",
+          detail: `${payloadSizeBytes} Bytes geladen`,
+          payloadSizeBytes,
+          message: "Payload empfangen",
+        });
+        throwIfAborted(options?.signal);
+        await updateRunProgress(runId, {
+          stage: "parsing",
+          detail: "Dynamic-Payload wird geparst",
+          payloadSizeBytes,
+          message: "Payload wird geparst",
+        });
         parsedDynamic = parseDynamicMobilithekPayload(dynamic.payload);
+        throwIfAborted(options?.signal);
         deltaCount = parsedDynamic.updates.length;
         message = `${parsedDynamic.updates.length} Delta-Updates verarbeitet`;
+        await updateRunProgress(runId, {
+          stage: "parsed",
+          detail: `${parsedDynamic.updates.length} Delta-Updates erkannt`,
+          payloadSizeBytes,
+          processedCount: 0,
+          totalCount: parsedDynamic.updates.length,
+          message: `${parsedDynamic.updates.length} Delta-Updates erkannt`,
+        });
         cursorState = {
           ...(feed.cursorState ?? {}),
           lastModified: dynamic.lastModified,
@@ -1222,8 +1896,15 @@ export async function runFeedAction(
     const client = await getPool().connect();
     try {
       await client.query("BEGIN");
+      await assertRunStillRunning(client, runId);
+      throwIfAborted(options?.signal);
 
       if (payloadToRecord) {
+        await updateRunProgress(runId, {
+          stage: "recording_payload",
+          detail: "Raw-Payload wird gespeichert",
+          message: "Raw-Payload wird gespeichert",
+        }, client);
         await recordPayload(client, {
           runId,
           feedId: feed.id,
@@ -1233,15 +1914,30 @@ export async function runFeedAction(
       }
 
       if (!options?.dryRun && parsedStatic) {
-        await upsertStaticCatalog(client, feed, parsedStatic);
+        await assertRunStillRunning(client, runId);
+        await upsertStaticCatalog(client, feed, parsedStatic, runId);
         lastSnapshotAt = new Date().toISOString();
       }
 
       if (!options?.dryRun && parsedDynamic) {
-        deltaCount = await applyDynamicUpdates(client, feed, parsedDynamic.updates);
+        await assertRunStillRunning(client, runId);
+        await updateRunProgress(runId, {
+          stage: "applying_updates",
+          detail: `${parsedDynamic.updates.length} Dynamic-Updates werden vorbereitet`,
+          processedCount: 0,
+          totalCount: parsedDynamic.updates.length,
+          message: "Dynamic-Updates werden geschrieben",
+        }, client);
+        deltaCount = await applyDynamicUpdates(client, feed, parsedDynamic.updates, runId);
       }
 
       if (!options?.dryRun) {
+        await assertRunStillRunning(client, runId);
+        await updateRunProgress(runId, {
+          stage: "finalizing",
+          detail: "Feed-Metadaten werden aktualisiert",
+          message: "Feed-Metadaten werden aktualisiert",
+        }, client);
         if (noRemoteWork) {
           await markFeedNoopSuccess(client, feed);
         } else {
@@ -1311,9 +2007,47 @@ export async function runDueFeedCycle() {
     return 0;
   }
 
-  const dueFeeds = feeds.filter((feed: FeedConfig) => shouldRunFeed(feed));
-  if (!dueFeeds.length) {
+  const queuedRuns = await loadQueuedRuns(FEED_CYCLE_QUEUE_LIMIT).catch((error) => {
+    console.error("[ingest] loadQueuedRuns failed:", errorMessage(error));
+    return [] as SyncRun[];
+  });
+  const latestRunByFeed = await loadLatestRunsByFeed().catch((error) => {
+    console.error("[ingest] loadLatestRunsByFeed failed:", errorMessage(error));
+    return new Map<string, SyncRun>();
+  });
+  const feedById = new Map(feeds.map((feed) => [feed.id, feed]));
+  const queuedFeedIds = new Set(queuedRuns.map((run) => run.feedId));
+  const dueFeeds = feeds.filter((feed: FeedConfig) =>
+    !queuedFeedIds.has(feed.id) && shouldRunFeed(feed, latestRunByFeed.get(feed.id))
+  );
+
+  if (!queuedRuns.length && !dueFeeds.length) {
     return 0;
+  }
+
+  const queuedResults = await runWithConcurrency(
+    queuedRuns,
+    FEED_CYCLE_CONCURRENCY,
+    async (run) => {
+      const feed = feedById.get(run.feedId);
+      if (!feed) {
+        throw new Error(`Feed not found for queued run ${run.id}`);
+      }
+
+      return runFeedActionWithTimeout(feed, run.kind as FeedAction, run.id);
+    },
+  );
+
+  queuedResults.forEach((result, index) => {
+    if (result.status === "rejected") {
+      const run = queuedRuns[index]!;
+      const feedName = feedById.get(run.feedId)?.name ?? run.feedId;
+      console.error(`[ingest] queued ${feedName} failed:`, errorMessage(result.reason));
+    }
+  });
+
+  if (queuedRuns.length) {
+    return queuedRuns.length;
   }
 
   // Bounded parallelism: one slow feed must not starve the rest, but a large
@@ -1324,7 +2058,7 @@ export async function runDueFeedCycle() {
     async (feed) => {
       const kind: FeedAction =
         feed.type === "dynamic" && feed.mode !== "pull" ? "reconciliation" : "manual";
-      return withTimeout(runFeedAction(feed.id, kind), FEED_RUN_TIMEOUT_MS, feed.name);
+      return runFeedActionWithTimeout(feed, kind);
     },
   );
 
@@ -1337,7 +2071,7 @@ export async function runDueFeedCycle() {
     }
   });
 
-  return dueFeeds.length;
+  return queuedRuns.length + dueFeeds.length;
 }
 
 export async function processFeedWebhook(feedId: string, payload: string, incomingSecret?: string | null) {

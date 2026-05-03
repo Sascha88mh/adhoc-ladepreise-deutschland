@@ -188,7 +188,10 @@ function mobilithekRequestError(
   return new Error(details, { cause: error });
 }
 
-export async function fetchStaticMobilithekPayload(feed: FeedConfig): Promise<string> {
+export async function fetchStaticMobilithekPayload(
+  feed: FeedConfig,
+  signal?: AbortSignal,
+): Promise<string | null> {
   if (shouldUseFixtures()) {
     return readFixture("static");
   }
@@ -199,7 +202,13 @@ export async function fetchStaticMobilithekPayload(feed: FeedConfig): Promise<st
     const response = await http.get<string>(target, {
       responseType: "text",
       transitional: { forcedJSONParsing: false },
+      signal,
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
     });
+
+    if (response.status === 204 || response.status === 304 || !response.data) {
+      return null;
+    }
 
     return typeof response.data === "string" ? response.data : JSON.stringify(response.data);
   } catch (error) {
@@ -210,6 +219,7 @@ export async function fetchStaticMobilithekPayload(feed: FeedConfig): Promise<st
 export async function pullDynamicMobilithekPayload(
   feed: FeedConfig,
   lastModified?: string | null,
+  signal?: AbortSignal,
 ): Promise<PullResult | null> {
   if (shouldUseFixtures()) {
     return {
@@ -225,6 +235,7 @@ export async function pullDynamicMobilithekPayload(
       headers: lastModified ? { "if-modified-since": lastModified } : undefined,
       responseType: "text",
       transitional: { forcedJSONParsing: false },
+      signal,
       // 204 (no packet) and 304 (not modified) must NOT throw.
       validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
     });

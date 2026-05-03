@@ -140,6 +140,134 @@ const ENBW_DYNAMIC_TOP_LEVEL_PAYLOAD = JSON.stringify({
   payload: JSON.parse(ENBW_DYNAMIC_REFILL_POINT).messageContainer.payload,
 });
 
+const STATIC_WITH_AGGREGATE_STATION_POWER = JSON.stringify({
+  payload: {
+    aegiEnergyInfrastructureTablePublication: {
+      energyInfrastructureTable: [
+        {
+          energyInfrastructureSite: [
+            {
+              idG: "site-aggregate-power",
+              operator: {
+                afacAnOrganisation: {
+                  name: { values: [{ value: "AC Betreiber" }] },
+                  externalIdentifier: [{ identifier: "ac-operator" }],
+                },
+              },
+              locationReference: {
+                locPointLocation: {
+                  coordinatesForDisplay: { latitude: 51.1, longitude: 7.1 },
+                  locLocationExtensionG: {
+                    facilityLocation: {
+                      address: {
+                        postcode: "45468",
+                        city: { values: [{ value: "Mülheim an der Ruhr" }] },
+                        countryCode: "DE",
+                        addressLine: [
+                          { type: { value: "street" }, text: { values: [{ value: "Dimbeck" }] } },
+                          { type: { value: "houseNumber" }, text: { values: [{ value: "6a" }] } },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+              energyInfrastructureStation: [
+                {
+                  idG: "station-aggregate-power",
+                  numberOfRefillPoints: 2,
+                  totalMaximumPower: 44000,
+                  refillPoint: [
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "DE*AC*ONE",
+                        currentType: { value: "ac" },
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "DE*AC*TWO",
+                        currentType: { value: "ac" },
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+const STATIC_WITH_AVAILABLE_POWER_LOWER_THAN_SOCKET = JSON.stringify({
+  payload: {
+    aegiEnergyInfrastructureTablePublication: {
+      energyInfrastructureTable: [
+        {
+          energyInfrastructureSite: [
+            {
+              idG: "site-available-power",
+              operator: {
+                afacAnOrganisation: {
+                  name: { values: [{ value: "Allego" }] },
+                  externalIdentifier: [{ identifier: "ALL" }],
+                },
+              },
+              locationReference: {
+                locPointLocation: {
+                  coordinatesForDisplay: { latitude: 51.45, longitude: 7.01 },
+                  locLocationExtensionG: {
+                    facilityLocation: {
+                      address: {
+                        postcode: "45128",
+                        city: { values: [{ value: "Essen" }] },
+                        countryCode: "DE",
+                        addressLine: [
+                          { type: { value: "street" }, text: { values: [{ value: "Veitstraße" }] } },
+                          { type: { value: "houseNumber" }, text: { values: [{ value: "3" }] } },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+              energyInfrastructureStation: [
+                {
+                  idG: "Allego-DELOC000794",
+                  numberOfRefillPoints: 2,
+                  totalMaximumPower: 14720,
+                  refillPoint: [
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "DEALLEGO0018661",
+                        currentType: { value: "ac" },
+                        availableChargingPower: [7360],
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "DEALLEGO0018662",
+                        currentType: { value: "ac" },
+                        availableChargingPower: [7360],
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
 describe("Mobilithek parser", () => {
   it("parses static station payloads from the official AFIR example", () => {
     const result = parseStaticMobilithekPayload(STATIC_FIXTURE);
@@ -212,5 +340,38 @@ describe("Mobilithek parser", () => {
     expect(result.updates).toHaveLength(1);
     expect(result.updates[0]?.chargePointId).toBe("DE*EBW*ONE");
     expect(result.updates[0]?.statusCanonical).toBe("OUT_OF_SERVICE");
+  });
+
+  it("uses the strongest individual charge point as station power instead of aggregate totalMaximumPower", () => {
+    const result = parseStaticMobilithekPayload(STATIC_WITH_AGGREGATE_STATION_POWER);
+
+    expect(result.catalog[0]?.maxPowerKw).toBe(22);
+    expect(result.stations[0]?.maxPowerKw).toBe(22);
+    expect(result.catalog[0]?.chargePoints.map((point) => point.maxPowerKw)).toEqual([22, 22]);
+  });
+
+  it("prefers connector maxPowerAtSocket over lower availableChargingPower values", () => {
+    const result = parseStaticMobilithekPayload(STATIC_WITH_AVAILABLE_POWER_LOWER_THAN_SOCKET);
+
+    expect(result.catalog[0]?.maxPowerKw).toBe(22);
+    expect(result.stations[0]?.maxPowerKw).toBe(22);
+    expect(result.catalog[0]?.chargePoints.map((point) => point.maxPowerKw)).toEqual([22, 22]);
+    expect(result.catalog[0]?.chargePoints.flatMap((point) => point.connectors.map((connector) => connector.maxPowerKw))).toEqual([22, 22]);
+  });
+
+  it("normalizes single-phase style Type 2 AC available power to the plausible three-phase class", () => {
+    const payload = JSON.parse(STATIC_WITH_AVAILABLE_POWER_LOWER_THAN_SOCKET);
+    const refillPoints =
+      payload.payload.aegiEnergyInfrastructureTablePublication.energyInfrastructureTable[0]
+        .energyInfrastructureSite[0].energyInfrastructureStation[0].refillPoint;
+
+    for (const refillPoint of refillPoints) {
+      delete refillPoint.aegiElectricChargingPoint.connector[0].maxPowerAtSocket;
+    }
+
+    const result = parseStaticMobilithekPayload(payload);
+
+    expect(result.catalog[0]?.maxPowerKw).toBe(22);
+    expect(result.catalog[0]?.chargePoints.map((point) => point.maxPowerKw)).toEqual([22, 22]);
   });
 });

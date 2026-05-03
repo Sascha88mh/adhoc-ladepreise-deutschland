@@ -1,8 +1,11 @@
 import type { FeedConfig } from "@adhoc/shared";
 import {
   createFeedConfigDb,
+  cleanupStuckSyncRunsDb,
   deleteFeedConfigDb,
+  type ListFeedConfigsOptions,
   listFeedConfigsDb,
+  searchFeedConfigsDb,
   listSyncRunsDb,
   searchAdminStationsDb,
   terminateFeedRunDb,
@@ -11,7 +14,7 @@ import {
   deleteStationOverrideDb,
   usingDatabase,
 } from "@adhoc/shared/db";
-import { runFeedAction } from "@adhoc/shared/ingest";
+import { enqueueFeedSync, runFeedAction } from "@adhoc/shared/ingest";
 
 function requireAdminDatabase() {
   if (!usingDatabase()) {
@@ -19,9 +22,9 @@ function requireAdminDatabase() {
   }
 }
 
-export async function listAdminFeeds() {
+export async function listAdminFeeds(options?: ListFeedConfigsOptions) {
   requireAdminDatabase();
-  return listFeedConfigsDb();
+  return options ? searchFeedConfigsDb(options) : listFeedConfigsDb();
 }
 
 export async function findAdminFeedBySubscriptionId(subscriptionId: string) {
@@ -58,6 +61,7 @@ export async function deleteAdminFeedConfig(id: string) {
 
 export async function listAdminSyncRuns() {
   requireAdminDatabase();
+  await cleanupStuckSyncRunsDb();
   return listSyncRunsDb();
 }
 
@@ -68,9 +72,9 @@ export async function terminateAdminFeedRun(id: string) {
 
 export async function triggerAdminFeedAction(id: string, action: "test" | "sync") {
   requireAdminDatabase();
-  const run = await runFeedAction(id, action === "test" ? "test" : "manual", {
-    dryRun: action === "test",
-  });
+  const run = action === "sync"
+    ? await enqueueFeedSync(id)
+    : await runFeedAction(id, "test", { dryRun: true });
 
   if (!run) {
     throw new Error("Sync run could not be created");

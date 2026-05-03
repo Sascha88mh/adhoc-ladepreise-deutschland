@@ -5,6 +5,7 @@ dist
 coverage
 *.tsbuildinfo
 .DS_Store
+.claude/
 
 # Local Netlify folder
 .netlify

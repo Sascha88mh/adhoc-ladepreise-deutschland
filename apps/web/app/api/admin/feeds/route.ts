@@ -21,8 +21,41 @@ const createSchema = z.object({
   notes: z.string(),
 });
 
-export async function GET() {
-  return Response.json({ data: await listAdminFeeds() });
+const booleanParamSchema = z.enum(["true", "false"]).transform((value) => value === "true");
+
+const listSchema = z.object({
+  query: z.string().trim().optional(),
+  q: z.string().trim().optional(),
+  source: z.enum(["mobilithek"]).optional(),
+  cpoId: z.string().trim().min(1).optional(),
+  type: z.enum(["static", "dynamic"]).optional(),
+  mode: z.enum(["push", "pull", "hybrid"]).optional(),
+  isActive: booleanParamSchema.optional(),
+  ingestCatalog: booleanParamSchema.optional(),
+  ingestPrices: booleanParamSchema.optional(),
+  ingestStatus: booleanParamSchema.optional(),
+  sort: z.enum(["nameAsc", "nameDesc", "createdAtAsc", "createdAtDesc"]).default("nameAsc"),
+});
+
+export async function GET(request: Request) {
+  try {
+    const params = listSchema.parse(Object.fromEntries(new URL(request.url).searchParams));
+    const { q, query, ...filters } = params;
+
+    return Response.json({
+      data: await listAdminFeeds({
+        ...filters,
+        query: query || q,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return Response.json({ error: "Ungültige Feed-Filter." }, { status: 400 });
+    }
+
+    const message = error instanceof Error ? error.message : "Feeds konnten nicht geladen werden.";
+    return Response.json({ error: message }, { status: 500 });
+  }
 }
 
 export async function POST(request: Request) {

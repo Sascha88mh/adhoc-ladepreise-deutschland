@@ -3,11 +3,12 @@ import type {
   ChargePointDetail,
   RouteCandidate,
   RoutePlan,
+  StationStats,
   StationDetail,
   StationRecord,
   TariffSummary,
 } from "./types";
-import { routeCandidateSchema, stationDetailSchema } from "./types";
+import { routeCandidateSchema, stationDetailSchema, stationStatsSchema } from "./types";
 import { distanceFromRouteKm } from "../geo/route-corridor";
 
 function normalizePaymentMethod(method: string) {
@@ -60,6 +61,10 @@ function isFreshEnough(isoTimestamp: string, limitMinutes?: number) {
 }
 
 function includeTariff(tariff: TariffSummary, filters: CandidateFilters) {
+  if (!tariffMatchesPowerFilters(tariff, filters)) {
+    return false;
+  }
+
   if (filters.maxPriceKwh !== undefined) {
     if (tariff.pricePerKwh == null || tariff.pricePerKwh > filters.maxPriceKwh) {
       return false;
@@ -90,6 +95,35 @@ function includeTariff(tariff: TariffSummary, filters: CandidateFilters) {
   if (filters.paymentMethods?.length) {
     const supported = new Set(tariff.paymentMethods.map((method) => method.toLowerCase()));
     if (!filters.paymentMethods.every((method) => supported.has(normalizePaymentMethod(method)))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function tariffMatchesPowerFilters(tariff: TariffSummary, filters: CandidateFilters) {
+  if (tariff.scope !== "charge_point") {
+    return true;
+  }
+
+  if (filters.currentTypes?.length) {
+    if (
+      tariff.chargePointCurrentType == null ||
+      !filters.currentTypes.includes(tariff.chargePointCurrentType)
+    ) {
+      return false;
+    }
+  }
+
+  if (filters.minPowerKw !== undefined) {
+    if (tariff.chargePointMaxPowerKw == null || tariff.chargePointMaxPowerKw < filters.minPowerKw) {
+      return false;
+    }
+  }
+
+  if (filters.maxPowerKw !== undefined) {
+    if (tariff.chargePointMaxPowerKw == null || tariff.chargePointMaxPowerKw > filters.maxPowerKw) {
       return false;
     }
   }
@@ -306,6 +340,79 @@ export function findStationsInView(
 
       return left.stationName.localeCompare(right.stationName);
     });
+}
+
+export function summarizeStationStats(candidates: RouteCandidate[] = []): StationStats {
+  const providers = new Map<
+    string,
+    { cpoId: string; cpoName: string; stations: number; chargePoints: number }
+  >();
+  let chargePointCount = 0;
+  let availableChargePointCount = 0;
+  let ac = 0;
+  let dc = 0;
+  let hpc = 0;
+  let maxPowerKw: number | null = null;
+  let completePriceCount = 0;
+  const pricePoints: number[] = [];
+
+  for (const candidate of candidates) {
+    chargePointCount += candidate.chargePointCount;
+    availableChargePointCount += candidate.availabilitySummary.available;
+
+    if (candidate.currentTypes.includes("AC")) {
+      ac += 1;
+    }
+    if (candidate.currentTypes.includes("DC")) {
+      dc += 1;
+    }
+    if (candidate.currentTypes.includes("DC") && candidate.maxPowerKw >= 100) {
+      hpc += 1;
+    }
+
+    maxPowerKw = maxPowerKw == null
+      ? candidate.maxPowerKw
+      : Math.max(maxPowerKw, candidate.maxPowerKw);
+
+    if (candidate.tariffSummary.isComplete) {
+      completePriceCount += 1;
+    }
+    if (candidate.tariffSummary.pricePerKwh != null) {
+      pricePoints.push(candidate.tariffSummary.pricePerKwh);
+    }
+
+    const provider = providers.get(candidate.cpoId);
+    if (provider) {
+      provider.stations += 1;
+      provider.chargePoints += candidate.chargePointCount;
+    } else {
+      providers.set(candidate.cpoId, {
+        cpoId: candidate.cpoId,
+        cpoName: candidate.cpoName,
+        stations: 1,
+        chargePoints: candidate.chargePointCount,
+      });
+    }
+  }
+
+  return stationStatsSchema.parse({
+    stationCount: candidates.length,
+    chargePointCount,
+    availableChargePointCount,
+    maxPowerKw,
+    currentTypeCounts: { ac, dc, hpc },
+    priceBand: {
+      min: pricePoints.length ? Math.min(...pricePoints) : null,
+      max: pricePoints.length ? Math.max(...pricePoints) : null,
+    },
+    completePriceShare: candidates.length ? completePriceCount / candidates.length : null,
+    providerList: [...providers.values()].sort(
+      (left, right) =>
+        right.chargePoints - left.chargePoints ||
+        right.stations - left.stations ||
+        left.cpoName.localeCompare(right.cpoName),
+    ),
+  });
 }
 
 export function getStationDetail(

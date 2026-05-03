@@ -38,6 +38,10 @@ export const tariffSummarySchema = z.object({
   id: z.string(),
   label: z.string(),
   currency: z.string().default("EUR"),
+  scope: z.enum(["station", "charge_point"]).optional(),
+  chargePointCode: z.string().nullable().optional(),
+  chargePointCurrentType: currentTypeSchema.nullable().optional(),
+  chargePointMaxPowerKw: z.number().nullable().optional(),
   pricePerKwh: z.number().nullable(),
   pricePerMinute: z.number().nullable(),
   sessionFee: z.number().nullable(),
@@ -76,7 +80,7 @@ export const stationRecordSchema = z.object({
   currentTypes: z.array(currentTypeSchema),
   connectorTypes: z.array(z.string()),
   paymentMethods: z.array(z.string()),
-  maxPowerKw: z.number().positive(),
+  maxPowerKw: z.number().nonnegative(),
   availabilitySummary: availabilitySummarySchema,
   lastPriceUpdateAt: z.string(),
   lastStatusUpdateAt: z.string(),
@@ -122,7 +126,7 @@ export const routeCandidateSchema = z.object({
   city: z.string(),
   distanceFromRouteKm: z.number().nonnegative(),
   detourMinutes: z.number().nonnegative(),
-  maxPowerKw: z.number().positive(),
+  maxPowerKw: z.number().nonnegative(),
   chargePointCount: z.number().int().positive(),
   currentTypes: z.array(currentTypeSchema),
   connectorTypes: z.array(z.string()),
@@ -134,6 +138,32 @@ export const routeCandidateSchema = z.object({
   freshnessMinutes: z.number().nonnegative(),
 });
 export type RouteCandidate = z.infer<typeof routeCandidateSchema>;
+
+export const stationStatsSchema = z.object({
+  stationCount: z.number().int().nonnegative(),
+  chargePointCount: z.number().int().nonnegative(),
+  availableChargePointCount: z.number().int().nonnegative(),
+  maxPowerKw: z.number().nonnegative().nullable(),
+  currentTypeCounts: z.object({
+    ac: z.number().int().nonnegative(),
+    dc: z.number().int().nonnegative(),
+    hpc: z.number().int().nonnegative(),
+  }),
+  priceBand: z.object({
+    min: z.number().nullable(),
+    max: z.number().nullable(),
+  }),
+  completePriceShare: z.number().min(0).max(1).nullable(),
+  providerList: z.array(
+    z.object({
+      cpoId: z.string(),
+      cpoName: z.string(),
+      stations: z.number().int().nonnegative(),
+      chargePoints: z.number().int().nonnegative(),
+    }),
+  ),
+});
+export type StationStats = z.infer<typeof stationStatsSchema>;
 
 export const chargePointDetailSchema = z.object({
   code: z.string(),
@@ -244,6 +274,12 @@ export const syncRunSchema = z.object({
   finishedAt: z.string().nullable(),
   message: z.string(),
   deltaCount: z.number().int().nonnegative(),
+  progressStage: z.string().nullable().default(null),
+  progressDetail: z.string().nullable().default(null),
+  heartbeatAt: z.string().nullable().default(null),
+  payloadSizeBytes: z.number().int().nonnegative().nullable().default(null),
+  processedCount: z.number().int().nonnegative().nullable().default(null),
+  totalCount: z.number().int().nonnegative().nullable().default(null),
 });
 export type SyncRun = z.infer<typeof syncRunSchema>;
 
@@ -322,6 +358,10 @@ export const publicCandidatesResponseSchema = z.object({
 
 export const publicMapStationsResponseSchema = z.object({
   data: z.array(routeCandidateSchema),
+});
+
+export const publicStationStatsResponseSchema = z.object({
+  data: stationStatsSchema,
 });
 
 export const stationDetailResponseSchema = z.object({

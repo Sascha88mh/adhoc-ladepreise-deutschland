@@ -8,14 +8,18 @@ import type {
 import { adminStationRecordSchema, feedConfigSchema, stationOverrideSchema, syncRunSchema } from "../domain/types";
 import { getPool } from "./pool";
 
-function hashAdvisoryLockKey(input: string) {
-  let hash = 0;
-  for (let index = 0; index < input.length; index += 1) {
-    hash = (hash << 5) - hash + input.charCodeAt(index);
-    hash |= 0;
-  }
-  return hash;
-}
+export type ListFeedConfigsOptions = {
+  query?: string;
+  source?: FeedConfig["source"];
+  cpoId?: string;
+  type?: FeedConfig["type"];
+  mode?: FeedConfig["mode"];
+  isActive?: boolean;
+  ingestCatalog?: boolean;
+  ingestPrices?: boolean;
+  ingestStatus?: boolean;
+  sort?: "nameAsc" | "nameDesc" | "createdAtAsc" | "createdAtDesc";
+};
 
 function mapFeedRow(row: Record<string, unknown>): FeedConfig {
   return feedConfigSchema.parse({
@@ -63,6 +67,12 @@ function mapSyncRunRow(row: Record<string, unknown>): SyncRun {
     finishedAt: row.finished_at ? new Date(String(row.finished_at)).toISOString() : null,
     message: String(row.message ?? ""),
     deltaCount: Number(row.delta_count ?? 0),
+    progressStage: row.progress_stage ? String(row.progress_stage) : null,
+    progressDetail: row.progress_detail ? String(row.progress_detail) : null,
+    heartbeatAt: row.heartbeat_at ? new Date(String(row.heartbeat_at)).toISOString() : null,
+    payloadSizeBytes: row.payload_size_bytes == null ? null : Number(row.payload_size_bytes),
+    processedCount: row.processed_count == null ? null : Number(row.processed_count),
+    totalCount: row.total_count == null ? null : Number(row.total_count),
   });
 }
 
@@ -113,7 +123,83 @@ export async function listFeedConfigsDb(client?: PoolClient) {
   const result = await executor.query<Record<string, unknown>>(
     `select *
        from feed_configs
-      order by created_at desc`,
+      order by lower(name) asc, name asc, created_at desc`,
+  );
+
+  return result.rows.map((row) => mapFeedRow(row));
+}
+
+export async function searchFeedConfigsDb(
+  options: ListFeedConfigsOptions = {},
+  client?: PoolClient,
+) {
+  const executor = client ?? getPool();
+  const values: Array<string | boolean | null> = [];
+  const where: string[] = [];
+
+  const addValue = (value: string | boolean | null) => {
+    values.push(value);
+    return `$${values.length}`;
+  };
+
+  const query = options.query?.trim();
+  if (query) {
+    const placeholder = addValue(`%${query}%`);
+    where.push(`(
+      name ilike ${placeholder}
+      or subscription_id ilike ${placeholder}
+      or coalesce(cpo_id, '') ilike ${placeholder}
+      or coalesce(credential_ref, '') ilike ${placeholder}
+      or coalesce(webhook_secret_ref, '') ilike ${placeholder}
+      or notes ilike ${placeholder}
+    )`);
+  }
+
+  if (options.source) {
+    where.push(`source = ${addValue(options.source)}`);
+  }
+
+  if (options.cpoId) {
+    where.push(`cpo_id = ${addValue(options.cpoId)}`);
+  }
+
+  if (options.type) {
+    where.push(`type = ${addValue(options.type)}`);
+  }
+
+  if (options.mode) {
+    where.push(`mode = ${addValue(options.mode)}`);
+  }
+
+  if (options.isActive !== undefined) {
+    where.push(`is_active = ${addValue(options.isActive)}`);
+  }
+
+  if (options.ingestCatalog !== undefined) {
+    where.push(`ingest_catalog = ${addValue(options.ingestCatalog)}`);
+  }
+
+  if (options.ingestPrices !== undefined) {
+    where.push(`ingest_prices = ${addValue(options.ingestPrices)}`);
+  }
+
+  if (options.ingestStatus !== undefined) {
+    where.push(`ingest_status = ${addValue(options.ingestStatus)}`);
+  }
+
+  const orderBy = {
+    nameAsc: "lower(name) asc, name asc, created_at desc",
+    nameDesc: "lower(name) desc, name desc, created_at desc",
+    createdAtAsc: "created_at asc, lower(name) asc, name asc",
+    createdAtDesc: "created_at desc, lower(name) asc, name asc",
+  }[options.sort ?? "nameAsc"];
+
+  const result = await executor.query<Record<string, unknown>>(
+    `select *
+       from feed_configs
+      ${where.length ? `where ${where.join("\n        and ")}` : ""}
+      order by ${orderBy}`,
+    values,
   );
 
   return result.rows.map((row) => mapFeedRow(row));
@@ -302,72 +388,51 @@ export async function getAppSecret(key: string): Promise<string | null> {
 
 export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
   const executor = client ?? getPool();
-  const staleRuns = await executor.query<{ feed_id: string | null }>(
-    `select distinct feed_id::text as feed_id
-       from sync_runs
-      where status = 'running'
-        and started_at < now() - interval '5 minutes'
-        and feed_id is not null`,
-  );
-
-  for (const row of staleRuns.rows) {
-    if (!row.feed_id) {
-      continue;
-    }
-
-    const lockKey = hashAdvisoryLockKey(row.feed_id);
-    await executor.query(
-      `select pg_terminate_backend(a.pid)
-         from pg_locks l
-         join pg_stat_activity a
-           on a.pid = l.pid
-        where l.locktype = 'advisory'
-          and l.objid = $1
-          and a.pid <> pg_backend_pid()`,
-      [lockKey],
-    );
-  }
-
-  const result = await executor.query<{ id: string }>(
+  const running = await executor.query<{ id: string }>(
     `update sync_runs
         set status = 'failed',
             finished_at = now(),
-            message = 'Abgebrochen (Timeout)'
+            message = 'Abgebrochen (Timeout)',
+            progress_stage = 'failed',
+            progress_detail = 'Timeout-Cleanup nach 5 Minuten',
+            heartbeat_at = now()
       where status = 'running'
         and started_at < now() - interval '5 minutes'
       returning id::text`,
   );
-  return result.rowCount ?? 0;
+  const queued = await executor.query<{ id: string }>(
+    `update sync_runs
+        set status = 'failed',
+            finished_at = now(),
+            message = 'Abgebrochen (Queue-Timeout)',
+            progress_stage = 'failed',
+            progress_detail = 'Queue-Timeout nach 60 Minuten',
+            heartbeat_at = now()
+      where status = 'queued'
+        and started_at < now() - interval '60 minutes'
+      returning id::text`,
+  );
+  return (running.rowCount ?? 0) + (queued.rowCount ?? 0);
 }
 
 export async function terminateFeedRunDb(feedId: string, client?: PoolClient) {
   const executor = client ?? getPool();
-  const lockKey = hashAdvisoryLockKey(feedId);
-
-  const terminated = await executor.query<{ pid: number; terminated: boolean }>(
-    `select a.pid, pg_terminate_backend(a.pid) as terminated
-       from pg_locks l
-       join pg_stat_activity a
-         on a.pid = l.pid
-      where l.locktype = 'advisory'
-        and l.objid = $1
-        and a.pid <> pg_backend_pid()`,
-    [lockKey],
-  );
-
   const updatedRuns = await executor.query<{ id: string }>(
     `update sync_runs
         set status = 'failed',
             finished_at = now(),
-            message = 'Abgebrochen (manuell erzwungen)'
+            message = 'Abgebrochen (manuell erzwungen)',
+            progress_stage = 'failed',
+            progress_detail = 'Manuell erzwungen',
+            heartbeat_at = now()
       where feed_id = $1::uuid
-        and status = 'running'
+        and status in ('queued', 'running')
       returning id::text`,
     [feedId],
   );
 
   return {
-    terminatedPids: terminated.rows.filter((row) => row.terminated).map((row) => row.pid),
+    terminatedPids: [],
     updatedRuns: updatedRuns.rowCount ?? 0,
   };
 }

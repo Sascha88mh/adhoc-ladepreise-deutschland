@@ -85,6 +85,7 @@ Mobilithek Push
   -> betroffene Map-Caches/Tiles invalidieren oder neu erzeugen
 
 Mobilithek Pull / Reconciliation
+  -> persistenter sync_runs Queue-Claim
   -> Scheduler / Worker / Cron-Service
   -> runDueFeedCycle()
   -> Postgres/PostGIS
@@ -106,7 +107,12 @@ Traffic-Schicht fuer alles, was extrem oft, global oder raw-body-sensitiv ist:
 - **R2** fuer vorberechnete, versionierte JSON- oder Vector-Tile-Dateien.
 - **KV** fuer kleine, haeufig gelesene Metadaten wie aktive Tile-Versionen,
   Cache-Manifeste oder leichte Feature-Flags.
-- **Queues** spaeter fuer entkoppelten Feed-Ingest und Cache-Rebuild-Jobs.
+- **Queues** spaeter fuer entkoppelten Feed-Ingest und Cache-Rebuild-Jobs. Bis dahin
+  dient `sync_runs.status='queued'` als durable DB-Queue fuer Admin-Syncs; kurzlebige
+  Serverless-Hintergrundtasks werden nicht mehr fuer Feed-Arbeit verwendet.
+- **Feed-Worker bleiben Node-seitig**, solange Mobilithek-Pull mTLS, Postgres/PostGIS
+  und große Static-Payloads gemeinsam verarbeitet werden. Cloudflare triggert und
+  normalisiert Edge-Traffic, ist aber nicht der Ort fuer lange Pull-Syncs.
 - **mTLS Bindings** fuer externe mTLS-Requests, falls Mobilithek-Pull langfristig
   aus Workers heraus erfolgen soll.
 
@@ -254,6 +260,10 @@ Erfolgskriterium:
 
 Ziel: Haeufige Kartenansichten sollen ohne DB-Hit beantwortet werden.
 
+- Status: MVT-v1 ist der konkrete Implementierungspfad. Der neue Endpunkt
+  `/api/public/stations/tiles/{z}/{x}/{y}` liefert Mapbox Vector Tiles mit
+  `source-layer=stations`. `/api/public/stations/map` bleibt als Fallback und
+  Debug-Pfad erhalten, ist aber nicht mehr der normale Browse-Pfad der Karte.
 - Cache-Key nach Zoom/Tile oder normalisierten Bounds bilden.
   Status: erster Schritt umgesetzt. Die Karten-API bietet einen GET-Pfad mit
   kurzen Cache-Headern; der Client rundet Bounds nach aussen, damit aehnliche
@@ -275,6 +285,47 @@ Erfolgskriterium:
 - Cache-Hit-Ratio ist messbar.
 - Cache-Invalidierung nach Feed-Sync aktualisiert betroffene Tiles oder schaltet auf
   eine neue Datenversion um.
+
+### MVT-v1: konkrete Tile-Spezifikation
+
+Ziel: Die Karte navigiert wie ein POI-Layer, nicht wie eine API-Liste. MapLibre
+fordert Tiles nach, rendert Punkte direkt in der Karten-Engine und filtert bereits
+geladene Features ohne neue Stations-Requests.
+
+- Tile-Endpunkt: `GET /api/public/stations/tiles/{z}/{x}/{y}`.
+- Content-Type: `application/vnd.mapbox-vector-tile`.
+- Cache: `max-age=60`, `s-maxage=120`, `stale-while-revalidate=300`; spaeter wird
+  die URL um eine aktive Tile-Version aus einem Manifest erweitert.
+- Source-Layer: `stations`.
+- Geometrie: Point-Geometrie aus `stations.geom`, transformiert mit
+  `ST_TileEnvelope`, `ST_AsMVTGeom` und `ST_AsMVT`.
+- Ausgeschlossene Daten: Detaildaten, Ladepunktlisten, komplette Tarifobjekte und
+  Export-Ziele bleiben in `/api/public/stations/[id]`.
+
+Tile-Properties sind bewusst flach und MVT-freundlich:
+
+```text
+id, cpo, power_kw, charge_points,
+has_ac, has_dc, is_hpc,
+available, status_age_min, price_age_min,
+has_price, min_price_ct, max_price_ct, complete_price,
+has_session_fee, has_blocking_fee,
+pay_emv, pay_applepay, pay_googlepay, pay_website
+```
+
+Diese Felder decken die aktuellen Kartenfilter ab: AC/DC/HPC, Anbieter,
+Verfuegbarkeit, Leistung, Ladepunktzahl, Preisrange, vollstaendige Preise,
+Bezahlarten, Startgebuehr, Blockiergebuehr und Freshness. Filterwechsel duerfen
+keinen Bounds-Request mehr ausloesen.
+
+Level-of-detail in v1:
+
+- Zoom 5-8: gleiche Tile-Features, kleiner Radius und starke Label-Kollision.
+- Zoom 9-11: reduzierte Stationspunkte ohne Detaildrawer-Preload.
+- Zoom 12+: konkrete Stationen mit Leistungslabel.
+
+Serverseitiges Clustering und R2-vorberechnete Tiles sind Phase 4, nicht Teil von
+MVT-v1.
 
 ### Phase 4: Vorberechnete Map Tiles in R2/KV
 

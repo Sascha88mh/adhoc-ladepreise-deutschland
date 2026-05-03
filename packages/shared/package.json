@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "axios": "^1.13.1",
+    "fast-xml-parser": "^5.7.2",
     "pg": "^8.16.3",
     "zod": "^4.1.12"
   },

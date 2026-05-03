@@ -11,8 +11,10 @@ export const dynamic = "force-dynamic";
 export default async function Home() {
   const route = await createLocationFocusRoute("Berlin");
   storeRoutePlan(route);
-  const results = await buildCandidateResponse(route, {});
-  const cpos = await listCpos();
+  const [results, cpos] = await Promise.all([
+    buildCandidateResponse(route, {}),
+    listCpos(),
+  ]);
 
   return (
     <main className="h-[100dvh] w-[100vw] overflow-hidden">

@@ -4,10 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import maplibregl, {
   type GeoJSONSource,
   type Map as MaplibreMap,
+  type MapLayerMouseEvent,
   type StyleSpecification,
 } from "maplibre-gl";
-import type { RouteCandidate, RoutePlan } from "@adhoc/shared";
-import { StationMarker } from "./station-marker";
+import type { CandidateFilters, RouteCandidate, RoutePlan } from "@adhoc/shared";
 import { Compass } from "lucide-react";
 
 const MAP_STYLES = {
@@ -23,8 +23,22 @@ const MAP_STYLES = {
     "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
 } as const;
 
+const INTERACTIVE_STATION_LAYERS = [
+  "browse-points",
+  "candidate-points",
+  "browse-power-labels",
+  "candidate-power-labels",
+] as const;
+const STATION_TILE_SOURCE_ID = "station-tiles";
+const STATION_TILE_SOURCE_LAYER = "stations";
+const STATION_TILE_FILTER_LAYERS = ["browse-points", "browse-power-labels"] as const;
+const STATION_TILE_URL_TEMPLATE =
+  process.env.NEXT_PUBLIC_MAP_TILE_URL ??
+  "/api/public/stations/tiles/{z}/{x}/{y}";
+
 const SATELLITE_STYLE: StyleSpecification = {
   version: 8,
+  glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
   sources: {
     satellite: {
       type: "raster",
@@ -46,20 +60,34 @@ const SATELLITE_STYLE: StyleSpecification = {
 
 export type MapMode = "light" | "dark" | "color" | "satellite";
 
+export type MapViewport = {
+  lat: number;
+  lng: number;
+  zoom: number;
+  bearing: number;
+  pitch: number;
+};
+
 type Props = {
   route: RoutePlan;
   candidates: RouteCandidate[];
   browseCandidates: RouteCandidate[];
+  filters: CandidateFilters;
   selectedStationId: string | null;
   hoveredStationId: string | null;
   onSelect: (stationId: string | null) => void;
-  onViewportChange?: (bounds: {
-    minLat: number;
-    minLng: number;
-    maxLat: number;
-    maxLng: number;
+  onViewportChange?: (state: {
+    bounds: {
+      minLat: number;
+      minLng: number;
+      maxLat: number;
+      maxLng: number;
+    };
+    viewport: MapViewport;
   }) => void;
   mapMode: MapMode;
+  initialViewport?: MapViewport | null;
+  preserveViewport?: boolean;
   candidatesOpen?: boolean;
 };
 
@@ -105,6 +133,21 @@ function mapStyleForMode(mode: MapMode) {
   }
 
   return MAP_STYLES[mode];
+}
+
+function stationTileUrl() {
+  if (/^https?:\/\//.test(STATION_TILE_URL_TEMPLATE)) {
+    return STATION_TILE_URL_TEMPLATE;
+  }
+
+  if (typeof window === "undefined") {
+    return STATION_TILE_URL_TEMPLATE;
+  }
+
+  const path = STATION_TILE_URL_TEMPLATE.startsWith("/")
+    ? STATION_TILE_URL_TEMPLATE
+    : `/${STATION_TILE_URL_TEMPLATE}`;
+  return `${window.location.origin}${path}`;
 }
 
 function emptyCollection() {
@@ -153,29 +196,6 @@ function candidateCollection(candidates: RouteCandidate[]) {
   };
 }
 
-function browseCollection(
-  browseCandidates: RouteCandidate[],
-  highlightedIds: Set<string>,
-) {
-  return {
-    type: "FeatureCollection" as const,
-    features: browseCandidates
-      .filter((candidate) => !highlightedIds.has(candidate.stationId))
-      .map((candidate) => ({
-        type: "Feature" as const,
-        geometry: {
-          type: "Point" as const,
-          coordinates: [candidate.lng, candidate.lat],
-        },
-        properties: {
-          id: candidate.stationId,
-          available: candidate.availabilitySummary.available,
-          power: candidate.maxPowerKw,
-        },
-      })),
-  };
-}
-
 function routeCollection(route: RoutePlan) {
   return {
     type: "FeatureCollection" as const,
@@ -194,35 +214,169 @@ function routeCollection(route: RoutePlan) {
   };
 }
 
+type SelectedTileFeature = {
+  stationId: string;
+  lng: number;
+  lat: number;
+};
+
 function selectedCollection(
   candidates: RouteCandidate[],
   browseCandidates: RouteCandidate[],
   selectedStationId: string | null,
   hoveredStationId: string | null,
+  selectedTileFeature: SelectedTileFeature | null,
 ) {
   const highlighted = [...candidates, ...browseCandidates].find(
     (candidate) =>
       candidate.stationId === selectedStationId ||
       candidate.stationId === hoveredStationId,
   );
+  const highlightedTile =
+    !highlighted &&
+    selectedTileFeature &&
+    (selectedTileFeature.stationId === selectedStationId ||
+      selectedTileFeature.stationId === hoveredStationId)
+      ? selectedTileFeature
+      : null;
 
   return {
     type: "FeatureCollection" as const,
-    features: highlighted
+    features: highlighted || highlightedTile
       ? [
           {
             type: "Feature" as const,
             geometry: {
               type: "Point" as const,
-              coordinates: [highlighted.lng, highlighted.lat],
+              coordinates: highlighted
+                ? [highlighted.lng, highlighted.lat]
+                : [highlightedTile!.lng, highlightedTile!.lat],
             },
             properties: {
-              id: highlighted.stationId,
+              id: highlighted?.stationId ?? highlightedTile!.stationId,
             },
           },
         ]
       : [],
   };
+}
+
+function paymentProperty(method: string) {
+  const normalized = method.toLowerCase();
+
+  if (normalized === "eccard" || normalized === "creditcard") {
+    return "pay_emv";
+  }
+
+  if (normalized === "applepay") {
+    return "pay_applepay";
+  }
+
+  if (normalized === "googlepay") {
+    return "pay_googlepay";
+  }
+
+  if (normalized === "webqr") {
+    return "pay_website";
+  }
+
+  return null;
+}
+
+function stationTileFilter(filters: CandidateFilters) {
+  const clauses: unknown[] = ["all"];
+  const useHpcPrice =
+    filters.currentTypes?.includes("DC") &&
+    (filters.minPowerKw ?? 0) >= 100 &&
+    filters.maxPowerKw === undefined;
+  const hasPriceProperty = useHpcPrice ? "hpc_has_price" : "has_price";
+  const minPriceProperty = useHpcPrice ? "hpc_min_price_ct" : "min_price_ct";
+  const maxPriceProperty = useHpcPrice ? "hpc_max_price_ct" : "max_price_ct";
+
+  if (filters.currentTypes?.includes("AC")) {
+    clauses.push(["==", ["get", "has_ac"], 1]);
+  }
+
+  if (filters.currentTypes?.includes("DC")) {
+    clauses.push(["==", ["get", "has_dc"], 1]);
+  }
+
+  if (filters.minPowerKw !== undefined) {
+    clauses.push([">=", ["get", "power_kw"], filters.minPowerKw]);
+  }
+
+  if (filters.maxPowerKw !== undefined) {
+    clauses.push(["<=", ["get", "power_kw"], filters.maxPowerKw]);
+  }
+
+  if (filters.minChargePointCount !== undefined) {
+    clauses.push([">=", ["get", "charge_points"], filters.minChargePointCount]);
+  }
+
+  if (filters.maxChargePointCount !== undefined) {
+    clauses.push(["<=", ["get", "charge_points"], filters.maxChargePointCount]);
+  }
+
+  if (filters.availableOnly) {
+    clauses.push([">", ["get", "available"], 0]);
+  }
+
+  if (filters.minPriceKwh !== undefined || filters.maxPriceKwh !== undefined) {
+    clauses.push(["==", ["get", hasPriceProperty], 1]);
+  }
+
+  if (filters.minPriceKwh !== undefined) {
+    clauses.push([">=", ["get", maxPriceProperty], Math.round(filters.minPriceKwh * 100)]);
+  }
+
+  if (filters.maxPriceKwh !== undefined) {
+    clauses.push(["<=", ["get", minPriceProperty], Math.round(filters.maxPriceKwh * 100)]);
+  }
+
+  if (filters.onlyCompletePrices) {
+    clauses.push(["==", ["get", "complete_price"], 1]);
+  }
+
+  if (filters.allowSessionFee === false) {
+    clauses.push(["==", ["get", "has_session_fee"], 0]);
+  }
+
+  if (filters.allowBlockingFee === false) {
+    clauses.push(["==", ["get", "has_blocking_fee"], 0]);
+  }
+
+  if (filters.freshWithinMinutes !== undefined) {
+    clauses.push(["<=", ["get", "status_age_min"], filters.freshWithinMinutes]);
+    clauses.push(["<=", ["get", "price_age_min"], filters.freshWithinMinutes]);
+  }
+
+  if (filters.cpoIds?.length) {
+    clauses.push(["in", ["get", "cpo"], ["literal", filters.cpoIds]]);
+  }
+
+  const paymentProperties = new Set(
+    (filters.paymentMethods ?? [])
+      .map(paymentProperty)
+      .filter((property) => property != null),
+  );
+  for (const property of paymentProperties) {
+    clauses.push(["==", ["get", property], 1]);
+  }
+
+  return clauses.length > 1 ? clauses : null;
+}
+
+function applyStationTileFilter(map: MaplibreMap, filters: CandidateFilters) {
+  const filter = stationTileFilter(filters);
+
+  for (const layerId of STATION_TILE_FILTER_LAYERS) {
+    if (map.getLayer(layerId)) {
+      map.setFilter(
+        layerId,
+        filter as Parameters<MaplibreMap["setFilter"]>[1],
+      );
+    }
+  }
 }
 
 function updateSource(
@@ -321,10 +475,12 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
     });
   }
 
-  if (!map.getSource("browse")) {
-    map.addSource("browse", {
-      type: "geojson",
-      data: emptyCollection(),
+  if (!map.getSource(STATION_TILE_SOURCE_ID)) {
+    map.addSource(STATION_TILE_SOURCE_ID, {
+      type: "vector",
+      tiles: [stationTileUrl()],
+      minzoom: 5,
+      maxzoom: 16,
     });
   }
 
@@ -395,11 +551,198 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
       },
     });
   }
+
+  if (!map.getLayer("browse-points")) {
+    map.addLayer({
+      id: "browse-points",
+      type: "circle",
+      source: STATION_TILE_SOURCE_ID,
+      "source-layer": STATION_TILE_SOURCE_LAYER,
+      paint: {
+        "circle-color": [
+          "case",
+          [">", ["coalesce", ["get", "available"], 0], 0],
+          "#156f63",
+          "#d09a4a",
+        ],
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          2.2,
+          9,
+          3.8,
+          12,
+          7,
+          15,
+          10,
+        ],
+        "circle-opacity": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          0.66,
+          10,
+          0.84,
+        ],
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-opacity": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          8,
+          0,
+          11,
+          0.82,
+        ],
+        "circle-stroke-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          8,
+          0,
+          12,
+          1.2,
+        ],
+      },
+    });
+  }
+
+  if (!map.getLayer("candidate-points")) {
+    map.addLayer({
+      id: "candidate-points",
+      type: "circle",
+      source: "candidates",
+      paint: {
+        "circle-color": [
+          "case",
+          [">", ["coalesce", ["get", "available"], 0], 0],
+          "#156f63",
+          "#d09a4a",
+        ],
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          3,
+          9,
+          5,
+          12,
+          9,
+          15,
+          12,
+        ],
+        "circle-opacity": 0.92,
+        "circle-stroke-color": palette.candidateStroke,
+        "circle-stroke-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          8,
+          0.8,
+          13,
+          2,
+        ],
+      },
+    });
+  }
+
+  if (!map.getLayer("browse-power-labels")) {
+    map.addLayer({
+      id: "browse-power-labels",
+      type: "symbol",
+      source: STATION_TILE_SOURCE_ID,
+      "source-layer": STATION_TILE_SOURCE_LAYER,
+      minzoom: 12,
+      layout: {
+        "text-field": ["to-string", ["get", "power_kw"]],
+        "text-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          12,
+          9,
+          15,
+          11,
+        ],
+        "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+        "text-allow-overlap": false,
+        "text-ignore-placement": false,
+      },
+      paint: {
+        "text-color": "#ffffff",
+        "text-halo-color": "rgba(15, 23, 42, 0.46)",
+        "text-halo-width": 0.7,
+      },
+    });
+  }
+
+  if (!map.getLayer("candidate-power-labels")) {
+    map.addLayer({
+      id: "candidate-power-labels",
+      type: "symbol",
+      source: "candidates",
+      minzoom: 11,
+      layout: {
+        "text-field": ["to-string", ["get", "power"]],
+        "text-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          11,
+          9,
+          15,
+          11.5,
+        ],
+        "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+        "text-allow-overlap": false,
+        "text-ignore-placement": false,
+      },
+      paint: {
+        "text-color": "#ffffff",
+        "text-halo-color": "rgba(15, 23, 42, 0.5)",
+        "text-halo-width": 0.8,
+      },
+    });
+  }
+
+  if (!map.getLayer("selected-ring")) {
+    map.addLayer({
+      id: "selected-ring",
+      type: "circle",
+      source: "selected",
+      paint: {
+        "circle-color": palette.selectedFill,
+        "circle-opacity": 0.18,
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          8,
+          12,
+          17,
+          15,
+          23,
+        ],
+        "circle-stroke-color": palette.selectedStroke,
+        "circle-stroke-width": 3,
+        "circle-stroke-opacity": 0.95,
+      },
+    });
+  }
+
   map.setPaintProperty("route-glow", "line-color", palette.glow);
   map.setPaintProperty("route-line", "line-color", palette.line);
   map.setPaintProperty("focus-halo", "circle-color", palette.focusHalo);
   map.setPaintProperty("focus-halo", "circle-stroke-color", palette.focusCore);
   map.setPaintProperty("focus-core", "circle-color", palette.focusCore);
+  map.setPaintProperty("candidate-points", "circle-stroke-color", palette.candidateStroke);
+  map.setPaintProperty("selected-ring", "circle-color", palette.selectedFill);
+  map.setPaintProperty("selected-ring", "circle-stroke-color", palette.selectedStroke);
 }
 
 function syncMapData(
@@ -409,6 +752,7 @@ function syncMapData(
   browseCandidates: RouteCandidate[],
   selectedStationId: string | null,
   hoveredStationId: string | null,
+  selectedTileFeature: SelectedTileFeature | null,
 ) {
   updateSource(
     map,
@@ -418,20 +762,13 @@ function syncMapData(
   updateSource(map, "candidates", candidateCollection(candidates));
   updateSource(
     map,
-    "browse",
-    browseCollection(
-      browseCandidates,
-      new Set(candidates.map((candidate) => candidate.stationId)),
-    ),
-  );
-  updateSource(
-    map,
     "selected",
     selectedCollection(
       candidates,
       browseCandidates,
       selectedStationId,
       hoveredStationId,
+      selectedTileFeature,
     ),
   );
   updateSource(map, "focus", focusCollection(route));
@@ -472,26 +809,31 @@ export function RouteMap({
   route,
   candidates,
   browseCandidates,
+  filters,
   selectedStationId,
   hoveredStationId,
   onSelect,
   onViewportChange,
   mapMode,
+  initialViewport,
+  preserveViewport = false,
   candidatesOpen,
 }: Props) {
   const [mapInstance, setMapInstance] = useState<MaplibreMap | null>(null);
-  const [isZoomedIn, setIsZoomedIn] = useState(false);
-  const [isZoomedOut, setIsZoomedOut] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MaplibreMap | null>(null);
   const onSelectRef = useRef(onSelect);
   const routeRef = useRef(route);
   const candidatesRef = useRef(candidates);
   const browseCandidatesRef = useRef(browseCandidates);
+  const filtersRef = useRef(filters);
   const selectedStationIdRef = useRef(selectedStationId);
   const hoveredStationIdRef = useRef(hoveredStationId);
+  const selectedTileFeatureRef = useRef<SelectedTileFeature | null>(null);
   const mapModeRef = useRef(mapMode);
   const onViewportChangeRef = useRef(onViewportChange);
+  const preserveViewportRef = useRef(preserveViewport);
+  const initialViewportRef = useRef(initialViewport);
 
   useEffect(() => {
     onSelectRef.current = onSelect;
@@ -502,13 +844,18 @@ export function RouteMap({
   }, [onViewportChange]);
 
   useEffect(() => {
+    preserveViewportRef.current = preserveViewport;
+  }, [preserveViewport]);
+
+  useEffect(() => {
     routeRef.current = route;
     candidatesRef.current = candidates;
     browseCandidatesRef.current = browseCandidates;
+    filtersRef.current = filters;
     selectedStationIdRef.current = selectedStationId;
     hoveredStationIdRef.current = hoveredStationId;
     mapModeRef.current = mapMode;
-  }, [route, candidates, browseCandidates, selectedStationId, hoveredStationId, mapMode]);
+  }, [route, candidates, browseCandidates, filters, selectedStationId, hoveredStationId, mapMode]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -519,19 +866,18 @@ export function RouteMap({
       container: containerRef.current,
       style: mapStyleForMode(mapModeRef.current),
       center: [
-        routeRef.current.origin.coordinates.lng,
-        routeRef.current.origin.coordinates.lat,
+        initialViewportRef.current?.lng ?? routeRef.current.origin.coordinates.lng,
+        initialViewportRef.current?.lat ?? routeRef.current.origin.coordinates.lat,
       ],
-      zoom: isLocationFocusRoute(routeRef.current) ? 14 : 6,
-      pitch: 20,
+      zoom: initialViewportRef.current?.zoom ?? (isLocationFocusRoute(routeRef.current) ? 14 : 6),
+      bearing: initialViewportRef.current?.bearing ?? 0,
+      pitch: initialViewportRef.current?.pitch ?? 20,
       maxZoom: 16,
       attributionControl: false,
     });
 
     mapRef.current = map;
-    setMapInstance(map); // Store map purely to trigger React re-render of child markers
-    setIsZoomedIn(map.getZoom() > 11.5);
-    setIsZoomedOut(map.getZoom() < 10.0);
+    setMapInstance(map);
 
     const renderCurrentState = () => {
       const currentRoute = routeRef.current;
@@ -545,40 +891,85 @@ export function RouteMap({
         browseCandidatesRef.current,
         selectedStationIdRef.current,
         hoveredStationIdRef.current,
+        selectedTileFeatureRef.current,
       );
+      applyStationTileFilter(map, filtersRef.current);
 
-      fitMapToContent(map, currentRoute, currentCandidates);
+      if (!preserveViewportRef.current) {
+        fitMapToContent(map, currentRoute, currentCandidates);
+      }
+    };
+
+    const emitViewport = () => {
+      const bounds = map.getBounds();
+      const center = map.getCenter();
+      onViewportChangeRef.current?.({
+        bounds: {
+          minLat: bounds.getSouth(),
+          minLng: bounds.getWest(),
+          maxLat: bounds.getNorth(),
+          maxLng: bounds.getEast(),
+        },
+        viewport: {
+          lat: center.lat,
+          lng: center.lng,
+          zoom: map.getZoom(),
+          bearing: map.getBearing(),
+          pitch: map.getPitch(),
+        },
+      });
     };
 
     map.on("load", renderCurrentState);
-    map.on("load", () => {
-      const bounds = map.getBounds();
-      onViewportChangeRef.current?.({
-        minLat: bounds.getSouth(),
-        minLng: bounds.getWest(),
-        maxLat: bounds.getNorth(),
-        maxLng: bounds.getEast(),
+    map.on("load", emitViewport);
+    map.on("click", (event) => {
+      const interactiveFeatures = map.queryRenderedFeatures(event.point, {
+        layers: [...INTERACTIVE_STATION_LAYERS],
       });
-    });
-    map.on("click", () => {
-      // Any click that reaches the MapLibre canvas wasn't caught by a StationMarker overlay
-      // Therefore, it's a click on an empty area of the map or the route line.
+
+      if (interactiveFeatures.length > 0) {
+        return;
+      }
+
       onSelectRef.current(null);
     });
-    map.on("zoom", () => {
-      const zoom = map.getZoom();
-      setIsZoomedIn(zoom > 11.5);
-      setIsZoomedOut(zoom < 10.0);
-    });
     map.on("moveend", () => {
-      const bounds = map.getBounds();
-      onViewportChangeRef.current?.({
-        minLat: bounds.getSouth(),
-        minLng: bounds.getWest(),
-        maxLat: bounds.getNorth(),
-        maxLng: bounds.getEast(),
-      });
+      emitViewport();
     });
+
+    const selectFeature = (event: MapLayerMouseEvent) => {
+      const feature = event.features?.[0];
+      const id = feature?.properties?.id;
+      if (typeof id === "string") {
+        if (feature?.geometry.type === "Point") {
+          const coordinates = feature.geometry.coordinates;
+          if (
+            Array.isArray(coordinates) &&
+            typeof coordinates[0] === "number" &&
+            typeof coordinates[1] === "number"
+          ) {
+            selectedTileFeatureRef.current = {
+              stationId: id,
+              lng: coordinates[0],
+              lat: coordinates[1],
+            };
+          }
+        }
+        onSelectRef.current(id);
+      }
+    };
+    const enablePointer = () => {
+      map.getCanvas().style.cursor = "pointer";
+    };
+    const disablePointer = () => {
+      map.getCanvas().style.cursor = "";
+    };
+
+    for (const layerId of INTERACTIVE_STATION_LAYERS) {
+      map.on("click", layerId, selectFeature);
+      map.on("mouseenter", layerId, enablePointer);
+      map.on("mouseleave", layerId, disablePointer);
+    }
 
     let frameId: number;
     const animatePulse = (timestamp: number) => {
@@ -598,7 +989,7 @@ export function RouteMap({
           currentMap.setPaintProperty("focus-halo", "circle-radius", radius);
           currentMap.setPaintProperty("focus-halo", "circle-opacity", opacity);
           currentMap.setPaintProperty("focus-halo", "circle-stroke-opacity", opacity);
-        } catch (error) {
+        } catch {
           // Layer might be rendering or map disconnected temporarily
         }
       }
@@ -608,6 +999,11 @@ export function RouteMap({
 
     return () => {
       cancelAnimationFrame(frameId);
+      for (const layerId of INTERACTIVE_STATION_LAYERS) {
+        map.off("click", layerId, selectFeature);
+        map.off("mouseenter", layerId, enablePointer);
+        map.off("mouseleave", layerId, disablePointer);
+      }
       map.remove();
       mapRef.current = null;
     };
@@ -629,7 +1025,9 @@ export function RouteMap({
         browseCandidates,
         selectedStationId,
         hoveredStationId,
+        selectedTileFeatureRef.current,
       );
+      applyStationTileFilter(map, filters);
     };
 
     if (!map.isStyleLoaded()) {
@@ -637,7 +1035,7 @@ export function RouteMap({
     }
 
     apply();
-  }, [route, candidates, browseCandidates, selectedStationId, hoveredStationId, mapMode]);
+  }, [route, candidates, browseCandidates, filters, selectedStationId, hoveredStationId, mapMode]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -668,7 +1066,9 @@ export function RouteMap({
         browseCandidatesRef.current,
         selectedStationIdRef.current,
         hoveredStationIdRef.current,
+        selectedTileFeatureRef.current,
       );
+      applyStationTileFilter(map, filtersRef.current);
     };
 
     requestAnimationFrame(rehydrateStyle);
@@ -681,30 +1081,14 @@ export function RouteMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
+    if (preserveViewport) return;
     fitMapToContent(map, route, candidates);
-  }, [route.routeId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Merge candidate lists without duplicates
-  const allCandidates = new Map<string, RouteCandidate>();
-  candidates.forEach(c => allCandidates.set(c.stationId, c));
-  browseCandidates.forEach(c => allCandidates.set(c.stationId, c));
+  }, [route.routeId, preserveViewport]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <>
       <div ref={containerRef} className="h-full w-full" />
       {mapInstance && <CustomCompass map={mapInstance} candidatesOpen={candidatesOpen} />}
-      {mapInstance &&
-        Array.from(allCandidates.values()).map((candidate) => (
-          <StationMarker
-            key={candidate.stationId}
-            map={mapInstance}
-            candidate={candidate}
-            isSelected={selectedStationId === candidate.stationId || hoveredStationId === candidate.stationId}
-            isZoomedIn={isZoomedIn}
-            isZoomedOut={isZoomedOut}
-            onClick={onSelect}
-          />
-        ))}
     </>
   );
 }

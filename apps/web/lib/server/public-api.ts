@@ -1,7 +1,7 @@
 import {
   findCandidatesForRoute,
   findStationsInView,
-  getCpoList,
+  summarizeStationStats,
   resolveLocation,
   getStationDetail,
   routePlanSchema,
@@ -14,6 +14,7 @@ import {
 import {
   listStationRecordsDb,
   listStationRecordsInBoundsDb,
+  listCpoSummariesDb,
   loadChargePointRowsDb,
   usingDatabase,
 } from "@adhoc/shared/db";
@@ -81,11 +82,6 @@ export async function createLocationFocusRoute(query: string) {
   });
 }
 
-async function stationRecords() {
-  requirePublicDatabase();
-  return listStationRecordsDb();
-}
-
 function expandedRouteBounds(route: RoutePlan) {
   const latPadding = route.corridorKm / 111;
   const midLat = (route.bounds.minLat + route.bounds.maxLat) / 2;
@@ -125,7 +121,8 @@ export async function buildCandidateResponse(route: RoutePlan, filters: Candidat
 }
 
 export async function listCpos() {
-  return getCpoList(await stationRecords());
+  requirePublicDatabase();
+  return listCpoSummariesDb();
 }
 
 export async function loadStationDetail(stationId: string) {
@@ -162,4 +159,11 @@ export async function listMapStations(
 ) {
   requirePublicDatabase();
   return findStationsInView(bounds, filters, await listStationRecordsInBoundsDb(bounds));
+}
+
+export async function loadMapStationStats(
+  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
+  filters: CandidateFilters,
+) {
+  return summarizeStationStats(await listMapStations(bounds, filters));
 }

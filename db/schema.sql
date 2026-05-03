@@ -46,13 +46,22 @@ CREATE TABLE sync_runs (
   started_at TIMESTAMPTZ NOT NULL,
   finished_at TIMESTAMPTZ,
   message TEXT NOT NULL DEFAULT '',
-  delta_count INTEGER NOT NULL DEFAULT 0
+  delta_count INTEGER NOT NULL DEFAULT 0,
+  progress_stage TEXT,
+  progress_detail TEXT,
+  heartbeat_at TIMESTAMPTZ,
+  payload_size_bytes BIGINT,
+  processed_count INTEGER,
+  total_count INTEGER
 );
 
 CREATE INDEX idx_sync_runs_feed_started ON sync_runs(feed_id, started_at DESC);
 CREATE UNIQUE INDEX idx_sync_runs_one_running_per_feed
   ON sync_runs(feed_id)
   WHERE status = 'running';
+CREATE UNIQUE INDEX idx_sync_runs_one_active_per_feed
+  ON sync_runs(feed_id)
+  WHERE status IN ('queued', 'running');
 CREATE INDEX idx_sync_runs_running_started
   ON sync_runs(started_at)
   WHERE status = 'running';

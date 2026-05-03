@@ -2,23 +2,41 @@
 
 import dynamic from "next/dynamic";
 import { AnimatePresence, motion } from "framer-motion";
-import { LoaderCircle, PanelRightClose, PanelRightOpen, Layers } from "lucide-react";
+import {
+  AlertTriangle,
+  BarChart3,
+  Building2,
+  LoaderCircle,
+  PanelRightClose,
+  PanelRightOpen,
+  Layers,
+  PlugZap,
+  X,
+  Zap,
+} from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type {
   CandidateFilters,
   RouteCandidate,
   RoutePlan,
   StationDetail,
+  StationStats,
 } from "@adhoc/shared";
 import {
-  fetchMapStations,
   fetchLocationFocus,
   fetchIpLocation,
   fetchReverseLocation,
   fetchRouteCandidates,
   fetchRoutePlan,
   fetchStationDetail,
+  fetchStationStats,
 } from "@/lib/client/api";
+import {
+  readRoutePlannerUrlState,
+  writeRoutePlannerUrlState,
+  type RoutePlannerUrlState,
+  type StoredMapViewport,
+} from "@/lib/client/url-state";
 import { FilterRail } from "@/components/filters/filter-rail";
 import { CandidateList } from "@/components/results/candidate-list";
 import { StationDrawer } from "@/components/results/station-drawer";
@@ -37,6 +55,12 @@ const RouteMap = dynamic(
 );
 
 type MapMode = "light" | "dark" | "color" | "satellite";
+type MapBounds = {
+  minLat: number;
+  minLng: number;
+  maxLat: number;
+  maxLng: number;
+};
 
 const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
   { id: "light", label: "Klar" },
@@ -44,12 +68,39 @@ const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
   { id: "color", label: "Farbe" },
   { id: "satellite", label: "Satellit" },
 ];
+const EMPTY_BROWSE_CANDIDATES: RouteCandidate[] = [];
 
 function mapTheme(): CSSProperties {
   return {
     "--accent-fg": "#ffffff",
     "--glass-border": "var(--line)",
   } as CSSProperties;
+}
+
+function integerLabel(value: number) {
+  return new Intl.NumberFormat("de-DE").format(value);
+}
+
+function priceBandLabel(stats: StationStats) {
+  if (stats.priceBand.min == null || stats.priceBand.max == null) {
+    return "offen";
+  }
+
+  if (stats.priceBand.min === stats.priceBand.max) {
+    return `${stats.priceBand.min.toFixed(2).replace(".", ",")} €/kWh`;
+  }
+
+  return `${stats.priceBand.min.toFixed(2).replace(".", ",")} - ${stats.priceBand.max
+    .toFixed(2)
+    .replace(".", ",")} €/kWh`;
+}
+
+function completePriceLabel(stats: StationStats) {
+  if (stats.completePriceShare == null) {
+    return "keine Preise";
+  }
+
+  return `${Math.round(stats.completePriceShare * 100)}% komplett`;
 }
 
 type Props = {
@@ -90,6 +141,8 @@ export function RoutePlannerShell({
   initialCpos,
   defaultQuery,
 }: Props) {
+  const [initialUrlState, setInitialUrlState] = useState<RoutePlannerUrlState | null>(null);
+
   function effectiveFilters(source: CandidateFilters, mode: SearchQueryState["mode"]) {
     if (mode === "location") {
       const rest = { ...source };
@@ -114,7 +167,7 @@ export function RoutePlannerShell({
   const [filters, setFilters] = useState<CandidateFilters>({});
   const debouncedFilters = useDebouncedValue(filters, 800);
   const [results, setResults] = useState(initialResults);
-  const [browseCandidates, setBrowseCandidates] = useState<RouteCandidate[]>([]);
+  const browseCandidates = EMPTY_BROWSE_CANDIDATES;
   const [selectedStationId, setSelectedStationId] = useState<string | null>(
     initialResults.candidates[0]?.stationId ?? null,
   );
@@ -134,12 +187,15 @@ export function RoutePlannerShell({
   const [detailOpen, setDetailOpen] = useState(
     Boolean(initialResults.candidates[0]?.stationId),
   );
-  const [mapBounds, setMapBounds] = useState<{
-    minLat: number;
-    minLng: number;
-    maxLat: number;
-    maxLng: number;
-  } | null>(null);
+  const [mapViewport, setMapViewport] = useState<StoredMapViewport | null>(null);
+  const [mapBounds, setMapBounds] = useState<MapBounds | null>(null);
+  const debouncedMapBounds = useDebouncedValue(mapBounds, 500);
+  const [stationStats, setStationStats] = useState<StationStats | null>(null);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState<string | null>(null);
+  const [restoringUrlState, setRestoringUrlState] = useState(true);
+  const [preserveUrlViewport, setPreserveUrlViewport] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
   const mapCandidates = query.mode === "route" ? results.candidates : [];
   const activeStationId = selectedStationId;
@@ -147,6 +203,136 @@ export function RoutePlannerShell({
     detail?.stationId === activeStationId ? detail : null;
   const showRouteCandidatesUi = query.mode === "route";
   const globalLoading = routeLoading || resultsLoading;
+
+  useEffect(() => {
+    let ignore = false;
+
+    window.queueMicrotask(() => {
+      if (ignore) {
+        return;
+      }
+
+      const urlState = readRoutePlannerUrlState();
+
+      if (!urlState) {
+        setRestoringUrlState(false);
+        return;
+      }
+
+      autoLocatedRef.current = true;
+      manualSearchRef.current = true;
+      setInitialUrlState(urlState);
+      setQuery({
+        mode: urlState.mode,
+        origin: urlState.route?.origin ?? defaultQuery.origin,
+        originLabel: urlState.route?.originLabel ?? defaultQuery.origin,
+        destination: urlState.route?.destination ?? defaultQuery.destination,
+        destinationLabel: urlState.route?.destinationLabel ?? defaultQuery.destination,
+        location: urlState.location ? `${urlState.location.lat}, ${urlState.location.lng}` : "",
+        locationLabel: urlState.location?.label ?? "",
+      });
+      setMapMode(urlState.style);
+      setFilters(urlState.filters);
+      setSelectedStationId(urlState.stationId);
+      setDetail(null);
+      setDetailOpen(Boolean(urlState.stationId));
+      setMapViewport(urlState.mapViewport);
+      setPreserveUrlViewport(Boolean(urlState.mapViewport));
+      setPendingCandidateAutoOpen(urlState.mode === "route");
+    });
+
+    return () => {
+      ignore = true;
+    };
+  }, [defaultQuery.destination, defaultQuery.origin]);
+
+  useEffect(() => {
+    if (!initialUrlState) {
+      return;
+    }
+
+    let ignore = false;
+    const urlState = initialUrlState;
+
+    async function restoreFromUrl() {
+      setRouteLoading(true);
+      setError(null);
+      setCandidatesOpen(false);
+
+      try {
+        const nextRoute =
+          urlState.mode === "location" && urlState.location
+            ? await fetchLocationFocus(
+                `${urlState.location.lat}, ${urlState.location.lng}`,
+              )
+            : urlState.route
+              ? await fetchRoutePlan({
+                  origin: urlState.route.origin,
+                  destination: urlState.route.destination,
+                  profile: "auto",
+                })
+              : null;
+
+        if (ignore || !nextRoute) {
+          return;
+        }
+
+        setRoute(nextRoute);
+        setSelectedStationId(urlState.stationId);
+        setDetail(null);
+        setDetailOpen(Boolean(urlState.stationId));
+        setPendingCandidateAutoOpen(urlState.mode === "route");
+      } catch (caught) {
+        if (!ignore) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : "Gespeicherter Zustand konnte nicht geladen werden.",
+          );
+          setPreserveUrlViewport(false);
+        }
+      } finally {
+        if (!ignore) {
+          setRestoringUrlState(false);
+          setRouteLoading(false);
+        }
+      }
+    }
+
+    void restoreFromUrl();
+
+    return () => {
+      ignore = true;
+    };
+  }, [initialUrlState]);
+
+  useEffect(() => {
+    if (restoringUrlState) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      writeRoutePlannerUrlState({
+        mode: query.mode,
+        filters: effectiveFilters(filters, query.mode),
+        mapViewport,
+        style: mapMode,
+        stationId: selectedStationId,
+        location: {
+          query: query.location,
+          label: query.locationLabel,
+        },
+        route: {
+          origin: query.origin,
+          originLabel: query.originLabel,
+          destination: query.destination,
+          destinationLabel: query.destinationLabel,
+        },
+      });
+    }, 350);
+
+    return () => window.clearTimeout(timeout);
+  }, [filters, mapMode, mapViewport, query, restoringUrlState, selectedStationId]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -161,6 +347,10 @@ export function RoutePlannerShell({
   }, []);
 
   useEffect(() => {
+    if (restoringUrlState) {
+      return;
+    }
+
     let ignore = false;
 
     async function updateCandidates() {
@@ -203,39 +393,53 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, showRouteCandidatesUi]);
+  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, restoringUrlState, showRouteCandidatesUi]);
 
   useEffect(() => {
-    if (!mapBounds) {
+    if (restoringUrlState || !debouncedMapBounds) {
       return;
     }
 
+    const bounds = debouncedMapBounds;
+    const controller = new AbortController();
     let ignore = false;
-    const currentBounds = mapBounds;
 
-    async function updateBrowseStations() {
+    async function updateStationStats() {
+      setStatsLoading(true);
+      setStatsError(null);
+
       try {
-        const next = await fetchMapStations({
-          bounds: currentBounds,
+        const next = await fetchStationStats({
+          bounds,
           filters: effectiveFilters(debouncedFilters, query.mode),
+          signal: controller.signal,
         });
 
         if (!ignore) {
-          setBrowseCandidates(next);
+          setStationStats(next);
         }
-      } catch {
-        if (!ignore) {
-          setBrowseCandidates([]);
+      } catch (caught) {
+        if (!ignore && !controller.signal.aborted) {
+          setStatsError(
+            caught instanceof Error
+              ? caught.message
+              : "Statistik konnte nicht geladen werden.",
+          );
+        }
+      } finally {
+        if (!ignore && !controller.signal.aborted) {
+          setStatsLoading(false);
         }
       }
     }
 
-    void updateBrowseStations();
+    void updateStationStats();
 
     return () => {
       ignore = true;
+      controller.abort();
     };
-  }, [mapBounds, debouncedFilters, query.mode, refreshTick]);
+  }, [debouncedFilters, debouncedMapBounds, query.mode, refreshTick, restoringUrlState]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -277,7 +481,7 @@ export function RoutePlannerShell({
   }, [activeStationId]);
 
   useEffect(() => {
-    if (autoLocatedRef.current) {
+    if (restoringUrlState || autoLocatedRef.current) {
       return;
     }
 
@@ -383,13 +587,22 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [restoringUrlState]);
+
+  function handleViewportChange(state: {
+    bounds: MapBounds;
+    viewport: StoredMapViewport;
+  }) {
+    setMapBounds(state.bounds);
+    setMapViewport(state.viewport);
+  }
 
   async function handleRoutePlan() {
     setRouteLoading(true);
     setError(null);
     setCandidatesOpen(false);
     setPendingCandidateAutoOpen(true);
+    setPreserveUrlViewport(false);
 
     try {
       const nextRoute =
@@ -405,6 +618,23 @@ export function RoutePlannerShell({
       setSelectedStationId(null);
       setDetail(null);
       setDetailOpen(false);
+      writeRoutePlannerUrlState({
+        mode: query.mode,
+        filters: effectiveFilters(filters, query.mode),
+        mapViewport,
+        style: mapMode,
+        stationId: null,
+        location: {
+          query: query.location,
+          label: query.locationLabel,
+        },
+        route: {
+          origin: query.origin,
+          originLabel: query.originLabel,
+          destination: query.destination,
+          destinationLabel: query.destinationLabel,
+        },
+      });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Route konnte nicht geplant werden.");
       setPendingCandidateAutoOpen(false);
@@ -432,11 +662,14 @@ export function RoutePlannerShell({
           route={route}
           candidates={mapCandidates}
           browseCandidates={browseCandidates}
+          filters={effectiveFilters(debouncedFilters, query.mode)}
           selectedStationId={activeStationId}
           hoveredStationId={hoveredStationId}
           onSelect={handleSelectStation}
-          onViewportChange={setMapBounds}
+          onViewportChange={handleViewportChange}
           mapMode={mapMode}
+          initialViewport={initialUrlState?.mapViewport ?? null}
+          preserveViewport={preserveUrlViewport}
           candidatesOpen={showRouteCandidatesUi && candidatesOpen}
         />
       </div>
@@ -493,6 +726,165 @@ export function RoutePlannerShell({
             </div>
           </motion.div>
         )}
+      </AnimatePresence>
+
+      {/* Map Statistics */}
+      <div className="pointer-events-none absolute right-4 top-16 z-20 flex justify-end sm:top-16">
+        <button
+          type="button"
+          onClick={() => setStatsOpen((current) => !current)}
+          className="glass-panel-strong pointer-events-auto flex min-h-11 max-w-[calc(100vw-2rem)] items-center gap-2 rounded-full px-4 py-2 text-sm font-medium text-[var(--foreground)] shadow-2xl transition hover:bg-white/90"
+          title="Statistik öffnen"
+          aria-expanded={statsOpen}
+        >
+          {statsLoading ? (
+            <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-[var(--accent)]" />
+          ) : statsError ? (
+            <AlertTriangle className="h-4 w-4 shrink-0 text-[#9c4110]" />
+          ) : (
+            <BarChart3 className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+          )}
+          <span className="whitespace-nowrap">
+            {stationStats
+              ? `${integerLabel(stationStats.stationCount)} Standorte · ${integerLabel(
+                  stationStats.chargePointCount,
+                )} Ladepunkte`
+              : "Statistik"}
+          </span>
+        </button>
+      </div>
+
+      <AnimatePresence>
+        {statsOpen ? (
+          <motion.aside
+            initial={{ y: -12, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: -12, opacity: 0 }}
+            className="pointer-events-auto absolute right-4 top-32 z-30 flex max-h-[calc(100vh-9rem)] w-[min(25rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong"
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
+              <div>
+                <p className="metric-label mb-2">Gefilterter Kartenausschnitt</p>
+                <h2 className="font-[var(--font-heading)] text-2xl font-semibold">
+                  Statistik
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStatsOpen(false)}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/75 text-[var(--muted)] transition hover:bg-white hover:text-[var(--foreground)]"
+                aria-label="Statistik schließen"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="scroll-shadow flex-1 overflow-auto px-5 py-4">
+              {statsError ? (
+                <div className="mb-4 rounded-[20px] border border-[#f0c28b] bg-[#fff7ed] px-4 py-3 text-sm text-[#9c4110]">
+                  {statsError}
+                </div>
+              ) : null}
+
+              {stationStats ? (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
+                      <p className="metric-label mb-2">Standorte</p>
+                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
+                        {integerLabel(stationStats.stationCount)}
+                      </p>
+                    </div>
+                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
+                      <p className="metric-label mb-2">Ladepunkte</p>
+                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
+                        {integerLabel(stationStats.chargePointCount)}
+                      </p>
+                    </div>
+                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
+                      <p className="metric-label mb-2">Frei</p>
+                      <p className="font-[var(--font-heading)] text-3xl font-semibold text-[var(--accent)]">
+                        {integerLabel(stationStats.availableChargePointCount)}
+                      </p>
+                    </div>
+                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
+                      <p className="metric-label mb-2">Max. Leistung</p>
+                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
+                        {stationStats.maxPowerKw == null
+                          ? "-"
+                          : `${integerLabel(Math.round(stationStats.maxPowerKw))} kW`}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-2 text-sm text-[var(--muted)] sm:grid-cols-2">
+                    <p className="flex items-center gap-2 rounded-full bg-white/70 px-3 py-2">
+                      <PlugZap className="h-4 w-4 text-[var(--accent)]" />
+                      AC {integerLabel(stationStats.currentTypeCounts.ac)} · DC{" "}
+                      {integerLabel(stationStats.currentTypeCounts.dc)}
+                    </p>
+                    <p className="flex items-center gap-2 rounded-full bg-white/70 px-3 py-2">
+                      <Zap className="h-4 w-4 text-[var(--accent)]" />
+                      HPC {integerLabel(stationStats.currentTypeCounts.hpc)}
+                    </p>
+                    <p className="rounded-full bg-white/70 px-3 py-2">
+                      Preis {priceBandLabel(stationStats)}
+                    </p>
+                    <p className="rounded-full bg-white/70 px-3 py-2">
+                      {completePriceLabel(stationStats)}
+                    </p>
+                  </div>
+
+                  <div className="mt-6">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <h3 className="font-[var(--font-heading)] text-lg font-semibold">
+                        Anbieter
+                      </h3>
+                      <span className="text-sm text-[var(--muted)]">
+                        {integerLabel(stationStats.providerList.length)}
+                      </span>
+                    </div>
+                    <div className="space-y-2">
+                      {stationStats.providerList.length === 0 ? (
+                        <div className="rounded-[22px] border border-dashed border-[var(--line)] bg-white/60 p-5 text-sm text-[var(--muted)]">
+                          Keine Anbieter im aktuellen Ausschnitt.
+                        </div>
+                      ) : null}
+
+                      {stationStats.providerList.map((provider) => (
+                        <div
+                          key={provider.cpoId}
+                          className="flex items-center justify-between gap-3 rounded-[22px] border border-[var(--line)] bg-white/75 px-4 py-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="truncate font-medium text-[var(--foreground)]">
+                              {provider.cpoName}
+                            </p>
+                            <p className="mt-1 flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                              <Building2 className="h-3.5 w-3.5" />
+                              {integerLabel(provider.stations)} Standorte
+                            </p>
+                          </div>
+                          <div className="shrink-0 text-right">
+                            <p className="font-[var(--font-heading)] text-xl font-semibold">
+                              {integerLabel(provider.chargePoints)}
+                            </p>
+                            <p className="text-xs text-[var(--muted)]">Ladepunkte</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="flex items-center gap-3 rounded-[22px] border border-[var(--line)] bg-white/70 p-5 text-sm text-[var(--muted)]">
+                  <LoaderCircle className="h-4 w-4 animate-spin text-[var(--accent)]" />
+                  Statistik wird geladen...
+                </div>
+              )}
+            </div>
+          </motion.aside>
+        ) : null}
       </AnimatePresence>
 
       {/* Map Style Switcher */}

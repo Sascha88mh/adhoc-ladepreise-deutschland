@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { findCandidatesForRoute, planRoute, type StationRecord } from "../src/index";
+import {
+  findCandidatesForRoute,
+  findStationsInView,
+  planRoute,
+  summarizeStationStats,
+  type StationRecord,
+} from "../src/index";
 
 const TEST_STATIONS: StationRecord[] = [
   {
@@ -187,6 +193,70 @@ describe("route candidate selection", () => {
     ).toBe(true);
   });
 
+  it("uses only tariffs from the selected power tier for price filters", async () => {
+    const route = await planRoute("52.520008,13.404954", "53.551086,9.993682", "auto");
+    const mixedPowerStation: StationRecord = {
+      ...TEST_STATIONS[0],
+      stationId: "mixed-power-prices",
+      maxPowerKw: 300,
+      tariffs: [
+        {
+          id: "charge_point|DE*LOW*1|adHoc",
+          label: "Low power direct",
+          currency: "EUR",
+          scope: "charge_point",
+          chargePointCode: "DE*LOW*1",
+          chargePointCurrentType: "AC",
+          chargePointMaxPowerKw: 22,
+          pricePerKwh: 0.39,
+          pricePerMinute: null,
+          sessionFee: null,
+          preauthAmount: null,
+          blockingFeePerMinute: null,
+          blockingFeeStartsAfterMinutes: null,
+          caps: [],
+          paymentMethods: ["emv", "website"],
+          brandsAccepted: [],
+          isComplete: true,
+        },
+        {
+          id: "charge_point|DE*HPC*1|adHoc",
+          label: "HPC direct",
+          currency: "EUR",
+          scope: "charge_point",
+          chargePointCode: "DE*HPC*1",
+          chargePointCurrentType: "DC",
+          chargePointMaxPowerKw: 300,
+          pricePerKwh: 0.79,
+          pricePerMinute: null,
+          sessionFee: null,
+          preauthAmount: null,
+          blockingFeePerMinute: null,
+          blockingFeeStartsAfterMinutes: null,
+          caps: [],
+          paymentMethods: ["emv", "website"],
+          brandsAccepted: [],
+          isComplete: true,
+        },
+      ],
+    };
+
+    const tooCheapForHpc = findCandidatesForRoute(route, {
+      currentTypes: ["DC"],
+      minPowerKw: 100,
+      maxPriceKwh: 0.5,
+    }, [mixedPowerStation]);
+    const matchingHpcPrice = findCandidatesForRoute(route, {
+      currentTypes: ["DC"],
+      minPowerKw: 100,
+      maxPriceKwh: 0.8,
+    }, [mixedPowerStation]);
+
+    expect(tooCheapForHpc.candidates).toHaveLength(0);
+    expect(matchingHpcPrice.candidates).toHaveLength(1);
+    expect(matchingHpcPrice.candidates[0].tariffSummary.pricePerKwh).toBe(0.79);
+  });
+
   it("maps public payment categories to the underlying tariff methods", async () => {
     const route = await planRoute("52.520008,13.404954", "53.551086,9.993682", "auto");
     const result = findCandidatesForRoute(route, {
@@ -216,6 +286,52 @@ describe("route candidate selection", () => {
 
     expect(wide.candidates.length).toBeGreaterThan(0);
     expect(narrow.candidates.length).toBeLessThanOrEqual(wide.candidates.length);
+  });
+
+  it("keeps stations with unknown power from crashing candidate mapping", async () => {
+    const route = await planRoute("52.520008,13.404954", "53.551086,9.993682", "auto");
+    const zeroPowerStation: StationRecord = {
+      ...TEST_STATIONS[0],
+      stationId: "unknown-power",
+      maxPowerKw: 0,
+    };
+
+    const result = findCandidatesForRoute(route, {
+      maxPriceKwh: 0.55,
+    }, [zeroPowerStation]);
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0].maxPowerKw).toBe(0);
+  });
+
+  it("summarizes filtered map stations by provider and charging characteristics", () => {
+    const candidates = findStationsInView(
+      {
+        minLat: 52,
+        minLng: 9,
+        maxLat: 54,
+        maxLng: 14,
+      },
+      {
+        maxPriceKwh: 0.7,
+      },
+      TEST_STATIONS,
+    );
+
+    const stats = summarizeStationStats(candidates);
+
+    expect(stats.stationCount).toBe(3);
+    expect(stats.chargePointCount).toBe(18);
+    expect(stats.availableChargePointCount).toBe(11);
+    expect(stats.maxPowerKw).toBe(350);
+    expect(stats.currentTypeCounts).toEqual({ ac: 0, dc: 3, hpc: 3 });
+    expect(stats.priceBand).toEqual({ min: 0.49, max: 0.69 });
+    expect(stats.completePriceShare).toBe(1);
+    expect(stats.providerList).toEqual([
+      { cpoId: "ionity", cpoName: "IONITY", stations: 1, chargePoints: 8 },
+      { cpoId: "mer", cpoName: "Mer Germany", stations: 1, chargePoints: 6 },
+      { cpoId: "enbw", cpoName: "EnBW", stations: 1, chargePoints: 4 },
+    ]);
   });
 
   it("fails clearly for truck routing without Valhalla", async () => {

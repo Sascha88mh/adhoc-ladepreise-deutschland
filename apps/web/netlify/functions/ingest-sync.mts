@@ -3,7 +3,7 @@ import type { Config } from "@netlify/functions";
 const handler = async (request: Request) => {
   const startedAt = Date.now();
   const body = (await request.json().catch(() => ({}))) as { next_run?: string };
-  const target = new URL("/api/internal/ingest-sync", request.url);
+  const target = new URL("/.netlify/functions/ingest-sync-background", request.url);
 
   const response = await fetch(target, {
     method: "POST",
@@ -11,12 +11,16 @@ const handler = async (request: Request) => {
     body: JSON.stringify({ next_run: body.next_run ?? null }),
   });
 
-  const responseBody = await response.text();
-  return new Response(responseBody, {
+  return new Response(JSON.stringify({
+    ok: true,
+    accepted: response.ok,
+    nextRun: body.next_run ?? null,
+    durationMs: Date.now() - startedAt,
     status: response.status,
+  }), {
+    status: response.ok ? 202 : 500,
     headers: {
-      "content-type": response.headers.get("content-type") ?? "application/json",
-      "x-proxy-duration-ms": String(Date.now() - startedAt),
+      "content-type": "application/json",
     },
   });
 };

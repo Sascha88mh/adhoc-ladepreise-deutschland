@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, useTransition, type ReactNode } from "rea
 import { Database, Activity, MapPin, Search, HardDrive, Edit2, X, RotateCcw, Save, Trash2 } from "lucide-react";
 import type { AdminStationRecord, FeedConfig, SyncRun } from "@adhoc/shared";
 import {
+  type AdminFeedFilters,
   cleanupStuckSyncRuns,
   createAdminFeed,
   deleteAdminFeed,
@@ -52,6 +53,14 @@ type FeedActionState = {
   label: string;
 };
 
+type FeedFilterState = {
+  query: string;
+  type: "" | FeedConfig["type"];
+  mode: "" | FeedConfig["mode"];
+  isActive: "" | "true" | "false";
+  ingest: "" | "catalog" | "prices" | "status";
+};
+
 const EMPTY_FORM: FeedFormState = {
   source: "mobilithek",
   cpoId: "",
@@ -69,6 +78,14 @@ const EMPTY_FORM: FeedFormState = {
   credentialRef: "",
   webhookSecretRef: "",
   notes: "",
+};
+
+const EMPTY_FEED_FILTERS: FeedFilterState = {
+  query: "",
+  type: "",
+  mode: "",
+  isActive: "",
+  ingest: "",
 };
 
 const FEED_FIELD_DESCRIPTIONS = {
@@ -127,9 +144,67 @@ function formatRelativeMinutes(value: string | null) {
   return `vor ${diffDays} Tag${diffDays === 1 ? "" : "en"}`;
 }
 
+function formatBytes(value: number | null | undefined) {
+  if (value == null) {
+    return null;
+  }
+
+  if (value >= 1024 * 1024) {
+    return `${Math.round(value / 1024 / 1024)} MB`;
+  }
+
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)} KB`;
+  }
+
+  return `${value} B`;
+}
+
+function progressText(run: SyncRun | undefined) {
+  if (!run) {
+    return null;
+  }
+
+  const parts = [
+    run.progressStage,
+    run.progressDetail,
+    run.totalCount != null && run.processedCount != null
+      ? `${run.processedCount}/${run.totalCount}`
+      : null,
+    formatBytes(run.payloadSizeBytes),
+    run.heartbeatAt ? `Heartbeat ${formatRelativeMinutes(run.heartbeatAt)}` : null,
+  ].filter(Boolean);
+
+  return parts.length ? parts.join(" · ") : null;
+}
+
 function parseNullableText(value: string) {
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function adminFeedFilters(filters: FeedFilterState): AdminFeedFilters {
+  return {
+    query: parseNullableText(filters.query) ?? undefined,
+    type: filters.type || undefined,
+    mode: filters.mode || undefined,
+    isActive:
+      filters.isActive === "true" ? true : filters.isActive === "false" ? false : undefined,
+    ingestCatalog: filters.ingest === "catalog" ? true : undefined,
+    ingestPrices: filters.ingest === "prices" ? true : undefined,
+    ingestStatus: filters.ingest === "status" ? true : undefined,
+    sort: "nameAsc",
+  };
+}
+
+function activeFeedFilterCount(filters: FeedFilterState) {
+  return [
+    parseNullableText(filters.query),
+    filters.type,
+    filters.mode,
+    filters.isActive,
+    filters.ingest,
+  ].filter(Boolean).length;
 }
 
 function parseNullableInt(value: string) {
@@ -162,6 +237,8 @@ function statusTone(status: SyncRun["status"]) {
       return "bg-[#f8e1da] text-[#9a3f1b]";
     case "running":
       return "bg-[#efe7cb] text-[#7a5f00]";
+    case "queued":
+      return "bg-[#dbeafe] text-[#1d4ed8]";
     default:
       return "bg-[var(--accent-soft)] text-[var(--accent)]";
   }
@@ -188,6 +265,14 @@ function healthForFeed(feed: FeedConfig, latestRun: SyncRun | undefined): FeedHe
     return {
       label: "läuft",
       tone: "bg-[#efe7cb] text-[#7a5f00]",
+      detail: latestRun.message,
+    };
+  }
+
+  if (latestRun?.status === "queued") {
+    return {
+      label: "wartet",
+      tone: "bg-[#dbeafe] text-[#1d4ed8]",
       detail: latestRun.message,
     };
   }
@@ -590,6 +675,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
   const [stationError, setStationError] = useState<string | null>(null);
   const [overrideBusy, setOverrideBusy] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"feeds" | "runs" | "overrides">("feeds");
+  const [feedFilters, setFeedFilters] = useState<FeedFilterState>(EMPTY_FEED_FILTERS);
   const [feedActions, setFeedActions] = useState<Record<string, FeedActionState>>({});
   const [, startTransition] = useTransition();
 
@@ -607,7 +693,8 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
 
   const selectedStation =
     stationResults.find((station) => station.stationId === selectedStationId) ?? null;
-  const hasRunningRuns = syncRuns.some((run) => run.status === "running");
+  const hasActiveRuns = syncRuns.some((run) => run.status === "queued" || run.status === "running");
+  const feedFilterCount = activeFeedFilterCount(feedFilters);
 
   useEffect(() => {
     const timer = window.setTimeout(async () => {
@@ -630,13 +717,35 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
   }, [selectedStationId, startTransition, stationQuery]);
 
   useEffect(() => {
-    if (!hasRunningRuns) {
+    if (activeTab !== "feeds") {
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const nextFeeds = await fetchAdminFeeds(adminFeedFilters(feedFilters));
+        startTransition(() => {
+          setFeeds(nextFeeds);
+        });
+      } catch (error) {
+        setUiError(error instanceof Error ? error.message : "Feeds konnten nicht geladen werden.");
+      }
+    }, 250);
+
+    return () => window.clearTimeout(timer);
+  }, [activeTab, feedFilters, startTransition]);
+
+  useEffect(() => {
+    if (!hasActiveRuns) {
       return;
     }
 
     const interval = window.setInterval(async () => {
       try {
-        const [nextFeeds, nextRuns] = await Promise.all([fetchAdminFeeds(), fetchSyncRuns()]);
+        const [nextFeeds, nextRuns] = await Promise.all([
+          fetchAdminFeeds(adminFeedFilters(feedFilters)),
+          fetchSyncRuns(),
+        ]);
         setFeeds(nextFeeds);
         setSyncRuns(nextRuns);
       } catch (error) {
@@ -645,7 +754,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
     }, 2500);
 
     return () => window.clearInterval(interval);
-  }, [hasRunningRuns]);
+  }, [feedFilters, hasActiveRuns]);
 
   function setFeedAction(feedId: string, action: FeedActionState | null) {
     setFeedActions((current) => {
@@ -663,7 +772,10 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
   }
 
   async function refreshAdminData() {
-    const [nextFeeds, nextRuns] = await Promise.all([fetchAdminFeeds(), fetchSyncRuns()]);
+    const [nextFeeds, nextRuns] = await Promise.all([
+      fetchAdminFeeds(adminFeedFilters(feedFilters)),
+      fetchSyncRuns(),
+    ]);
     setFeeds(nextFeeds);
     setSyncRuns(nextRuns);
   }
@@ -717,6 +829,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
       setFeeds((current) =>
         current.map((entry) => (entry.id === updated.id ? updated : entry)),
       );
+      await refreshAdminData();
     } catch (error) {
       setUiError(error instanceof Error ? error.message : "Feed konnte nicht gespeichert werden.");
     } finally {
@@ -749,7 +862,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
       const run = await triggerFeedAction(feedId, action);
       setSyncRuns((current) => [run, ...current.filter((entry) => entry.id !== run.id)]);
 
-      if (run.status === "running") {
+      if (run.status === "running" || run.status === "queued") {
         await refreshAdminData();
       } else {
         try {
@@ -895,7 +1008,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
         >
           <Activity className="h-4 w-4" />
           Sync Läufe
-          {hasRunningRuns && (
+          {hasActiveRuns && (
              <span className="ml-auto flex h-2 w-2 rounded-full bg-[#f59e0b] animate-pulse" />
           )}
         </button>
@@ -1186,6 +1299,86 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
           </div>
         </div>
 
+        <div className="mb-4 grid gap-3 lg:grid-cols-[minmax(220px,1.4fr)_repeat(4,minmax(120px,0.7fr))_auto]">
+          <label className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              value={feedFilters.query}
+              onChange={(event) =>
+                setFeedFilters((current) => ({ ...current, query: event.target.value }))
+              }
+              placeholder="Feed suchen"
+              className="h-11 w-full rounded-[14px] border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+            />
+          </label>
+          <select
+            value={feedFilters.type}
+            onChange={(event) =>
+              setFeedFilters((current) => ({
+                ...current,
+                type: event.target.value as FeedFilterState["type"],
+              }))
+            }
+            className="h-11 rounded-[14px] border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="">Alle Typen</option>
+            <option value="dynamic">dynamic</option>
+            <option value="static">static</option>
+          </select>
+          <select
+            value={feedFilters.mode}
+            onChange={(event) =>
+              setFeedFilters((current) => ({
+                ...current,
+                mode: event.target.value as FeedFilterState["mode"],
+              }))
+            }
+            className="h-11 rounded-[14px] border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="">Alle Modi</option>
+            <option value="push">push</option>
+            <option value="pull">pull</option>
+            <option value="hybrid">hybrid</option>
+          </select>
+          <select
+            value={feedFilters.isActive}
+            onChange={(event) =>
+              setFeedFilters((current) => ({
+                ...current,
+                isActive: event.target.value as FeedFilterState["isActive"],
+              }))
+            }
+            className="h-11 rounded-[14px] border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="">Alle Status</option>
+            <option value="true">Aktiv</option>
+            <option value="false">Inaktiv</option>
+          </select>
+          <select
+            value={feedFilters.ingest}
+            onChange={(event) =>
+              setFeedFilters((current) => ({
+                ...current,
+                ingest: event.target.value as FeedFilterState["ingest"],
+              }))
+            }
+            className="h-11 rounded-[14px] border border-slate-200 bg-white px-3 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)]"
+          >
+            <option value="">Alle Ingests</option>
+            <option value="catalog">Catalog</option>
+            <option value="prices">Preise</option>
+            <option value="status">Status</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => setFeedFilters(EMPTY_FEED_FILTERS)}
+            disabled={feedFilterCount === 0}
+            className="h-11 rounded-[14px] border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:opacity-50"
+          >
+            Zurücksetzen
+          </button>
+        </div>
+
         <div className="overflow-hidden rounded-[26px] border shadow-sm border-slate-200 bg-white">
           <div className="hidden gap-3 border-b border-slate-100 bg-slate-50/80 px-5 py-3.5 text-[11px] font-bold uppercase tracking-[0.2em] text-slate-500 lg:grid lg:grid-cols-[minmax(0,1.6fr)_minmax(0,0.8fr)_minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,1.2fr)_300px]">
             <span className="px-2">Feed</span>
@@ -1197,12 +1390,19 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
           </div>
 
           <div className="divide-y divide-slate-100">
+            {feeds.length === 0 ? (
+              <div className="px-5 py-10 text-center text-sm text-[var(--muted)]">
+                {feedFilterCount > 0
+                  ? "Keine Feeds passen zu den aktuellen Filtern."
+                  : "Noch keine Feeds angelegt."}
+              </div>
+            ) : null}
             {feeds.map((feed) => {
               const latestRun = runsByFeed[feed.id]?.[0];
               const health = healthForFeed(feed, latestRun);
               const isExpanded = expandedFeedId === feed.id;
               const busy = feedActions[feed.id] ?? null;
-              const actionStatusText = busy?.label ?? latestRun?.message ?? health.detail;
+              const actionStatusText = busy?.label ?? progressText(latestRun) ?? latestRun?.message ?? health.detail;
               const latestRunLabel = latestRun?.status ?? health.label;
               const latestRunTone = latestRun ? statusTone(latestRun.status) : health.tone;
 
@@ -1345,7 +1545,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
               </h2>
             </div>
             <div className="flex items-center gap-3">
-              {hasRunningRuns ? (
+              {hasActiveRuns ? (
                 <div className="rounded-full bg-[#fff8df] px-3 py-2 text-sm text-[#7a5f00]">
                   <ActionSpinner />
                 </div>
@@ -1373,15 +1573,18 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
                     <p className="text-xs text-[var(--muted)]">{run.feedId}</p>
                   </div>
                   <span className={`rounded-full px-3 py-1 text-xs ${statusTone(run.status)}`}>
-                    {run.status === "running" ? <ActionSpinner /> : run.status}
+                    {run.status === "running" ? <ActionSpinner /> : run.status === "queued" ? "wartet" : run.status}
                   </span>
                 </div>
                 <p className="text-sm text-slate-700">{run.message}</p>
+                {progressText(run) ? (
+                  <p className="mt-1 text-xs text-slate-500">{progressText(run)}</p>
+                ) : null}
                 <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
                   <span>{new Date(run.startedAt).toLocaleString("de-DE")}</span>
                   <div className="flex items-center gap-3">
                     <span>Delta {run.deltaCount}</span>
-                    {run.status === "running" ? (
+                    {run.status === "running" || run.status === "queued" ? (
                       <button
                         type="button"
                         onClick={() => void handleTerminate(run.feedId)}
