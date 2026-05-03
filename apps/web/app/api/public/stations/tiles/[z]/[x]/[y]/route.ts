@@ -1,7 +1,7 @@
 import { loadStationMapTileDb, usingDatabase } from "@adhoc/shared/db";
 
 const TILE_CACHE_CONTROL =
-  "public, max-age=60, s-maxage=120, stale-while-revalidate=300";
+  "public, max-age=120, s-maxage=300, stale-while-revalidate=600";
 const MVT_CONTENT_TYPE = "application/vnd.mapbox-vector-tile";
 const MAX_TILE_ZOOM = 16;
 

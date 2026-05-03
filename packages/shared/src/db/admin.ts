@@ -391,9 +391,9 @@ export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
   const running = await executor.query<{ id: string }>(
     `with stale as (
        select id
-         from sync_runs
+        from sync_runs
         where status = 'running'
-          and started_at < now() - interval '5 minutes'
+          and coalesce(heartbeat_at, started_at) < now() - interval '15 minutes'
         for update skip locked
      )
      update sync_runs
@@ -401,7 +401,7 @@ export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
             finished_at = now(),
             message = 'Abgebrochen (Timeout)',
             progress_stage = 'failed',
-            progress_detail = 'Timeout-Cleanup nach 5 Minuten',
+            progress_detail = 'Timeout-Cleanup nach 15 Minuten',
             heartbeat_at = now()
        from stale
       where sync_runs.id = stale.id

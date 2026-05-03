@@ -1,5 +1,7 @@
 import { loadStationDetail } from "@/lib/server/public-api";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
@@ -11,5 +13,12 @@ export async function GET(
     return Response.json({ error: "Station not found" }, { status: 404 });
   }
 
-  return Response.json({ data: detail });
+  return Response.json(
+    { data: detail },
+    {
+      headers: {
+        "cache-control": "no-store",
+      },
+    },
+  );
 }

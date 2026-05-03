@@ -3,16 +3,10 @@
 import dynamic from "next/dynamic";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  AlertTriangle,
-  BarChart3,
-  Building2,
   LoaderCircle,
   PanelRightClose,
   PanelRightOpen,
   Layers,
-  PlugZap,
-  X,
-  Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type {
@@ -20,7 +14,6 @@ import type {
   RouteCandidate,
   RoutePlan,
   StationDetail,
-  StationStats,
 } from "@adhoc/shared";
 import {
   fetchLocationFocus,
@@ -29,7 +22,6 @@ import {
   fetchRouteCandidates,
   fetchRoutePlan,
   fetchStationDetail,
-  fetchStationStats,
 } from "@/lib/client/api";
 import {
   readRoutePlannerUrlState,
@@ -69,56 +61,12 @@ const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
   { id: "satellite", label: "Satellit" },
 ];
 const EMPTY_BROWSE_CANDIDATES: RouteCandidate[] = [];
-const MIN_AUTO_STATS_ZOOM = 9;
-const MAX_AUTO_STATS_LAT_SPAN = 1.6;
-const MAX_AUTO_STATS_LNG_SPAN = 2.6;
 
 function mapTheme(): CSSProperties {
   return {
     "--accent-fg": "#ffffff",
     "--glass-border": "var(--line)",
   } as CSSProperties;
-}
-
-function integerLabel(value: number) {
-  return new Intl.NumberFormat("de-DE").format(value);
-}
-
-function priceBandLabel(stats: StationStats) {
-  if (stats.priceBand.min == null || stats.priceBand.max == null) {
-    return "offen";
-  }
-
-  if (stats.priceBand.min === stats.priceBand.max) {
-    return `${stats.priceBand.min.toFixed(2).replace(".", ",")} €/kWh`;
-  }
-
-  return `${stats.priceBand.min.toFixed(2).replace(".", ",")} - ${stats.priceBand.max
-    .toFixed(2)
-    .replace(".", ",")} €/kWh`;
-}
-
-function completePriceLabel(stats: StationStats) {
-  if (stats.completePriceShare == null) {
-    return "keine Preise";
-  }
-
-  return `${Math.round(stats.completePriceShare * 100)}% komplett`;
-}
-
-function canAutoLoadStats(bounds: MapBounds | null, viewport: StoredMapViewport | null) {
-  if (!bounds || !viewport) {
-    return false;
-  }
-
-  const latSpan = Math.abs(bounds.maxLat - bounds.minLat);
-  const lngSpan = Math.abs(bounds.maxLng - bounds.minLng);
-
-  return (
-    viewport.zoom >= MIN_AUTO_STATS_ZOOM &&
-    latSpan <= MAX_AUTO_STATS_LAT_SPAN &&
-    lngSpan <= MAX_AUTO_STATS_LNG_SPAN
-  );
 }
 
 type Props = {
@@ -202,16 +150,9 @@ export function RoutePlannerShell({
   const manualSearchRef = useRef(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [mapViewport, setMapViewport] = useState<StoredMapViewport | null>(null);
-  const [mapBounds, setMapBounds] = useState<MapBounds | null>(null);
-  const debouncedMapBounds = useDebouncedValue(mapBounds, 500);
-  const [stationStats, setStationStats] = useState<StationStats | null>(null);
-  const [statsOpen, setStatsOpen] = useState(false);
-  const [statsLoading, setStatsLoading] = useState(false);
-  const [statsError, setStatsError] = useState<string | null>(null);
   const [restoringUrlState, setRestoringUrlState] = useState(true);
   const [preserveUrlViewport, setPreserveUrlViewport] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
-  const statsAutoLoad = canAutoLoadStats(mapBounds, mapViewport);
   const mapCandidates = query.mode === "route" ? results.candidates : [];
   const activeStationId = selectedStationId;
   const activeDetail =
@@ -411,81 +352,24 @@ export function RoutePlannerShell({
   }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, restoringUrlState, showRouteCandidatesUi]);
 
   useEffect(() => {
-    if (restoringUrlState || !debouncedMapBounds) {
-      return;
-    }
-
-    if (!statsOpen && !canAutoLoadStats(debouncedMapBounds, mapViewport)) {
-      return;
-    }
-
-    const bounds = debouncedMapBounds;
-    const controller = new AbortController();
-    let ignore = false;
-
-    async function updateStationStats() {
-      setStatsLoading(true);
-      setStatsError(null);
-
-      try {
-        const next = await fetchStationStats({
-          bounds,
-          filters: effectiveFilters(debouncedFilters, query.mode),
-          signal: controller.signal,
-        });
-
-        if (!ignore) {
-          setStationStats(next);
-        }
-      } catch (caught) {
-        if (!ignore && !controller.signal.aborted) {
-          setStatsError(
-            caught instanceof Error
-              ? caught.message
-              : "Statistik konnte nicht geladen werden.",
-          );
-        }
-      } finally {
-        if (!ignore && !controller.signal.aborted) {
-          setStatsLoading(false);
-        }
-      }
-    }
-
-    void updateStationStats();
-
-    return () => {
-      ignore = true;
-      controller.abort();
-    };
-  }, [
-    debouncedFilters,
-    debouncedMapBounds,
-    mapViewport,
-    query.mode,
-    refreshTick,
-    restoringUrlState,
-    statsOpen,
-  ]);
-
-  useEffect(() => {
     if (!activeStationId) {
       return;
     }
 
     let ignore = false;
+    const controller = new AbortController();
     const stationId = activeStationId;
 
     async function loadDetail() {
       setDetailLoading(true);
       setError(null);
       try {
-        const next = await fetchStationDetail(stationId);
+        const next = await fetchStationDetail(stationId, controller.signal);
         if (!ignore) {
           setDetail(next);
         }
       } catch (caught) {
-        if (!ignore) {
+        if (!ignore && !controller.signal.aborted) {
           setDetail(null);
           setError(
             caught instanceof Error
@@ -504,8 +388,9 @@ export function RoutePlannerShell({
 
     return () => {
       ignore = true;
+      controller.abort();
     };
-  }, [activeStationId]);
+  }, [activeStationId, refreshTick]);
 
   useEffect(() => {
     if (restoringUrlState || autoLocatedRef.current) {
@@ -620,7 +505,6 @@ export function RoutePlannerShell({
     bounds: MapBounds;
     viewport: StoredMapViewport;
   }) {
-    setMapBounds(state.bounds);
     setMapViewport(state.viewport);
   }
 
@@ -753,165 +637,6 @@ export function RoutePlannerShell({
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
-
-      {/* Map Statistics */}
-      <div className="pointer-events-none absolute right-5 top-[5.5rem] z-20 flex justify-end sm:right-4 sm:top-16">
-        <button
-          type="button"
-          onClick={() => setStatsOpen((current) => !current)}
-          className="glass-panel-strong pointer-events-auto flex h-11 w-11 items-center justify-center rounded-full text-sm font-medium text-[var(--foreground)] shadow-2xl transition hover:bg-white/90 sm:h-auto sm:w-auto sm:max-w-[calc(100vw-2rem)] sm:justify-start sm:gap-2 sm:px-4 sm:py-2"
-          title="Statistik öffnen"
-          aria-expanded={statsOpen}
-        >
-          {statsLoading ? (
-            <LoaderCircle className="h-4 w-4 shrink-0 animate-spin text-[var(--accent)]" />
-          ) : statsError ? (
-            <AlertTriangle className="h-4 w-4 shrink-0 text-[#9c4110]" />
-          ) : (
-            <BarChart3 className="h-4 w-4 shrink-0 text-[var(--accent)]" />
-          )}
-          <span className="hidden whitespace-nowrap sm:inline">
-            {stationStats && (statsAutoLoad || statsOpen)
-              ? `${integerLabel(stationStats.stationCount)} Standorte · ${integerLabel(
-                  stationStats.chargePointCount,
-                )} Ladepunkte`
-              : "Statistik"}
-          </span>
-        </button>
-      </div>
-
-      <AnimatePresence>
-        {statsOpen ? (
-          <motion.aside
-            initial={{ y: -12, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: -12, opacity: 0 }}
-            className="pointer-events-auto absolute right-4 top-36 z-30 flex max-h-[calc(100vh-10rem)] w-[min(25rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong sm:top-32 sm:max-h-[calc(100vh-9rem)]"
-          >
-            <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
-              <div>
-                <p className="metric-label mb-2">Gefilterter Kartenausschnitt</p>
-                <h2 className="font-[var(--font-heading)] text-2xl font-semibold">
-                  Statistik
-                </h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => setStatsOpen(false)}
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/75 text-[var(--muted)] transition hover:bg-white hover:text-[var(--foreground)]"
-                aria-label="Statistik schließen"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="scroll-shadow flex-1 overflow-auto px-5 py-4">
-              {statsError ? (
-                <div className="mb-4 rounded-[20px] border border-[#f0c28b] bg-[#fff7ed] px-4 py-3 text-sm text-[#9c4110]">
-                  {statsError}
-                </div>
-              ) : null}
-
-              {stationStats ? (
-                <>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
-                      <p className="metric-label mb-2">Standorte</p>
-                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
-                        {integerLabel(stationStats.stationCount)}
-                      </p>
-                    </div>
-                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
-                      <p className="metric-label mb-2">Ladepunkte</p>
-                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
-                        {integerLabel(stationStats.chargePointCount)}
-                      </p>
-                    </div>
-                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
-                      <p className="metric-label mb-2">Frei</p>
-                      <p className="font-[var(--font-heading)] text-3xl font-semibold text-[var(--accent)]">
-                        {integerLabel(stationStats.availableChargePointCount)}
-                      </p>
-                    </div>
-                    <div className="rounded-[22px] border border-[var(--line)] bg-white/75 p-4">
-                      <p className="metric-label mb-2">Max. Leistung</p>
-                      <p className="font-[var(--font-heading)] text-3xl font-semibold">
-                        {stationStats.maxPowerKw == null
-                          ? "-"
-                          : `${integerLabel(Math.round(stationStats.maxPowerKw))} kW`}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="mt-4 grid gap-2 text-sm text-[var(--muted)] sm:grid-cols-2">
-                    <p className="flex items-center gap-2 rounded-full bg-white/70 px-3 py-2">
-                      <PlugZap className="h-4 w-4 text-[var(--accent)]" />
-                      AC {integerLabel(stationStats.currentTypeCounts.ac)} · DC{" "}
-                      {integerLabel(stationStats.currentTypeCounts.dc)}
-                    </p>
-                    <p className="flex items-center gap-2 rounded-full bg-white/70 px-3 py-2">
-                      <Zap className="h-4 w-4 text-[var(--accent)]" />
-                      HPC {integerLabel(stationStats.currentTypeCounts.hpc)}
-                    </p>
-                    <p className="rounded-full bg-white/70 px-3 py-2">
-                      Preis {priceBandLabel(stationStats)}
-                    </p>
-                    <p className="rounded-full bg-white/70 px-3 py-2">
-                      {completePriceLabel(stationStats)}
-                    </p>
-                  </div>
-
-                  <div className="mt-6">
-                    <div className="mb-3 flex items-center justify-between gap-3">
-                      <h3 className="font-[var(--font-heading)] text-lg font-semibold">
-                        Anbieter
-                      </h3>
-                      <span className="text-sm text-[var(--muted)]">
-                        {integerLabel(stationStats.providerList.length)}
-                      </span>
-                    </div>
-                    <div className="space-y-2">
-                      {stationStats.providerList.length === 0 ? (
-                        <div className="rounded-[22px] border border-dashed border-[var(--line)] bg-white/60 p-5 text-sm text-[var(--muted)]">
-                          Keine Anbieter im aktuellen Ausschnitt.
-                        </div>
-                      ) : null}
-
-                      {stationStats.providerList.map((provider) => (
-                        <div
-                          key={provider.cpoId}
-                          className="flex items-center justify-between gap-3 rounded-[22px] border border-[var(--line)] bg-white/75 px-4 py-3"
-                        >
-                          <div className="min-w-0">
-                            <p className="truncate font-medium text-[var(--foreground)]">
-                              {provider.cpoName}
-                            </p>
-                            <p className="mt-1 flex items-center gap-1.5 text-xs text-[var(--muted)]">
-                              <Building2 className="h-3.5 w-3.5" />
-                              {integerLabel(provider.stations)} Standorte
-                            </p>
-                          </div>
-                          <div className="shrink-0 text-right">
-                            <p className="font-[var(--font-heading)] text-xl font-semibold">
-                              {integerLabel(provider.chargePoints)}
-                            </p>
-                            <p className="text-xs text-[var(--muted)]">Ladepunkte</p>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className="flex items-center gap-3 rounded-[22px] border border-[var(--line)] bg-white/70 p-5 text-sm text-[var(--muted)]">
-                  <LoaderCircle className="h-4 w-4 animate-spin text-[var(--accent)]" />
-                  Statistik wird geladen...
-                </div>
-              )}
-            </div>
-          </motion.aside>
-        ) : null}
       </AnimatePresence>
 
       {/* Map Style Switcher */}

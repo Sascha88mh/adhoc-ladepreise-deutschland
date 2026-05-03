@@ -268,6 +268,148 @@ const STATIC_WITH_AVAILABLE_POWER_LOWER_THAN_SOCKET = JSON.stringify({
   },
 });
 
+const VAYLENS_STATION_LEVEL_LOCATIONS = JSON.stringify({
+  payload: {
+    aegiEnergyInfrastructureTablePublication: {
+      energyInfrastructureTable: [
+        {
+          energyInfrastructureSite: [
+            {
+              idG: "vaylens-site",
+              operator: {
+                afacAnOrganisation: {
+                  name: { values: [{ value: "Regionalwerk Bodensee GmbH & Co. KG" }] },
+                  externalIdentifier: [{ identifier: "DE*ISE" }],
+                },
+              },
+              energyInfrastructureStation: [
+                {
+                  idG: "station-a",
+                  numberOfRefillPoints: 1,
+                  locationReference: {
+                    locPointLocation: {
+                      coordinatesForDisplay: { latitude: 51.490024, longitude: 6.876805 },
+                      locLocationExtensionG: {
+                        facilityLocation: {
+                          address: {
+                            postcode: "46047",
+                            city: { values: [{ value: "Oberhausen" }] },
+                            countryCode: "DE",
+                            addressLine: [
+                              { type: { value: "street" }, text: { values: [{ value: "Centroallee Parkhaus" }] } },
+                              { type: { value: "houseNumber" }, text: { values: [{ value: "1" }] } },
+                            ],
+                          },
+                        },
+                      },
+                    },
+                  },
+                  refillPoint: [
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "vaylens-cp-a",
+                        currentType: { value: "ac" },
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                  ],
+                },
+                {
+                  idG: "station-b",
+                  numberOfRefillPoints: 1,
+                  locationReference: {
+                    locPointLocation: {
+                      coordinatesForDisplay: { latitude: 51.490024, longitude: 6.876805 },
+                      locLocationExtensionG: {
+                        facilityLocation: {
+                          address: {
+                            postcode: "46047",
+                            city: { values: [{ value: "Oberhausen" }] },
+                            countryCode: "DE",
+                            addressLine: [
+                              { type: { value: "street" }, text: { values: [{ value: "Centroallee Parkhaus" }] } },
+                              { type: { value: "houseNumber" }, text: { values: [{ value: "1" }] } },
+                            ],
+                          },
+                        },
+                      },
+                    },
+                  },
+                  refillPoint: [
+                    {
+                      aegiElectricChargingPoint: {
+                        idG: "vaylens-cp-b",
+                        currentType: { value: "ac" },
+                        connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+
+const VAYLENS_SPLIT_ACROSS_SITES = JSON.stringify({
+  payload: {
+    aegiEnergyInfrastructureTablePublication: {
+      energyInfrastructureTable: [
+        {
+          energyInfrastructureSite: [
+            { suffix: "a", latitude: 51.490024, longitude: 6.876805 },
+            { suffix: "b", latitude: 51.490124, longitude: 6.876905 },
+          ].map(({ suffix, latitude, longitude }) => ({
+            idG: `site-${suffix}`,
+            operator: {
+              afacAnOrganisation: {
+                name: { values: [{ value: "DE*ISE" }] },
+                legalName: { values: [{ value: "Energieversorgung Oberhausen AG" }] },
+                externalIdentifier: [{ identifier: "DE*ISE" }],
+              },
+            },
+            energyInfrastructureStation: [
+              {
+                idG: `station-${suffix}`,
+                numberOfRefillPoints: 1,
+                locationReference: {
+                  locPointLocation: {
+                    coordinatesForDisplay: { latitude, longitude },
+                    locLocationExtensionG: {
+                      facilityLocation: {
+                        address: {
+                          postcode: "46047",
+                          city: { values: [{ value: "Oberhausen" }] },
+                          countryCode: "DE",
+                          addressLine: [
+                            { type: { value: "street" }, text: { values: [{ value: "Centroallee Parkhaus 1" }] } },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                },
+                refillPoint: [
+                  {
+                    aegiElectricChargingPoint: {
+                      idG: `vaylens-cross-site-cp-${suffix}`,
+                      currentType: { value: "ac" },
+                      connector: [{ connectorType: { value: "iec62196T2" }, maxPowerAtSocket: 22000 }],
+                    },
+                  },
+                ],
+              },
+            ],
+          })),
+        },
+      ],
+    },
+  },
+});
+
 describe("Mobilithek parser", () => {
   it("parses static station payloads from the official AFIR example", () => {
     const result = parseStaticMobilithekPayload(STATIC_FIXTURE);
@@ -373,5 +515,34 @@ describe("Mobilithek parser", () => {
 
     expect(result.catalog[0]?.maxPowerKw).toBe(22);
     expect(result.catalog[0]?.chargePoints.map((point) => point.maxPowerKw)).toEqual([22, 22]);
+  });
+
+  it("groups Vaylens station-level locations with matching address and coordinates", () => {
+    const result = parseStaticMobilithekPayload(VAYLENS_STATION_LEVEL_LOCATIONS);
+
+    expect(result.catalog).toHaveLength(1);
+    expect(result.catalog[0]?.cpoId).not.toBe("DE*ISE");
+    expect(result.catalog[0]?.cpoName).toBe("Regionalwerk Bodensee GmbH & Co. KG");
+    expect(result.catalog[0]?.addressLine).toBe("Centroallee Parkhaus 1");
+    expect(result.catalog[0]?.chargePointCount).toBe(2);
+    expect(result.catalog[0]?.chargePoints.map((point) => point.chargePointCode)).toEqual([
+      "vaylens-cp-a",
+      "vaylens-cp-b",
+    ]);
+  });
+
+  it("groups matching Vaylens locations even when they are split across sites", () => {
+    const result = parseStaticMobilithekPayload(VAYLENS_SPLIT_ACROSS_SITES);
+
+    expect(result.catalog).toHaveLength(1);
+    expect(result.catalog[0]?.cpoId).not.toBe("DE*ISE");
+    expect(result.catalog[0]?.cpoName).toBe("Energieversorgung Oberhausen AG");
+    expect(result.catalog[0]?.coordinates.lat).toBeCloseTo(51.490074, 6);
+    expect(result.catalog[0]?.coordinates.lng).toBeCloseTo(6.876855, 6);
+    expect(result.catalog[0]?.chargePointCount).toBe(2);
+    expect(result.catalog[0]?.chargePoints.map((point) => point.chargePointCode)).toEqual([
+      "vaylens-cross-site-cp-a",
+      "vaylens-cross-site-cp-b",
+    ]);
   });
 });

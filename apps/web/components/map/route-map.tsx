@@ -178,21 +178,29 @@ function focusCollection(route: RoutePlan) {
 }
 
 function candidateCollection(candidates: RouteCandidate[]) {
+  const now = Date.now();
   return {
     type: "FeatureCollection" as const,
-    features: candidates.map((candidate) => ({
-      type: "Feature" as const,
-      geometry: {
-        type: "Point" as const,
-        coordinates: [candidate.lng, candidate.lat],
-      },
-      properties: {
-        id: candidate.stationId,
-        available: candidate.availabilitySummary.available,
-        power: candidate.maxPowerKw,
-        price: candidate.tariffSummary.pricePerKwh ?? 9,
-      },
-    })),
+    features: candidates.map((candidate) => {
+      const lastStatusMs = new Date(candidate.lastStatusUpdateAt).getTime();
+      const statusAgeMin = lastStatusMs === 0
+        ? 2147483647
+        : Math.floor((now - lastStatusMs) / 60000);
+      return {
+        type: "Feature" as const,
+        geometry: {
+          type: "Point" as const,
+          coordinates: [candidate.lng, candidate.lat],
+        },
+        properties: {
+          id: candidate.stationId,
+          available: candidate.availabilitySummary.available,
+          status_age_min: statusAgeMin,
+          power: candidate.maxPowerKw,
+          price: candidate.tariffSummary.pricePerKwh ?? 9,
+        },
+      };
+    }),
   };
 }
 
@@ -561,6 +569,8 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
       paint: {
         "circle-color": [
           "case",
+          [">", ["get", "status_age_min"], 60],
+          "#4b5563",
           [">", ["coalesce", ["get", "available"], 0], 0],
           "#156f63",
           "#d09a4a",
@@ -569,23 +579,21 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
           "interpolate",
           ["linear"],
           ["zoom"],
-          5,
-          2.2,
-          9,
-          3.8,
-          12,
-          7,
-          15,
-          10,
+          5, 2.0,
+          9, 3.5,
+          11, 6.0,
+          12, 10.5,
+          14, 12.5,
+          16, 14.5,
         ],
         "circle-opacity": [
           "interpolate",
           ["linear"],
           ["zoom"],
           5,
-          0.66,
+          0.6,
           10,
-          0.84,
+          0.78,
         ],
         "circle-stroke-color": "#ffffff",
         "circle-stroke-opacity": [
@@ -618,6 +626,8 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
       paint: {
         "circle-color": [
           "case",
+          [">", ["coalesce", ["get", "status_age_min"], 2147483647], 60],
+          "#4b5563",
           [">", ["coalesce", ["get", "available"], 0], 0],
           "#156f63",
           "#d09a4a",
@@ -626,16 +636,14 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
           "interpolate",
           ["linear"],
           ["zoom"],
-          5,
-          3,
-          9,
-          5,
-          12,
-          9,
-          15,
-          12,
+          5, 2.7,
+          9, 4.5,
+          11, 7.5,
+          12, 12.5,
+          14, 15.0,
+          16, 17.0,
         ],
-        "circle-opacity": 0.92,
+        "circle-opacity": 0.84,
         "circle-stroke-color": palette.candidateStroke,
         "circle-stroke-width": [
           "interpolate",

@@ -5,7 +5,6 @@ import {
   publicCandidatesResponseSchema,
   publicReverseLocationResponseSchema,
   publicRoutePlanResponseSchema,
-  publicStationStatsResponseSchema,
   stationOverridesResponseSchema,
   stationDetailResponseSchema,
   type AdminStationRecord,
@@ -15,7 +14,6 @@ import {
   type RouteCandidate,
   type RoutePlan,
   type StationDetail,
-  type StationStats,
   type SyncRun,
 } from "@adhoc/shared";
 
@@ -50,10 +48,6 @@ const MAP_STATIONS_CACHE_TTL_MS = 60_000;
 const mapStationsCache = new Map<
   string,
   { expiresAt: number; data: RouteCandidate[] }
->();
-const stationStatsCache = new Map<
-  string,
-  { expiresAt: number; data: StationStats }
 >();
 
 export async function fetchRoutePlan(payload: {
@@ -152,44 +146,6 @@ export async function fetchMapStations(payload: {
   return data;
 }
 
-export async function fetchStationStats(payload: {
-  bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number };
-  filters: CandidateFilters;
-  signal?: AbortSignal;
-}) {
-  const bounds = quantizeMapBounds(payload.bounds);
-  const params = new URLSearchParams({
-    minLat: String(bounds.minLat),
-    minLng: String(bounds.minLng),
-    maxLat: String(bounds.maxLat),
-    maxLng: String(bounds.maxLng),
-    filters: JSON.stringify(payload.filters ?? {}),
-  });
-  const url = `/api/public/stations/stats?${params.toString()}`;
-  const cached = stationStatsCache.get(url);
-
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data;
-  }
-
-  const response = await requestJson<unknown>(url, { signal: payload.signal });
-  const data = publicStationStatsResponseSchema.parse(response).data;
-
-  stationStatsCache.set(url, {
-    expiresAt: Date.now() + MAP_STATIONS_CACHE_TTL_MS,
-    data,
-  });
-
-  if (stationStatsCache.size > 80) {
-    const oldestKey = stationStatsCache.keys().next().value;
-    if (oldestKey) {
-      stationStatsCache.delete(oldestKey);
-    }
-  }
-
-  return data;
-}
-
 function quantizeMapBounds(bounds: {
   minLat: number;
   minLng: number;
@@ -215,8 +171,12 @@ function quantizeMapBounds(bounds: {
   };
 }
 
-export async function fetchStationDetail(stationId: string): Promise<StationDetail> {
-  const response = await requestJson<unknown>(`/api/public/stations/${stationId}`);
+export async function fetchStationDetail(stationId: string, signal?: AbortSignal): Promise<StationDetail> {
+  const params = new URLSearchParams({ t: String(Date.now()) });
+  const response = await requestJson<unknown>(`/api/public/stations/${stationId}?${params.toString()}`, {
+    cache: "no-store",
+    signal,
+  });
   return stationDetailResponseSchema.parse(response).data;
 }
 

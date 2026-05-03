@@ -97,6 +97,21 @@ function money(value: number | null | undefined) {
   return `${value.toFixed(2).replace(".", ",")} €`;
 }
 
+const updateTimeFormatter = new Intl.DateTimeFormat("de-DE", {
+  dateStyle: "short",
+  timeStyle: "medium",
+});
+
+function formatUpdateTime(value: string) {
+  const timestamp = Date.parse(value);
+
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return "noch nicht synchronisiert";
+  }
+
+  return updateTimeFormatter.format(new Date(timestamp));
+}
+
 function parseChargePointCodeFromTariffId(tariffId: string) {
   const [scope, scopeCode] = tariffId.split("|");
   return scope === "charge_point" ? scopeCode : null;
@@ -363,8 +378,8 @@ export function StationDrawer({ detail, loading, open, onClose }: Props) {
                     <Zap className="h-4 w-4 text-[var(--accent)]" />
                     Letzte Aktualisierung
                   </p>
-                  <p>Preis: {new Date(detail.lastPriceUpdateAt).toLocaleString("de-DE")}</p>
-                  <p>Status: {new Date(detail.lastStatusUpdateAt).toLocaleString("de-DE")}</p>
+                  <p>Preis: {formatUpdateTime(detail.lastPriceUpdateAt)}</p>
+                  <p>Status: {formatUpdateTime(detail.lastStatusUpdateAt)}</p>
                 </div>
               </>
             ) : null}

@@ -87,6 +87,35 @@ function readExternalIdentifier(values: unknown): string | undefined {
     .find((value): value is string => Boolean(value));
 }
 
+function looksLikeOperatorCode(value: string) {
+  return /^[A-Z]{2}\*[A-Z0-9*]+$/.test(value.trim().toUpperCase());
+}
+
+function readOrganisationName(operator?: { name?: unknown; legalName?: unknown }) {
+  const name = operator ? readMultilingual(operator.name) : null;
+  const legalName = operator ? readMultilingual(operator.legalName) : null;
+
+  if (name && !looksLikeOperatorCode(name)) {
+    return name;
+  }
+
+  return legalName ?? name ?? null;
+}
+
+function normalizeCpoIdentity(rawId: string, rawName: string) {
+  if (rawId.trim().toUpperCase() === "DE*ISE" && rawName.trim() && rawName !== rawId) {
+    return {
+      cpoId: `${rawId}:${stableId([rawName])}`,
+      cpoName: rawName,
+    };
+  }
+
+  return {
+    cpoId: rawId,
+    cpoName: rawName,
+  };
+}
+
 function normalizeCurrentType(value: unknown): CurrentType {
   return readValue(value)?.toUpperCase() === "AC" ? "AC" : "DC";
 }
@@ -367,6 +396,7 @@ function parseChargePoint(
     }>;
   },
   stationCode: string,
+  fallbackDiscriminator: string | number,
 ): ParsedChargePoint {
   const chargePointCode =
     point.idG ??
@@ -374,6 +404,7 @@ function parseChargePoint(
     readExternalIdentifier(point.externalIdentifier) ??
     stableId([
       stationCode,
+      fallbackDiscriminator,
       readValue(point.currentType),
       JSON.stringify(point.availableChargingPower ?? []),
     ]);
@@ -495,6 +526,13 @@ type StationEntry = {
     locAreaLocation?: LocationBlock;
     locPointLocation?: LocationBlock;
   };
+  operator?: {
+    afacAnOrganisation?: { name?: unknown; legalName?: unknown; externalIdentifier?: Array<{ identifier?: string } | string> };
+    name?: unknown;
+    legalName?: unknown;
+    externalIdentifier?: Array<{ identifier?: string } | string>;
+    id?: string;
+  };
   refillPoint?: Array<{
     aegiElectricChargingPoint?: {
       idG?: string;
@@ -557,11 +595,45 @@ function buildCatalogEntry(
   longitude: number,
   stations: StationEntry[],
 ): ParsedStationCatalog {
-  const allChargePoints = stations.flatMap((station) =>
+  const allChargePoints = stations.flatMap((station, stationIndex) =>
     (station.refillPoint ?? [])
-      .map((item) => item.aegiElectricChargingPoint ?? item)
-      .filter((point): point is NonNullable<typeof point> => Boolean(point))
-      .map((point) => parseChargePoint(point, stationCode)),
+      .map((item, refillPointIndex) => ({
+        point: item.aegiElectricChargingPoint ?? item,
+        fallbackDiscriminator: `${station.idG ?? station.id ?? stationIndex}:${refillPointIndex}`,
+      }))
+      .filter((entry): entry is { point: NonNullable<typeof entry.point>; fallbackDiscriminator: string } =>
+        Boolean(entry.point),
+      )
+      .map(({ point, fallbackDiscriminator }) => parseChargePoint(point, stationCode, fallbackDiscriminator)),
+  );
+
+  const deduplicatedChargePoints = Array.from(
+    allChargePoints
+      .reduce<Map<string, ParsedChargePoint>>((acc, point) => {
+        const current = acc.get(point.chargePointCode);
+        acc.set(
+          point.chargePointCode,
+          current
+            ? {
+                ...current,
+                maxPowerKw: Math.max(current.maxPowerKw, point.maxPowerKw),
+                connectors: Array.from(
+                  new Map(
+                    [...current.connectors, ...point.connectors].map((connector) => [
+                      `${connector.connectorType}|${connector.maxPowerKw ?? ""}`,
+                      connector,
+                    ]),
+                  ).values(),
+                ),
+                tariffs: Array.from(
+                  new Map([...current.tariffs, ...point.tariffs].map((tariff) => [tariff.id, tariff])).values(),
+                ),
+              }
+            : point,
+        );
+        return acc;
+      }, new Map())
+      .values(),
   );
 
   const paymentMethods = Array.from(
@@ -570,18 +642,18 @@ function buildCatalogEntry(
         ...stations.flatMap((station) =>
           (station.authenticationAndIdentificationMethods ?? []).map((method) => readValue(method)),
         ),
-        ...allChargePoints.flatMap((point) => point.tariffs.flatMap((tariff) => tariff.paymentMethods)),
+        ...deduplicatedChargePoints.flatMap((point) => point.tariffs.flatMap((tariff) => tariff.paymentMethods)),
       ].filter((value): value is string => Boolean(value)),
     ),
   );
 
   const connectorTypes = Array.from(
-    new Set(allChargePoints.flatMap((point) => point.connectors.map((connector) => connector.connectorType))),
+    new Set(deduplicatedChargePoints.flatMap((point) => point.connectors.map((connector) => connector.connectorType))),
   );
 
-  const currentTypes = Array.from(new Set(allChargePoints.map((point) => point.currentType)));
+  const currentTypes = Array.from(new Set(deduplicatedChargePoints.map((point) => point.currentType)));
 
-  const chargePointMaxPowerKw = Math.max(...allChargePoints.map((point) => point.maxPowerKw), 0);
+  const chargePointMaxPowerKw = Math.max(...deduplicatedChargePoints.map((point) => point.maxPowerKw), 0);
   const stationTotalPowerKw = Math.max(
     ...stations.map((station) => (station.totalMaximumPower != null ? station.totalMaximumPower / 1000 : 0)),
     0,
@@ -590,7 +662,8 @@ function buildCatalogEntry(
 
   const chargePointCount = Math.max(
     1,
-    stations.reduce((sum, station) => sum + (station.numberOfRefillPoints ?? 0), 0) || allChargePoints.length,
+    stations.reduce((sum, station) => sum + (station.numberOfRefillPoints ?? 0), 0) ||
+      deduplicatedChargePoints.length,
   );
 
   const name =
@@ -613,9 +686,111 @@ function buildCatalogEntry(
     connectorTypes,
     paymentMethods,
     maxPowerKw,
-    chargePoints: allChargePoints,
+    chargePoints: deduplicatedChargePoints,
     notes: [],
   };
+}
+
+function stationLocationGroupKey(address: FacilityAddress, latitude: number, longitude: number) {
+  return [
+    address.countryCode ?? "DE",
+    address.postcode == null ? "" : String(address.postcode),
+    readMultilingual(address.city) ?? "",
+    readAddressLine(address),
+    latitude.toFixed(5),
+    longitude.toFixed(5),
+  ]
+    .map((part) => part.trim().toLowerCase())
+    .join("|");
+}
+
+function catalogLocationGroupKey(station: ParsedStationCatalog) {
+  return [
+    station.cpoId,
+    station.countryCode,
+    station.postalCode,
+    station.city,
+    station.addressLine,
+  ]
+    .map((part) => part.trim().toLowerCase())
+    .join("|");
+}
+
+function mergeChargePoints(points: ParsedChargePoint[]) {
+  return Array.from(
+    points
+      .reduce<Map<string, ParsedChargePoint>>((acc, point) => {
+        const current = acc.get(point.chargePointCode);
+        acc.set(
+          point.chargePointCode,
+          current
+            ? {
+                ...current,
+                maxPowerKw: Math.max(current.maxPowerKw, point.maxPowerKw),
+                connectors: Array.from(
+                  new Map(
+                    [...current.connectors, ...point.connectors].map((connector) => [
+                      `${connector.connectorType}|${connector.maxPowerKw ?? ""}`,
+                      connector,
+                    ]),
+                  ).values(),
+                ),
+                tariffs: Array.from(
+                  new Map([...current.tariffs, ...point.tariffs].map((tariff) => [tariff.id, tariff])).values(),
+                ),
+              }
+            : point,
+        );
+        return acc;
+      }, new Map())
+      .values(),
+  );
+}
+
+function mergeCatalogEntries(catalog: ParsedStationCatalog[]) {
+  const clustersByAddress = new Map<string, ParsedStationCatalog[]>();
+
+  for (const station of catalog) {
+    const key = catalogLocationGroupKey(station);
+    const stations = clustersByAddress.get(key) ?? [];
+    stations.push(station);
+    clustersByAddress.set(key, stations);
+  }
+
+  return [...clustersByAddress.values()].map((stations) => {
+    if (stations.length === 1) {
+      return stations[0]!;
+    }
+
+    const first = stations[0]!;
+    const chargePoints = mergeChargePoints(stations.flatMap((station) => station.chargePoints));
+    const coordinates = {
+      lat: stations.reduce((sum, station) => sum + station.coordinates.lat, 0) / stations.length,
+      lng: stations.reduce((sum, station) => sum + station.coordinates.lng, 0) / stations.length,
+    };
+    const chargePointCount = Math.max(
+      chargePoints.length,
+      stations.reduce((sum, station) => sum + station.chargePointCount, 0),
+      1,
+    );
+
+    return {
+      ...first,
+      stationCode: stableId([
+        "location",
+        catalogLocationGroupKey(first),
+      ]),
+      name: stations.map((station) => station.name).find((name) => name !== "Ladestation") ?? first.name,
+      coordinates,
+      chargePointCount,
+      currentTypes: Array.from(new Set(stations.flatMap((station) => station.currentTypes))),
+      connectorTypes: Array.from(new Set(stations.flatMap((station) => station.connectorTypes))),
+      paymentMethods: Array.from(new Set(stations.flatMap((station) => station.paymentMethods))),
+      maxPowerKw: Math.max(...stations.map((station) => station.maxPowerKw), 0),
+      chargePoints,
+      notes: Array.from(new Set(stations.flatMap((station) => station.notes))),
+    };
+  });
 }
 
 function parseStationCatalog(
@@ -623,8 +798,9 @@ function parseStationCatalog(
     idG?: string;
     id?: string;
     operator?: {
-      afacAnOrganisation?: { name?: unknown; externalIdentifier?: Array<{ identifier?: string } | string> };
+      afacAnOrganisation?: { name?: unknown; legalName?: unknown; externalIdentifier?: Array<{ identifier?: string } | string> };
       name?: unknown;
+      legalName?: unknown;
       externalIdentifier?: Array<{ identifier?: string } | string>;
       id?: string;
     };
@@ -637,6 +813,7 @@ function parseStationCatalog(
   const operator = (site.operator?.afacAnOrganisation ?? site.operator) as
     | {
         name?: unknown;
+        legalName?: unknown;
         externalIdentifier?: Array<{ identifier?: string } | string>;
         id?: string;
       }
@@ -644,9 +821,10 @@ function parseStationCatalog(
   const cpoId =
     readExternalIdentifier(operator?.externalIdentifier) ??
     readValue(operator?.id) ??
-    readMultilingual(operator?.name) ??
+    readOrganisationName(operator) ??
     "unknown";
-  const cpoName = readMultilingual(operator?.name) ?? cpoId;
+  const cpoName = readOrganisationName(operator) ?? cpoId;
+  const cpo = normalizeCpoIdentity(cpoId, cpoName);
 
   const allStations = site.energyInfrastructureStation ?? [];
   const siteLocation = resolveLocationRef(site.locationReference);
@@ -659,26 +837,68 @@ function parseStationCatalog(
 
     if (latitude == null || longitude == null) return [];
 
-    const stationCode = site.idG ?? site.id ?? stableId([cpoId, String(latitude), String(longitude)]);
+    const stationCode = site.idG ?? site.id ?? stableId([cpo.cpoId, String(latitude), String(longitude)]);
 
-    return [buildCatalogEntry(stationCode, cpoId, cpoName, address!, latitude, longitude, allStations)];
+    return [buildCatalogEntry(stationCode, cpo.cpoId, cpo.cpoName, address!, latitude, longitude, allStations)];
   }
 
-  // Vaylens-style: no site-level location → each energyInfrastructureStation is its own DB entry
-  return allStations.flatMap((station, stationIndex) => {
+  // Vaylens-style: no site-level location → group stations by their own display location.
+  const stationGroups = new Map<
+    string,
+    {
+      address: FacilityAddress;
+      latitude: number;
+      longitude: number;
+      stations: StationEntry[];
+      fallbackParts: Array<string | number | null | undefined>;
+    }
+  >();
+
+  for (const [stationIndex, station] of allStations.entries()) {
     const { coords, address } = resolveLocationRef(station.locationReference);
     const latitude = coords?.latitude;
     const longitude = coords?.longitude;
 
-    if (latitude == null || longitude == null || !address) return [];
+    if (latitude == null || longitude == null || !address) continue;
 
-    const stationCode =
+    const key = stationLocationGroupKey(address, latitude, longitude);
+    const current = stationGroups.get(key);
+    const stationIdentity =
       station.idG ??
       station.id ??
       readExternalIdentifier(station.externalIdentifier) ??
-      stableId([cpoId, readMultilingual(station.description) ?? readMultilingual(station.name), stationIndex]);
+      `${readMultilingual(station.description) ?? readMultilingual(station.name) ?? "station"}:${stationIndex}`;
 
-    return [buildCatalogEntry(stationCode, cpoId, cpoName, address, latitude, longitude, [station])];
+    if (current) {
+      current.stations.push(station);
+      current.fallbackParts.push(stationIdentity);
+      continue;
+    }
+
+    stationGroups.set(key, {
+      address,
+      latitude,
+      longitude,
+      stations: [station],
+      fallbackParts: [stationIdentity],
+    });
+  }
+
+  return [...stationGroups.values()].map((group) => {
+    const stationCode =
+      group.stations.length === 1
+        ? group.fallbackParts[0] ?? stableId([cpo.cpoId, group.latitude, group.longitude])
+        : stableId([cpo.cpoId, stationLocationGroupKey(group.address, group.latitude, group.longitude)]);
+
+    return buildCatalogEntry(
+      String(stationCode),
+      cpo.cpoId,
+      cpo.cpoName,
+      group.address,
+      group.latitude,
+      group.longitude,
+      group.stations,
+    );
   });
 }
 
@@ -737,14 +957,15 @@ export function parseStaticMobilithekPayload(payload: string | Record<string, un
     }>;
   }>;
 
-  const catalog =
+  const catalog = mergeCatalogEntries(
     publications.flatMap((publication) =>
       (publication.aegiEnergyInfrastructureTablePublication?.energyInfrastructureTable ??
         publication.energyInfrastructureTable ??
         []).flatMap((table) =>
         (table.energyInfrastructureSite ?? []).flatMap((site) => parseStationCatalog(site)),
       ),
-    ) ?? [];
+    ) ?? [],
+  );
 
   return {
     catalog,

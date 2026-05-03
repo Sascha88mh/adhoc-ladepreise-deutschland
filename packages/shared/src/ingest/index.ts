@@ -154,32 +154,6 @@ function summarizeTariff(tariff: TariffSummary) {
   });
 }
 
-function tariffFingerprint(tariff: ParsedTariff) {
-  return JSON.stringify({
-    id: tariff.id,
-    externalCode: tariff.externalCode,
-    label: tariff.label,
-    currency: tariff.currency,
-    isComplete: tariff.isComplete,
-    paymentMethods: [...tariff.paymentMethods].sort(),
-    brandsAccepted: [...tariff.brandsAccepted].sort(),
-    caps: tariff.caps
-      .map((cap) => `${cap.label}|${cap.amount}|${cap.currency}`)
-      .sort(),
-    components: tariff.components.map((component) => ({
-      componentType: component.componentType,
-      amount: component.amount,
-      startsAfterMinutes: component.startsAfterMinutes,
-      priceCap: component.priceCap,
-      timeBasedApplicability: component.timeBasedApplicability,
-      overallPeriod: component.overallPeriod,
-      energyBasedApplicability: component.energyBasedApplicability,
-      taxIncluded: component.taxIncluded,
-      taxRate: component.taxRate,
-    })),
-  });
-}
-
 type TariffShapeRow = {
   stationId: string;
   cpId: string | null;
@@ -191,6 +165,141 @@ type TariffShapeRow = {
   isComplete: boolean;
   tariff: ParsedTariff;
 };
+
+type TariffFingerprintRow = {
+  tariffKey: string;
+  tariffCode: string;
+  label: string;
+  currency: string;
+  isComplete: boolean;
+  componentType: string | null;
+  amount: number | null;
+  startsAfterMinutes: number | null;
+  priceCap: number | null;
+  taxIncluded: boolean | null;
+  taxRate: number | null;
+  overallPeriod: Record<string, unknown> | null;
+  timeBasedApplicability: Record<string, unknown> | null;
+  energyBasedApplicability: Record<string, unknown> | null;
+  paymentMethods: string[];
+  brands: string[];
+};
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function normalizeJsonObject(value: Record<string, unknown> | null) {
+  return value == null ? null : stableStringify(value);
+}
+
+function tariffFingerprintRows(row: TariffShapeRow): TariffFingerprintRow[] {
+  const paymentMethods = [...row.tariff.paymentMethods].sort();
+  const brands = [...row.tariff.brandsAccepted].sort();
+  const componentRows: TariffFingerprintRow[] = [
+    ...row.tariff.components.map((component) => ({
+      tariffKey: row.code,
+      tariffCode: row.externalCode,
+      label: row.label,
+      currency: row.currency,
+      isComplete: row.isComplete,
+      componentType: component.componentType,
+      amount: component.amount,
+      startsAfterMinutes: component.startsAfterMinutes,
+      priceCap: component.priceCap,
+      taxIncluded: component.taxIncluded,
+      taxRate: component.taxRate,
+      overallPeriod: component.overallPeriod,
+      timeBasedApplicability: component.timeBasedApplicability,
+      energyBasedApplicability: component.energyBasedApplicability,
+      paymentMethods,
+      brands,
+    })),
+    ...row.tariff.caps.map((cap) => ({
+      tariffKey: row.code,
+      tariffCode: row.externalCode,
+      label: row.label,
+      currency: row.currency,
+      isComplete: row.isComplete,
+      componentType: "cap",
+      amount: null,
+      startsAfterMinutes: null,
+      priceCap: cap.amount,
+      taxIncluded: null,
+      taxRate: null,
+      overallPeriod: null,
+      timeBasedApplicability: null,
+      energyBasedApplicability: null,
+      paymentMethods,
+      brands,
+    })),
+  ];
+
+  if (!componentRows.length) {
+    componentRows.push({
+      tariffKey: row.code,
+      tariffCode: row.externalCode,
+      label: row.label,
+      currency: row.currency,
+      isComplete: row.isComplete,
+      componentType: null,
+      amount: null,
+      startsAfterMinutes: null,
+      priceCap: null,
+      taxIncluded: null,
+      taxRate: null,
+      overallPeriod: null,
+      timeBasedApplicability: null,
+      energyBasedApplicability: null,
+      paymentMethods,
+      brands,
+    });
+  }
+
+  return componentRows;
+}
+
+function tariffStorageFingerprint(row: TariffShapeRow) {
+  return JSON.stringify(
+    tariffFingerprintRows(row)
+      .map((entry) => ({
+        ...entry,
+        overallPeriod: normalizeJsonObject(entry.overallPeriod),
+        timeBasedApplicability: normalizeJsonObject(entry.timeBasedApplicability),
+        energyBasedApplicability: normalizeJsonObject(entry.energyBasedApplicability),
+      }))
+      .sort((left, right) =>
+        [
+          left.componentType ?? "",
+          String(left.amount ?? ""),
+          String(left.startsAfterMinutes ?? ""),
+          String(left.priceCap ?? ""),
+          left.overallPeriod ?? "",
+          left.timeBasedApplicability ?? "",
+          left.energyBasedApplicability ?? "",
+        ].join("|").localeCompare([
+          right.componentType ?? "",
+          String(right.amount ?? ""),
+          String(right.startsAfterMinutes ?? ""),
+          String(right.priceCap ?? ""),
+          right.overallPeriod ?? "",
+          right.timeBasedApplicability ?? "",
+          right.energyBasedApplicability ?? "",
+        ].join("|")),
+      ),
+  );
+}
 
 function mergeTariffShapes(
   existing: TariffShapeRow,
@@ -389,7 +498,7 @@ async function cleanupStaleActiveRun(feedId: string) {
             heartbeat_at = now()
       where feed_id = $1::uuid
         and (
-          (status = 'running' and started_at < now() - interval '5 minutes')
+          (status = 'running' and coalesce(heartbeat_at, started_at) < now() - interval '15 minutes')
           or
           (status = 'queued' and started_at < now() - interval '60 minutes')
         )`,
@@ -535,6 +644,12 @@ async function updateRunProgress(
   );
 }
 
+async function configureIngestTransaction(client: PoolClient) {
+  await client.query(`set local statement_timeout = '10min'`);
+  await client.query(`set local lock_timeout = '30s'`);
+  await client.query(`set local idle_in_transaction_session_timeout = '10min'`);
+}
+
 export async function enqueueFeedSync(feedId: string) {
   const feed = await getFeedConfigDb(feedId);
   if (!feed) {
@@ -620,7 +735,8 @@ async function finishRun(
             progress_stage = $2,
             progress_detail = $3,
             heartbeat_at = now(),
-            processed_count = case when $2 = 'success' then $4 else processed_count end
+            processed_count = case when $2 = 'success' then $4 else processed_count end,
+            total_count = case when $2 = 'success' then $4 else total_count end
       where id = $1::uuid
         and status = 'running'`,
     [runId, input.status, input.message, input.deltaCount],
@@ -815,7 +931,11 @@ async function insertTariffShape(
   return tariffId;
 }
 
-async function loadCurrentTariffFingerprint(client: PoolClient, tariffKey: string) {
+async function loadCurrentTariffFingerprints(client: PoolClient, tariffKeys: string[]) {
+  if (!tariffKeys.length) {
+    return new Map<string, string>();
+  }
+
   const result = await client.query<{
     tariff_key: string;
     tariff_code: string;
@@ -833,7 +953,7 @@ async function loadCurrentTariffFingerprint(client: PoolClient, tariffKey: strin
     energy_based_applicability: Record<string, unknown> | null;
     payment_methods: string[];
     brands: string[];
-  }>(
+    }>(
     `select
         t.tariff_key,
         t.tariff_code,
@@ -870,16 +990,21 @@ async function loadCurrentTariffFingerprint(client: PoolClient, tariffKey: strin
       from tariffs t
  left join tariff_components c
         on c.tariff_id = t.id
-     where t.tariff_key = $1`,
-    [tariffKey],
+     where t.tariff_key = any($1::text[])
+     order by
+       t.tariff_key,
+       c.component_type nulls first,
+       c.amount nulls first,
+       c.starts_after_minutes nulls first,
+       c.price_cap nulls first,
+       c.id`,
+    [tariffKeys],
   );
 
-  if (!result.rows.length) {
-    return null;
-  }
-
-  return JSON.stringify(
-    result.rows.map((row) => ({
+  const rowsByKey = new Map<string, TariffFingerprintRow[]>();
+  for (const row of result.rows) {
+    const rows = rowsByKey.get(row.tariff_key) ?? [];
+    rows.push({
       tariffKey: row.tariff_key,
       tariffCode: row.tariff_code,
       label: row.label,
@@ -896,7 +1021,44 @@ async function loadCurrentTariffFingerprint(client: PoolClient, tariffKey: strin
       energyBasedApplicability: row.energy_based_applicability,
       paymentMethods: row.payment_methods,
       brands: row.brands,
-    })),
+    });
+    rowsByKey.set(row.tariff_key, rows);
+  }
+
+  return new Map(
+    [...rowsByKey.entries()].map(([key, rows]) => [
+      key,
+      JSON.stringify(
+        rows
+          .map((entry) => ({
+            ...entry,
+            paymentMethods: [...entry.paymentMethods].sort(),
+            brands: [...entry.brands].sort(),
+            overallPeriod: normalizeJsonObject(entry.overallPeriod),
+            timeBasedApplicability: normalizeJsonObject(entry.timeBasedApplicability),
+            energyBasedApplicability: normalizeJsonObject(entry.energyBasedApplicability),
+          }))
+          .sort((left, right) =>
+            [
+              left.componentType ?? "",
+              String(left.amount ?? ""),
+              String(left.startsAfterMinutes ?? ""),
+              String(left.priceCap ?? ""),
+              left.overallPeriod ?? "",
+              left.timeBasedApplicability ?? "",
+              left.energyBasedApplicability ?? "",
+            ].join("|").localeCompare([
+              right.componentType ?? "",
+              String(right.amount ?? ""),
+              String(right.startsAfterMinutes ?? ""),
+              String(right.priceCap ?? ""),
+              right.overallPeriod ?? "",
+              right.timeBasedApplicability ?? "",
+              right.energyBasedApplicability ?? "",
+            ].join("|")),
+          ),
+      ),
+    ]),
   );
 }
 
@@ -1276,9 +1438,20 @@ async function upsertStaticCatalog(
       );
     }
   }
-  // Remove stale stations: use feed.cpoId if configured, otherwise use the CPO IDs from
-  // this parse run (handles cases where the station grouping changes between syncs).
-  const staleCpoIds = feed.cpoId ? [feed.cpoId] : [...cpoMap.keys()];
+  // Remove stale stations for both the configured feed CPO and the parsed CPOs.
+  // Some aggregator feeds normalize a shared upstream operator code into
+  // per-operator IDs (for example DE*ISE:hash), so include the legacy base code too.
+  const staleCpoIds = [
+    ...new Set(
+      [
+        feed.cpoId,
+        ...cpoMap.keys(),
+        ...[...cpoMap.keys()]
+          .map((id) => id.includes(":") ? id.split(":")[0] : null)
+          .filter((id): id is string => Boolean(id)),
+      ].filter((id): id is string => Boolean(id)),
+    ),
+  ];
   if (staleCpoIds.length && stationIdMap.size) {
     await client.query(
       `delete from stations where cpo_id = any($1::text[]) and not (station_code = any($2::text[]))`,
@@ -1516,7 +1689,12 @@ async function applyDynamicUpdates(
   }
 
   if (feed.ingestPrices) {
-    let processedPriceUpdates = 0;
+    const tariffRowsByKey = new Map<string, {
+      row: TariffShapeRow;
+      updateTime: string;
+      updateTimeMs: number;
+    }>();
+
     for (const update of updates) {
       const chargePoint = chargePointByCode.get(update.chargePointId);
       if (!chargePoint) {
@@ -1524,47 +1702,266 @@ async function applyDynamicUpdates(
       }
 
       const updateTime = update.lastUpdatedAt ?? nowIso;
+      const updateTimeMs = Date.parse(updateTime) || 0;
 
       for (const tariff of update.tariffs) {
-        const before = await loadCurrentTariffFingerprint(client, tariff.id);
-        const tariffId = await insertTariffShape(client, {
+        const row: TariffShapeRow = {
           stationId: chargePoint.station_id,
-          chargePointId: chargePoint.id,
+          cpId: chargePoint.id,
+          code: tariff.id,
+          externalCode: tariff.externalCode,
+          scope: tariff.scope,
+          label: tariff.label ?? "",
+          currency: tariff.currency ?? "EUR",
+          isComplete: tariff.isComplete ?? false,
           tariff,
+        };
+        const current = tariffRowsByKey.get(row.code);
+        tariffRowsByKey.set(row.code, {
+          row: current ? mergeTariffShapes(current.row, row) : row,
+          updateTime: !current || updateTimeMs >= current.updateTimeMs ? updateTime : current.updateTime,
+          updateTimeMs: Math.max(current?.updateTimeMs ?? 0, updateTimeMs),
         });
-        const afterFingerprint = tariffFingerprint(tariff);
+      }
+    }
 
-        if (!before || before !== afterFingerprint) {
-          await client.query(
-            `insert into price_snapshots (
-                tariff_id,
-                recorded_at,
-                summary
-              ) values ($1::uuid, $2::timestamptz, $3::jsonb)`,
-            [tariffId, updateTime, summarizeTariff(tariff)],
-          );
-          await client.query(
-            `update stations
-                set last_price_update_at = $2::timestamptz,
-                    updated_at = now()
-              where id = $1::uuid`,
-            [chargePoint.station_id, updateTime],
-          );
-          touchedStations.add(chargePoint.station_id);
-          deltaCount += 1;
+    const tariffRows = [...tariffRowsByKey.values()];
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "applying_prices",
+        detail: `${tariffRows.length} eindeutige Tarife werden geprüft`,
+        processedCount: 0,
+        totalCount: tariffRows.length,
+        message: "Preis-Updates werden geprüft",
+      }, client);
+    }
+
+    if (tariffRows.length) {
+      const currentFingerprints = await loadCurrentTariffFingerprints(
+        client,
+        tariffRows.map((entry) => entry.row.code),
+      );
+      const changedTariffRows = tariffRows.filter(
+        (entry) =>
+          currentFingerprints.get(entry.row.code) !== tariffStorageFingerprint(entry.row),
+      );
+      const tariffResult = await client.query<{ tariff_key: string; id: string }>(
+        `insert into tariffs (
+            station_id,
+            charge_point_id,
+            tariff_key,
+            tariff_code,
+            tariff_scope,
+            label,
+            currency,
+            is_complete,
+            updated_at
+          )
+         select t.sid::uuid, t.cpid::uuid, t.tkey, t.tcode, t.tscope, t.label, t.currency, t.complete, now()
+           from unnest(
+             $1::text[],
+             $2::text[],
+             $3::text[],
+             $4::text[],
+             $5::text[],
+             $6::text[],
+             $7::text[],
+             $8::bool[]
+           ) as t(sid, cpid, tkey, tcode, tscope, label, currency, complete)
+         on conflict (tariff_key) do update
+           set station_id = excluded.station_id,
+               charge_point_id = excluded.charge_point_id,
+               tariff_code = excluded.tariff_code,
+               tariff_scope = excluded.tariff_scope,
+               label = excluded.label,
+               currency = excluded.currency,
+               is_complete = excluded.is_complete,
+               updated_at = now()
+         returning tariff_key, id::text`,
+        [
+          tariffRows.map((entry) => entry.row.stationId),
+          tariffRows.map((entry) => entry.row.cpId),
+          tariffRows.map((entry) => entry.row.code),
+          tariffRows.map((entry) => entry.row.externalCode),
+          tariffRows.map((entry) => entry.row.scope),
+          tariffRows.map((entry) => entry.row.label),
+          tariffRows.map((entry) => entry.row.currency),
+          tariffRows.map((entry) => entry.row.isComplete),
+        ],
+      );
+      const tariffIdByKey = new Map(tariffResult.rows.map((row) => [row.tariff_key, row.id]));
+      const tariffIds = [...tariffIdByKey.values()];
+
+      await client.query(`delete from tariff_components where tariff_id = any($1::uuid[])`, [tariffIds]);
+      await client.query(`delete from tariff_payment_methods where tariff_id = any($1::uuid[])`, [tariffIds]);
+      await client.query(`delete from tariff_brands_accepted where tariff_id = any($1::uuid[])`, [tariffIds]);
+
+      const componentRows = tariffRows.flatMap((entry) => {
+        const tariffId = tariffIdByKey.get(entry.row.code);
+        if (!tariffId) return [];
+        return [
+          ...entry.row.tariff.components.map((component) => ({
+            tariffId,
+            componentType: component.componentType,
+            amount: component.amount,
+            startsAfterMinutes: component.startsAfterMinutes,
+            priceCap: component.priceCap,
+            taxIncluded: component.taxIncluded,
+            taxRate: component.taxRate,
+            overallPeriod: component.overallPeriod ? JSON.stringify(component.overallPeriod) : null,
+            timeBasedApplicability: component.timeBasedApplicability ? JSON.stringify(component.timeBasedApplicability) : null,
+            energyBasedApplicability: component.energyBasedApplicability ? JSON.stringify(component.energyBasedApplicability) : null,
+          })),
+          ...entry.row.tariff.caps.map((cap) => ({
+            tariffId,
+            componentType: "cap",
+            amount: null,
+            startsAfterMinutes: null,
+            priceCap: cap.amount,
+            taxIncluded: null,
+            taxRate: null,
+            overallPeriod: null,
+            timeBasedApplicability: null,
+            energyBasedApplicability: null,
+          })),
+        ];
+      });
+      const paymentRows = tariffRows.flatMap((entry) => {
+        const tariffId = tariffIdByKey.get(entry.row.code);
+        return tariffId ? entry.row.tariff.paymentMethods.map((method) => ({ tariffId, method })) : [];
+      });
+      const brandRows = tariffRows.flatMap((entry) => {
+        const tariffId = tariffIdByKey.get(entry.row.code);
+        return tariffId ? entry.row.tariff.brandsAccepted.map((brand) => ({ tariffId, brand })) : [];
+      });
+
+      if (componentRows.length) {
+        await client.query(
+          `insert into tariff_components (
+              tariff_id,
+              component_type,
+              amount,
+              starts_after_minutes,
+              price_cap,
+              tax_included,
+              tax_rate,
+              overall_period,
+              time_based_applicability,
+              energy_based_applicability
+            )
+           select t.tid::uuid, t.ctype, t.amount, t.starts_after_minutes, t.price_cap,
+                  t.tax_included, t.tax_rate, t.overall_period::jsonb,
+                  t.time_based_applicability::jsonb, t.energy_based_applicability::jsonb
+             from unnest(
+               $1::text[],
+               $2::text[],
+               $3::float8[],
+               $4::int[],
+               $5::float8[],
+               $6::bool[],
+               $7::float8[],
+               $8::text[],
+               $9::text[],
+               $10::text[]
+             ) as t(
+               tid, ctype, amount, starts_after_minutes, price_cap, tax_included,
+               tax_rate, overall_period, time_based_applicability, energy_based_applicability
+             )`,
+          [
+            componentRows.map((row) => row.tariffId),
+            componentRows.map((row) => row.componentType),
+            componentRows.map((row) => row.amount),
+            componentRows.map((row) => row.startsAfterMinutes),
+            componentRows.map((row) => row.priceCap),
+            componentRows.map((row) => row.taxIncluded),
+            componentRows.map((row) => row.taxRate),
+            componentRows.map((row) => row.overallPeriod),
+            componentRows.map((row) => row.timeBasedApplicability),
+            componentRows.map((row) => row.energyBasedApplicability),
+          ],
+        );
+      }
+      if (paymentRows.length) {
+        await client.query(
+          `insert into tariff_payment_methods (tariff_id, payment_method)
+           select t.tid::uuid, t.method
+             from unnest($1::text[], $2::text[]) as t(tid, method)
+           on conflict do nothing`,
+          [paymentRows.map((row) => row.tariffId), paymentRows.map((row) => row.method)],
+        );
+      }
+      if (brandRows.length) {
+        await client.query(
+          `insert into tariff_brands_accepted (tariff_id, brand)
+           select t.tid::uuid, t.brand
+             from unnest($1::text[], $2::text[]) as t(tid, brand)
+           on conflict do nothing`,
+          [brandRows.map((row) => row.tariffId), brandRows.map((row) => row.brand)],
+        );
+      }
+
+      const changedSnapshotRows = changedTariffRows
+        .map((entry) => ({
+          tariffId: tariffIdByKey.get(entry.row.code),
+          stationId: entry.row.stationId,
+          updateTime: entry.updateTime,
+          summary: summarizeTariff(entry.row.tariff),
+        }))
+        .filter((entry): entry is {
+          tariffId: string;
+          stationId: string;
+          updateTime: string;
+          summary: string;
+        } => Boolean(entry.tariffId));
+
+      if (changedSnapshotRows.length) {
+        await client.query(
+          `insert into price_snapshots (
+              tariff_id,
+              recorded_at,
+              summary
+            )
+           select t.tid::uuid, t.recorded_at::timestamptz, t.summary::jsonb
+             from unnest($1::text[], $2::text[], $3::text[]) as t(tid, recorded_at, summary)`,
+          [
+            changedSnapshotRows.map((row) => row.tariffId),
+            changedSnapshotRows.map((row) => row.updateTime),
+            changedSnapshotRows.map((row) => row.summary),
+          ],
+        );
+
+        const latestPriceByStation = new Map<string, string>();
+        for (const row of changedSnapshotRows) {
+          const current = latestPriceByStation.get(row.stationId);
+          if (!current || (Date.parse(row.updateTime) || 0) >= (Date.parse(current) || 0)) {
+            latestPriceByStation.set(row.stationId, row.updateTime);
+          }
+          touchedStations.add(row.stationId);
         }
+        const stationPriceRows = [...latestPriceByStation.entries()];
+        await client.query(
+          `update stations s
+              set last_price_update_at = t.updated_at::timestamptz,
+                  updated_at = now()
+             from unnest($1::text[], $2::text[]) as t(station_id, updated_at)
+            where s.id = t.station_id::uuid`,
+          [
+            stationPriceRows.map((row) => row[0]),
+            stationPriceRows.map((row) => row[1]),
+          ],
+        );
+        deltaCount += changedSnapshotRows.length;
       }
+    }
 
-      processedPriceUpdates += 1;
-      if (runId && processedPriceUpdates % 100 === 0) {
-        await updateRunProgress(runId, {
-          stage: "applying_prices",
-          detail: `${processedPriceUpdates}/${updates.length} Preis-Updates geprüft`,
-          processedCount: processedPriceUpdates,
-          totalCount: updates.length,
-          message: "Preis-Updates werden geprüft",
-        }, client);
-      }
+    if (runId) {
+      await updateRunProgress(runId, {
+        stage: "applying_prices",
+        detail: `${tariffRows.length}/${tariffRows.length} Tarife geprüft`,
+        processedCount: tariffRows.length,
+        totalCount: tariffRows.length,
+        message: "Preis-Updates geprüft",
+      }, client);
     }
   }
 
@@ -1896,6 +2293,7 @@ export async function runFeedAction(
     const client = await getPool().connect();
     try {
       await client.query("BEGIN");
+      await configureIngestTransaction(client);
       await assertRunStillRunning(client, runId);
       throwIfAborted(options?.signal);
 
