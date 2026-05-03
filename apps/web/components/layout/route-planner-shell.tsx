@@ -69,6 +69,9 @@ const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
   { id: "satellite", label: "Satellit" },
 ];
 const EMPTY_BROWSE_CANDIDATES: RouteCandidate[] = [];
+const MIN_AUTO_STATS_ZOOM = 9;
+const MAX_AUTO_STATS_LAT_SPAN = 1.6;
+const MAX_AUTO_STATS_LNG_SPAN = 2.6;
 
 function mapTheme(): CSSProperties {
   return {
@@ -101,6 +104,21 @@ function completePriceLabel(stats: StationStats) {
   }
 
   return `${Math.round(stats.completePriceShare * 100)}% komplett`;
+}
+
+function canAutoLoadStats(bounds: MapBounds | null, viewport: StoredMapViewport | null) {
+  if (!bounds || !viewport) {
+    return false;
+  }
+
+  const latSpan = Math.abs(bounds.maxLat - bounds.minLat);
+  const lngSpan = Math.abs(bounds.maxLng - bounds.minLng);
+
+  return (
+    viewport.zoom >= MIN_AUTO_STATS_ZOOM &&
+    latSpan <= MAX_AUTO_STATS_LAT_SPAN &&
+    lngSpan <= MAX_AUTO_STATS_LNG_SPAN
+  );
 }
 
 type Props = {
@@ -168,9 +186,7 @@ export function RoutePlannerShell({
   const debouncedFilters = useDebouncedValue(filters, 800);
   const [results, setResults] = useState(initialResults);
   const browseCandidates = EMPTY_BROWSE_CANDIDATES;
-  const [selectedStationId, setSelectedStationId] = useState<string | null>(
-    initialResults.candidates[0]?.stationId ?? null,
-  );
+  const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
   const [hoveredStationId, setHoveredStationId] = useState<string | null>(null);
   const [detail, setDetail] = useState<StationDetail | null>(null);
   
@@ -184,9 +200,7 @@ export function RoutePlannerShell({
   const [error, setError] = useState<string | null>(null);
   const autoLocatedRef = useRef(false);
   const manualSearchRef = useRef(false);
-  const [detailOpen, setDetailOpen] = useState(
-    Boolean(initialResults.candidates[0]?.stationId),
-  );
+  const [detailOpen, setDetailOpen] = useState(false);
   const [mapViewport, setMapViewport] = useState<StoredMapViewport | null>(null);
   const [mapBounds, setMapBounds] = useState<MapBounds | null>(null);
   const debouncedMapBounds = useDebouncedValue(mapBounds, 500);
@@ -197,6 +211,7 @@ export function RoutePlannerShell({
   const [restoringUrlState, setRestoringUrlState] = useState(true);
   const [preserveUrlViewport, setPreserveUrlViewport] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
+  const statsAutoLoad = canAutoLoadStats(mapBounds, mapViewport);
   const mapCandidates = query.mode === "route" ? results.candidates : [];
   const activeStationId = selectedStationId;
   const activeDetail =
@@ -233,9 +248,9 @@ export function RoutePlannerShell({
       });
       setMapMode(urlState.style);
       setFilters(urlState.filters);
-      setSelectedStationId(urlState.stationId);
+      setSelectedStationId(null);
       setDetail(null);
-      setDetailOpen(Boolean(urlState.stationId));
+      setDetailOpen(false);
       setMapViewport(urlState.mapViewport);
       setPreserveUrlViewport(Boolean(urlState.mapViewport));
       setPendingCandidateAutoOpen(urlState.mode === "route");
@@ -278,9 +293,9 @@ export function RoutePlannerShell({
         }
 
         setRoute(nextRoute);
-        setSelectedStationId(urlState.stationId);
+        setSelectedStationId(null);
         setDetail(null);
-        setDetailOpen(Boolean(urlState.stationId));
+        setDetailOpen(false);
         setPendingCandidateAutoOpen(urlState.mode === "route");
       } catch (caught) {
         if (!ignore) {
@@ -317,7 +332,7 @@ export function RoutePlannerShell({
         filters: effectiveFilters(filters, query.mode),
         mapViewport,
         style: mapMode,
-        stationId: selectedStationId,
+        stationId: null,
         location: {
           query: query.location,
           label: query.locationLabel,
@@ -332,7 +347,7 @@ export function RoutePlannerShell({
     }, 350);
 
     return () => window.clearTimeout(timeout);
-  }, [filters, mapMode, mapViewport, query, restoringUrlState, selectedStationId]);
+  }, [filters, mapMode, mapViewport, query, restoringUrlState]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -400,6 +415,10 @@ export function RoutePlannerShell({
       return;
     }
 
+    if (!statsOpen && !canAutoLoadStats(debouncedMapBounds, mapViewport)) {
+      return;
+    }
+
     const bounds = debouncedMapBounds;
     const controller = new AbortController();
     let ignore = false;
@@ -439,7 +458,15 @@ export function RoutePlannerShell({
       ignore = true;
       controller.abort();
     };
-  }, [debouncedFilters, debouncedMapBounds, query.mode, refreshTick, restoringUrlState]);
+  }, [
+    debouncedFilters,
+    debouncedMapBounds,
+    mapViewport,
+    query.mode,
+    refreshTick,
+    restoringUrlState,
+    statsOpen,
+  ]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -729,11 +756,11 @@ export function RoutePlannerShell({
       </AnimatePresence>
 
       {/* Map Statistics */}
-      <div className="pointer-events-none absolute right-4 top-16 z-20 flex justify-end sm:top-16">
+      <div className="pointer-events-none absolute right-5 top-[5.5rem] z-20 flex justify-end sm:right-4 sm:top-16">
         <button
           type="button"
           onClick={() => setStatsOpen((current) => !current)}
-          className="glass-panel-strong pointer-events-auto flex min-h-11 max-w-[calc(100vw-2rem)] items-center gap-2 rounded-full px-4 py-2 text-sm font-medium text-[var(--foreground)] shadow-2xl transition hover:bg-white/90"
+          className="glass-panel-strong pointer-events-auto flex h-11 w-11 items-center justify-center rounded-full text-sm font-medium text-[var(--foreground)] shadow-2xl transition hover:bg-white/90 sm:h-auto sm:w-auto sm:max-w-[calc(100vw-2rem)] sm:justify-start sm:gap-2 sm:px-4 sm:py-2"
           title="Statistik öffnen"
           aria-expanded={statsOpen}
         >
@@ -744,8 +771,8 @@ export function RoutePlannerShell({
           ) : (
             <BarChart3 className="h-4 w-4 shrink-0 text-[var(--accent)]" />
           )}
-          <span className="whitespace-nowrap">
-            {stationStats
+          <span className="hidden whitespace-nowrap sm:inline">
+            {stationStats && (statsAutoLoad || statsOpen)
               ? `${integerLabel(stationStats.stationCount)} Standorte · ${integerLabel(
                   stationStats.chargePointCount,
                 )} Ladepunkte`
@@ -760,7 +787,7 @@ export function RoutePlannerShell({
             initial={{ y: -12, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: -12, opacity: 0 }}
-            className="pointer-events-auto absolute right-4 top-32 z-30 flex max-h-[calc(100vh-9rem)] w-[min(25rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong"
+            className="pointer-events-auto absolute right-4 top-36 z-30 flex max-h-[calc(100vh-10rem)] w-[min(25rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-[30px] shadow-2xl glass-panel-strong sm:top-32 sm:max-h-[calc(100vh-9rem)]"
           >
             <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
               <div>

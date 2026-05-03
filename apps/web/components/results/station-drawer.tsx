@@ -200,23 +200,13 @@ export function StationDrawer({ detail, loading, open, onClose }: Props) {
   return (
     <AnimatePresence>
       {open && (loading || detail) ? (
-        <>
-          <motion.button
-            type="button"
-            aria-label="Details schließen"
-            onClick={onClose}
-            className="fixed inset-0 z-40 bg-[rgba(21,38,27,0.16)] backdrop-blur-[2px]"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-          />
-          <motion.aside
-            initial={{ opacity: 0, x: 36 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: 36 }}
-            transition={{ type: "spring", stiffness: 260, damping: 24 }}
-            className="fixed bottom-4 right-4 top-4 z-50 w-[min(26rem,calc(100vw-2rem))] overflow-auto rounded-[32px] bg-[rgba(255,255,255,0.97)] p-5 shadow-[0_32px_80px_rgba(16,31,27,0.18)]"
-          >
+        <motion.aside
+          initial={{ opacity: 0, x: 36 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: 36 }}
+          transition={{ type: "spring", stiffness: 260, damping: 24 }}
+          className="fixed bottom-4 right-4 top-4 z-50 w-[min(26rem,calc(100vw-2rem))] overflow-auto rounded-[32px] bg-[rgba(255,255,255,0.97)] p-5 shadow-[0_32px_80px_rgba(16,31,27,0.18)]"
+        >
             {loading && !detail ? (
               <div className="flex h-full min-h-80 flex-col items-center justify-center gap-4 text-center">
                 <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[var(--accent-soft)]">
@@ -378,8 +368,7 @@ export function StationDrawer({ detail, loading, open, onClose }: Props) {
                 </div>
               </>
             ) : null}
-          </motion.aside>
-        </>
+        </motion.aside>
       ) : null}
     </AnimatePresence>
   );

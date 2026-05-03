@@ -1,6 +1,6 @@
 import type { PoolClient } from "pg";
-import type { StationRecord, TariffSummary } from "../domain/types";
-import { stationRecordSchema } from "../domain/types";
+import type { CandidateFilters, StationRecord, TariffSummary } from "../domain/types";
+import { stationRecordSchema, stationStatsSchema } from "../domain/types";
 import { getPool } from "./pool";
 
 type TariffSchemaCapabilities = {
@@ -44,6 +44,27 @@ type StationTile = {
   z: number;
   x: number;
   y: number;
+};
+
+type PaymentFilterProperty = "pay_emv" | "pay_applepay" | "pay_googlepay" | "pay_website";
+
+type StationStatsRow = {
+  station_count: number;
+  charge_point_count: number;
+  available_charge_point_count: number;
+  max_power_kw: number | null;
+  ac_count: number;
+  dc_count: number;
+  hpc_count: number;
+  min_price_kwh: number | null;
+  max_price_kwh: number | null;
+  complete_price_count: number;
+  provider_list: Array<{
+    cpoId: string;
+    cpoName: string;
+    stations: number;
+    chargePoints: number;
+  }> | null;
 };
 
 type TariffRow = {
@@ -215,6 +236,120 @@ function normalizeBounds(bounds: StationBounds) {
     maxLat: Math.max(bounds.minLat, bounds.maxLat),
     maxLng: Math.max(bounds.minLng, bounds.maxLng),
   };
+}
+
+function paymentFilterProperty(method: string): PaymentFilterProperty | null {
+  const normalized = method.toLowerCase();
+
+  if (normalized === "eccard" || normalized === "creditcard" || normalized === "emv") {
+    return "pay_emv";
+  }
+
+  if (normalized === "applepay" || normalized === "apple_pay" || normalized === "apple pay") {
+    return "pay_applepay";
+  }
+
+  if (normalized === "googlepay" || normalized === "google_pay" || normalized === "google pay") {
+    return "pay_googlepay";
+  }
+
+  if (normalized === "webqr" || normalized === "website" || normalized === "web_qr" || normalized === "web qr") {
+    return "pay_website";
+  }
+
+  return null;
+}
+
+function stationStatsWhereClause(filters: CandidateFilters, params: unknown[]) {
+  const clauses: string[] = [];
+  const useHpcPrice =
+    filters.currentTypes?.includes("DC") &&
+    (filters.minPowerKw ?? 0) >= 100 &&
+    filters.maxPowerKw === undefined;
+  const hasPriceColumn = useHpcPrice ? "hpc_has_price" : "has_price";
+  const minPriceColumn = useHpcPrice ? "hpc_min_price_kwh" : "min_price_kwh";
+  const maxPriceColumn = useHpcPrice ? "hpc_max_price_kwh" : "max_price_kwh";
+
+  if (filters.currentTypes?.includes("AC")) {
+    clauses.push("has_ac");
+  }
+
+  if (filters.currentTypes?.includes("DC")) {
+    clauses.push("has_dc");
+  }
+
+  if (filters.minPowerKw !== undefined) {
+    params.push(filters.minPowerKw);
+    clauses.push(`max_power_kw >= $${params.length}::float8`);
+  }
+
+  if (filters.maxPowerKw !== undefined) {
+    params.push(filters.maxPowerKw);
+    clauses.push(`max_power_kw <= $${params.length}::float8`);
+  }
+
+  if (filters.minChargePointCount !== undefined) {
+    params.push(filters.minChargePointCount);
+    clauses.push(`charge_point_count >= $${params.length}::int`);
+  }
+
+  if (filters.maxChargePointCount !== undefined) {
+    params.push(filters.maxChargePointCount);
+    clauses.push(`charge_point_count <= $${params.length}::int`);
+  }
+
+  if (filters.availableOnly) {
+    clauses.push("available_count > 0");
+  }
+
+  if (filters.minPriceKwh !== undefined || filters.maxPriceKwh !== undefined) {
+    clauses.push(hasPriceColumn);
+  }
+
+  if (filters.minPriceKwh !== undefined) {
+    params.push(filters.minPriceKwh);
+    clauses.push(`${maxPriceColumn} >= $${params.length}::float8`);
+  }
+
+  if (filters.maxPriceKwh !== undefined) {
+    params.push(filters.maxPriceKwh);
+    clauses.push(`${minPriceColumn} <= $${params.length}::float8`);
+  }
+
+  if (filters.onlyCompletePrices) {
+    clauses.push("complete_price");
+  }
+
+  if (filters.allowSessionFee === false) {
+    clauses.push("not has_session_fee");
+  }
+
+  if (filters.allowBlockingFee === false) {
+    clauses.push("not has_blocking_fee");
+  }
+
+  if (filters.freshWithinMinutes !== undefined) {
+    params.push(filters.freshWithinMinutes);
+    clauses.push(`status_age_min <= $${params.length}::int`);
+    clauses.push(`price_age_min <= $${params.length}::int`);
+  }
+
+  if (filters.cpoIds?.length) {
+    params.push(filters.cpoIds);
+    clauses.push(`cpo_id = any($${params.length}::text[])`);
+  }
+
+  const paymentProperties = new Set(
+    (filters.paymentMethods ?? [])
+      .map(paymentFilterProperty)
+      .filter((property): property is PaymentFilterProperty => property != null),
+  );
+
+  for (const property of paymentProperties) {
+    clauses.push(property);
+  }
+
+  return clauses.length ? `where ${clauses.join(" and ")}` : "";
 }
 
 async function loadStationRows(
@@ -541,6 +676,252 @@ export async function listStationRecordsInBoundsDb(
   client?: PoolClient,
 ) {
   return mapStationRowsToRecords(await loadStationRows(undefined, client, bounds), client);
+}
+
+export async function loadStationStatsInBoundsDb(
+  bounds: StationBounds,
+  filters: CandidateFilters = {},
+  client?: PoolClient,
+) {
+  const executor = client ?? getPool();
+  const normalizedBounds = normalizeBounds(bounds);
+  const params: unknown[] = [
+    normalizedBounds.minLng,
+    normalizedBounds.minLat,
+    normalizedBounds.maxLng,
+    normalizedBounds.maxLat,
+  ];
+  const filteredWhere = stationStatsWhereClause(filters, params);
+  const result = await executor.query<StationStatsRow>(
+    `with station_base as (
+        select
+          s.id,
+          s.cpo_id,
+          c.name as cpo_name,
+          s.charge_point_count,
+          coalesce(o.max_power_kw, derived.max_power_kw, s.max_power_kw)::float8 as max_power_kw,
+          s.current_types,
+          s.available_count,
+          s.last_price_update_at,
+          s.last_status_update_at
+        from stations s
+        join cpos c
+          on c.id = s.cpo_id
+   left join station_overrides o
+          on o.station_id = s.id
+   left join lateral (
+          select nullif(max(
+            case
+              when cp.current_type = 'AC'
+               and cp.max_power_kw >= 7
+               and cp.max_power_kw <= 7.5
+               and exists (
+                 select 1
+                   from connectors c2
+                  where c2.charge_point_id = cp.id
+                    and lower(c2.connector_type) like '%iec62196t2%'
+                    and lower(c2.connector_type) not like '%combo%'
+                    and lower(c2.connector_type) not like '%ccs%'
+               )
+                then 22
+              else cp.max_power_kw
+            end
+          ), 0)::float8 as max_power_kw
+            from charge_points cp
+           where cp.station_id = s.id
+        ) derived on true
+       where s.geom && ST_MakeEnvelope($1::float8, $2::float8, $3::float8, $4::float8, 4326)
+         and coalesce(o.is_hidden, false) = false
+      ),
+      tariff_components_by_tariff as (
+        select
+          t.id as tariff_id,
+          t.station_id,
+          t.tariff_scope,
+          cp.current_type as charge_point_current_type,
+          (case
+            when cp.current_type = 'AC'
+             and cp.max_power_kw >= 7
+             and cp.max_power_kw <= 7.5
+             and exists (
+               select 1
+                 from connectors c2
+                where c2.charge_point_id = cp.id
+                  and lower(c2.connector_type) like '%iec62196t2%'
+                  and lower(c2.connector_type) not like '%combo%'
+                  and lower(c2.connector_type) not like '%ccs%'
+             )
+              then 22
+            else cp.max_power_kw
+          end)::float8 as charge_point_max_power_kw,
+          t.is_complete,
+          min(
+            case
+              when tc.component_type = 'pricePerKWh' and tc.amount is not null then
+                case
+                  when tc.tax_included = false and tc.tax_rate is not null then
+                    tc.amount * (1 + tc.tax_rate / 100)
+                  else tc.amount
+                end
+            end
+          )::float8 as price_per_kwh,
+          bool_or(tc.component_type = 'sessionFee' and coalesce(tc.amount, 0) > 0) as has_session_fee,
+          bool_or(
+            tc.component_type = 'blockingFee' and
+            (coalesce(tc.amount, 0) > 0 or tc.starts_after_minutes is not null)
+          ) as has_blocking_fee
+        from tariffs t
+   left join charge_points cp
+          on cp.id = t.charge_point_id
+   left join tariff_components tc
+          on tc.tariff_id = t.id
+       where t.station_id in (select id from station_base)
+       group by t.id, t.station_id, t.tariff_scope, cp.id, cp.current_type, cp.max_power_kw, t.is_complete
+      ),
+      tariff_by_station as (
+        select
+          station_id,
+          min(price_per_kwh) as min_price_kwh,
+          max(price_per_kwh) as max_price_kwh,
+          min(price_per_kwh) filter (
+            where tariff_scope = 'station'
+               or (
+                 charge_point_current_type = 'DC'
+                 and charge_point_max_power_kw >= 100
+               )
+          ) as hpc_min_price_kwh,
+          max(price_per_kwh) filter (
+            where tariff_scope = 'station'
+               or (
+                 charge_point_current_type = 'DC'
+                 and charge_point_max_power_kw >= 100
+               )
+          ) as hpc_max_price_kwh,
+          bool_or(is_complete) as complete_price,
+          bool_or(coalesce(has_session_fee, false)) as has_session_fee,
+          bool_or(coalesce(has_blocking_fee, false)) as has_blocking_fee
+        from tariff_components_by_tariff
+       group by station_id
+      ),
+      payment_by_station as (
+        select
+          t.station_id,
+          bool_or(lower(pm.payment_method) in ('emv', 'eccard', 'creditcard')) as pay_emv,
+          bool_or(lower(pm.payment_method) in ('applepay', 'apple_pay', 'apple pay')) as pay_applepay,
+          bool_or(lower(pm.payment_method) in ('googlepay', 'google_pay', 'google pay')) as pay_googlepay,
+          bool_or(lower(pm.payment_method) in ('website', 'webqr', 'web_qr', 'web qr')) as pay_website
+        from tariffs t
+        join tariff_payment_methods pm
+          on pm.tariff_id = t.id
+       where t.station_id in (select id from station_base)
+       group by t.station_id
+      ),
+      station_features as (
+        select
+          s.cpo_id,
+          s.cpo_name,
+          s.charge_point_count::int,
+          s.max_power_kw,
+          s.available_count::int,
+          'AC' = any(s.current_types) as has_ac,
+          'DC' = any(s.current_types) as has_dc,
+          'DC' = any(s.current_types) and s.max_power_kw >= 100 as is_hpc,
+          case
+            when s.last_status_update_at is null then 2147483647
+            else greatest(0, floor(extract(epoch from (now() - s.last_status_update_at)) / 60))::int
+          end as status_age_min,
+          case
+            when s.last_price_update_at is null then 2147483647
+            else greatest(0, floor(extract(epoch from (now() - s.last_price_update_at)) / 60))::int
+          end as price_age_min,
+          t.min_price_kwh,
+          t.max_price_kwh,
+          t.hpc_min_price_kwh,
+          t.hpc_max_price_kwh,
+          t.min_price_kwh is not null as has_price,
+          t.hpc_min_price_kwh is not null as hpc_has_price,
+          coalesce(t.complete_price, false) as complete_price,
+          coalesce(t.has_session_fee, false) as has_session_fee,
+          coalesce(t.has_blocking_fee, false) as has_blocking_fee,
+          coalesce(p.pay_emv, false) as pay_emv,
+          coalesce(p.pay_applepay, false) as pay_applepay,
+          coalesce(p.pay_googlepay, false) as pay_googlepay,
+          coalesce(p.pay_website, false) as pay_website
+        from station_base s
+   left join tariff_by_station t
+          on t.station_id = s.id
+   left join payment_by_station p
+          on p.station_id = s.id
+      ),
+      filtered_stations as (
+        select *
+          from station_features
+          ${filteredWhere}
+      ),
+      provider_stats as (
+        select
+          cpo_id,
+          cpo_name,
+          count(*)::int as stations,
+          coalesce(sum(charge_point_count), 0)::int as charge_points
+        from filtered_stations
+       group by cpo_id, cpo_name
+      ),
+      summary as (
+        select
+          count(*)::int as station_count,
+          coalesce(sum(charge_point_count), 0)::int as charge_point_count,
+          coalesce(sum(available_count), 0)::int as available_charge_point_count,
+          max(max_power_kw)::float8 as max_power_kw,
+          count(*) filter (where has_ac)::int as ac_count,
+          count(*) filter (where has_dc)::int as dc_count,
+          count(*) filter (where is_hpc)::int as hpc_count,
+          min(min_price_kwh)::float8 as min_price_kwh,
+          max(max_price_kwh)::float8 as max_price_kwh,
+          count(*) filter (where complete_price)::int as complete_price_count
+        from filtered_stations
+      )
+      select
+        summary.*,
+        coalesce(
+          (
+            select json_agg(
+              json_build_object(
+                'cpoId', cpo_id,
+                'cpoName', cpo_name,
+                'stations', stations,
+                'chargePoints', charge_points
+              )
+              order by charge_points desc, stations desc, cpo_name asc
+            )
+            from provider_stats
+          ),
+          '[]'::json
+        ) as provider_list
+      from summary`,
+    params,
+  );
+  const row = result.rows[0];
+
+  return stationStatsSchema.parse({
+    stationCount: Number(row?.station_count ?? 0),
+    chargePointCount: Number(row?.charge_point_count ?? 0),
+    availableChargePointCount: Number(row?.available_charge_point_count ?? 0),
+    maxPowerKw: row?.max_power_kw == null ? null : Number(row.max_power_kw),
+    currentTypeCounts: {
+      ac: Number(row?.ac_count ?? 0),
+      dc: Number(row?.dc_count ?? 0),
+      hpc: Number(row?.hpc_count ?? 0),
+    },
+    priceBand: {
+      min: row?.min_price_kwh == null ? null : Number(row.min_price_kwh),
+      max: row?.max_price_kwh == null ? null : Number(row.max_price_kwh),
+    },
+    completePriceShare: Number(row?.station_count ?? 0) > 0
+      ? Number(row?.complete_price_count ?? 0) / Number(row?.station_count ?? 1)
+      : null,
+    providerList: row?.provider_list ?? [],
+  });
 }
 
 export async function loadStationMapTileDb(

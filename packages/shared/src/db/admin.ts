@@ -389,28 +389,42 @@ export async function getAppSecret(key: string): Promise<string | null> {
 export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
   const executor = client ?? getPool();
   const running = await executor.query<{ id: string }>(
-    `update sync_runs
+    `with stale as (
+       select id
+         from sync_runs
+        where status = 'running'
+          and started_at < now() - interval '5 minutes'
+        for update skip locked
+     )
+     update sync_runs
         set status = 'failed',
             finished_at = now(),
             message = 'Abgebrochen (Timeout)',
             progress_stage = 'failed',
             progress_detail = 'Timeout-Cleanup nach 5 Minuten',
             heartbeat_at = now()
-      where status = 'running'
-        and started_at < now() - interval '5 minutes'
-      returning id::text`,
+       from stale
+      where sync_runs.id = stale.id
+      returning sync_runs.id::text`,
   );
   const queued = await executor.query<{ id: string }>(
-    `update sync_runs
+    `with stale as (
+       select id
+         from sync_runs
+        where status = 'queued'
+          and started_at < now() - interval '60 minutes'
+        for update skip locked
+     )
+     update sync_runs
         set status = 'failed',
             finished_at = now(),
             message = 'Abgebrochen (Queue-Timeout)',
             progress_stage = 'failed',
             progress_detail = 'Queue-Timeout nach 60 Minuten',
             heartbeat_at = now()
-      where status = 'queued'
-        and started_at < now() - interval '60 minutes'
-      returning id::text`,
+       from stale
+      where sync_runs.id = stale.id
+      returning sync_runs.id::text`,
   );
   return (running.rowCount ?? 0) + (queued.rowCount ?? 0);
 }

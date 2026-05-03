@@ -1,7 +1,6 @@
 import {
   findCandidatesForRoute,
   findStationsInView,
-  summarizeStationStats,
   resolveLocation,
   getStationDetail,
   routePlanSchema,
@@ -16,6 +15,7 @@ import {
   listStationRecordsInBoundsDb,
   listCpoSummariesDb,
   loadChargePointRowsDb,
+  loadStationStatsInBoundsDb,
   usingDatabase,
 } from "@adhoc/shared/db";
 
@@ -165,5 +165,6 @@ export async function loadMapStationStats(
   bounds: { minLat: number; minLng: number; maxLat: number; maxLng: number },
   filters: CandidateFilters,
 ) {
-  return summarizeStationStats(await listMapStations(bounds, filters));
+  requirePublicDatabase();
+  return loadStationStatsInBoundsDb(bounds, filters);
 }
