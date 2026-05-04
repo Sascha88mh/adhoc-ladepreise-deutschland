@@ -21,6 +21,7 @@ import {
 type Props = {
   initialFeeds: FeedConfig[];
   initialSyncRuns: SyncRun[];
+  initialLoadError?: string;
 };
 
 type FeedFormState = {
@@ -117,14 +118,18 @@ function formatDateTime(value: string | null) {
   });
 }
 
-function formatRelativeMinutes(value: string | null) {
+function formatRelativeMinutes(value: string | null, nowMs: number | null) {
   if (!value) {
     return "keine Aktivität";
   }
 
+  if (nowMs == null) {
+    return "wird aktualisiert";
+  }
+
   const diffMinutes = Math.max(
     0,
-    Math.round((Date.now() - new Date(value).getTime()) / 60000),
+    Math.round((nowMs - new Date(value).getTime()) / 60000),
   );
 
   if (diffMinutes < 1) {
@@ -160,7 +165,7 @@ function formatBytes(value: number | null | undefined) {
   return `${value} B`;
 }
 
-function progressText(run: SyncRun | undefined) {
+function progressText(run: SyncRun | undefined, nowMs: number | null) {
   if (!run) {
     return null;
   }
@@ -172,7 +177,7 @@ function progressText(run: SyncRun | undefined) {
       ? `${run.processedCount}/${run.totalCount}`
       : null,
     formatBytes(run.payloadSizeBytes),
-    run.heartbeatAt ? `Heartbeat ${formatRelativeMinutes(run.heartbeatAt)}` : null,
+    run.heartbeatAt ? `Heartbeat ${formatRelativeMinutes(run.heartbeatAt, nowMs)}` : null,
   ].filter(Boolean);
 
   return parts.length ? parts.join(" · ") : null;
@@ -244,7 +249,11 @@ function statusTone(status: SyncRun["status"]) {
   }
 }
 
-function healthForFeed(feed: FeedConfig, latestRun: SyncRun | undefined): FeedHealth {
+function healthForFeed(
+  feed: FeedConfig,
+  latestRun: SyncRun | undefined,
+  nowMs: number | null,
+): FeedHealth {
   if (!feed.isActive) {
     return {
       label: "deaktiviert",
@@ -301,19 +310,20 @@ function healthForFeed(feed: FeedConfig, latestRun: SyncRun | undefined): FeedHe
 
   if (
     interval != null &&
-    Date.now() - new Date(feed.lastSuccessAt).getTime() > interval * 60_000 * 2
+    nowMs != null &&
+    nowMs - new Date(feed.lastSuccessAt).getTime() > interval * 60_000 * 2
   ) {
     return {
       label: "stale",
       tone: "bg-[#f7ecd8] text-[#8a6413]",
-      detail: `Überfällig seit ${formatRelativeMinutes(feed.lastSuccessAt)}`,
+      detail: `Überfällig seit ${formatRelativeMinutes(feed.lastSuccessAt, nowMs)}`,
     };
   }
 
   return {
     label: "ok",
     tone: "bg-[#dff4ea] text-[#166746]",
-    detail: `Letzter Erfolg ${formatRelativeMinutes(feed.lastSuccessAt)}`,
+    detail: `Letzter Erfolg ${formatRelativeMinutes(feed.lastSuccessAt, nowMs)}`,
   };
 }
 
@@ -662,13 +672,13 @@ function FeedEditor({
   );
 }
 
-export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
+export function AdminConsole({ initialFeeds, initialSyncRuns, initialLoadError }: Props) {
   const [feeds, setFeeds] = useState(initialFeeds);
   const [syncRuns, setSyncRuns] = useState(initialSyncRuns);
   const [form, setForm] = useState(EMPTY_FORM);
   const [expandedFeedId, setExpandedFeedId] = useState<string | null>(null);
   const [createFormOpen, setCreateFormOpen] = useState(false);
-  const [uiError, setUiError] = useState<string | null>(null);
+  const [uiError, setUiError] = useState<string | null>(initialLoadError ?? null);
   const [stationQuery, setStationQuery] = useState("");
   const [stationResults, setStationResults] = useState<AdminStationRecord[]>([]);
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
@@ -677,6 +687,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
   const [activeTab, setActiveTab] = useState<"feeds" | "runs" | "overrides">("feeds");
   const [feedFilters, setFeedFilters] = useState<FeedFilterState>(EMPTY_FEED_FILTERS);
   const [feedActions, setFeedActions] = useState<Record<string, FeedActionState>>({});
+  const [nowMs, setNowMs] = useState<number | null>(null);
   const [, startTransition] = useTransition();
 
   const runsByFeed = useMemo(() => {
@@ -695,8 +706,22 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
     stationResults.find((station) => station.stationId === selectedStationId) ?? null;
   const hasActiveRuns = syncRuns.some((run) => run.status === "queued" || run.status === "running");
   const feedFilterCount = activeFeedFilterCount(feedFilters);
+  const feedListUnavailable = feeds.length === 0 && feedFilterCount === 0 && Boolean(uiError);
 
   useEffect(() => {
+    const initialTimer = window.setTimeout(() => setNowMs(Date.now()), 0);
+    const interval = window.setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== "overrides") {
+      return;
+    }
+
     const timer = window.setTimeout(async () => {
       try {
         const results = await searchAdminStations(stationQuery);
@@ -714,7 +739,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
     }, 250);
 
     return () => window.clearTimeout(timer);
-  }, [selectedStationId, startTransition, stationQuery]);
+  }, [activeTab, selectedStationId, startTransition, stationQuery]);
 
   useEffect(() => {
     if (activeTab !== "feeds") {
@@ -1392,17 +1417,19 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
           <div className="divide-y divide-slate-100">
             {feeds.length === 0 ? (
               <div className="px-5 py-10 text-center text-sm text-[var(--muted)]">
-                {feedFilterCount > 0
-                  ? "Keine Feeds passen zu den aktuellen Filtern."
-                  : "Noch keine Feeds angelegt."}
+                {feedListUnavailable
+                  ? "Feeds konnten gerade nicht geladen werden. Die Einträge wurden nicht gelöscht."
+                  : feedFilterCount > 0
+                    ? "Keine Feeds passen zu den aktuellen Filtern."
+                    : "Noch keine Feeds angelegt."}
               </div>
             ) : null}
             {feeds.map((feed) => {
               const latestRun = runsByFeed[feed.id]?.[0];
-              const health = healthForFeed(feed, latestRun);
+              const health = healthForFeed(feed, latestRun, nowMs);
               const isExpanded = expandedFeedId === feed.id;
               const busy = feedActions[feed.id] ?? null;
-              const actionStatusText = busy?.label ?? progressText(latestRun) ?? latestRun?.message ?? health.detail;
+              const actionStatusText = busy?.label ?? progressText(latestRun, nowMs) ?? latestRun?.message ?? health.detail;
               const latestRunLabel = latestRun?.status ?? health.label;
               const latestRunTone = latestRun ? statusTone(latestRun.status) : health.tone;
 
@@ -1455,7 +1482,7 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
                         <div className="text-sm text-slate-700">
                           <div>{formatDateTime(feed.lastSuccessAt)}</div>
                           <div className="mt-1 text-xs text-[var(--muted)]">
-                            {formatRelativeMinutes(feed.lastSuccessAt)}
+                            {formatRelativeMinutes(feed.lastSuccessAt, nowMs)}
                           </div>
                         </div>
                       </InfoCell>
@@ -1577,8 +1604,8 @@ export function AdminConsole({ initialFeeds, initialSyncRuns }: Props) {
                   </span>
                 </div>
                 <p className="text-sm text-slate-700">{run.message}</p>
-                {progressText(run) ? (
-                  <p className="mt-1 text-xs text-slate-500">{progressText(run)}</p>
+                {progressText(run, nowMs) ? (
+                  <p className="mt-1 text-xs text-slate-500">{progressText(run, nowMs)}</p>
                 ) : null}
                 <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[var(--muted)]">
                   <span>{new Date(run.startedAt).toLocaleString("de-DE")}</span>

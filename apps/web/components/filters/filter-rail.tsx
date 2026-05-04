@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronDown, ChevronUp, Filter, WalletCards } from "lucide-react";
+import { ChevronDown, Filter, WalletCards } from "lucide-react";
 import type { CandidateFilters } from "@adhoc/shared";
 import { DualRangeSlider } from "@/components/ui/range-slider";
 
@@ -12,6 +12,7 @@ type Props = {
   hitCount: number;
   priceBand: { min: number | null; max: number | null };
   cpos: Array<{ id: string; name: string; stations: number }>;
+  cposLoading?: boolean;
   expanded: boolean;
   onToggle: () => void;
   showCorridorFilter?: boolean;
@@ -20,8 +21,21 @@ type Props = {
 const MAX_POWER_KW = 1000;
 const MAX_CHARGE_POINTS = 50;
 const MAX_PRICE_CENTS = 100;
-const DEFAULT_CORRIDOR_KM = 5;
-const MAX_CORRIDOR_KM = 25;
+const DEFAULT_CORRIDOR_KM = 0.5;
+const MIN_CORRIDOR_KM = 0.1;
+const MAX_CORRIDOR_KM = 2;
+type PowerTier = "Alle" | "AC" | "DC" | "HPC";
+
+function corridorLabel(valueKm: number) {
+  if (valueKm < 1) {
+    return `${Math.round(valueKm * 1000)} m`;
+  }
+
+  return `${valueKm.toLocaleString("de-DE", {
+    maximumFractionDigits: 1,
+    minimumFractionDigits: valueKm % 1 === 0 ? 0 : 1,
+  })} km`;
+}
 
 function toggleArrayValue<T extends string>(values: T[] | undefined, value: T) {
   if (!values?.includes(value)) {
@@ -89,14 +103,14 @@ function CollapsibleFilterSection({ title, defaultExpanded = false, children }: 
   );
 }
 
-function AnimatedSegmentedControl({
+function AnimatedSegmentedControl<TId extends string>({
   options,
   activeId,
   onChange,
 }: {
-  options: { id: string; label: string }[];
-  activeId: string;
-  onChange: (id: any) => void;
+  options: { id: TId; label: string }[];
+  activeId: TId;
+  onChange: (id: TId) => void;
 }) {
   return (
     <div className="flex items-center gap-1.5">
@@ -126,27 +140,16 @@ function AnimatedSegmentedControl({
   );
 }
 
-function formatPriceBand(priceBand: { min: number | null; max: number | null }) {
-  if (priceBand.min == null || priceBand.max == null) {
-    return "Noch kein Preisband";
-  }
-
-  return `${priceBand.min.toFixed(2).replace(".", ",")}–${priceBand.max
-    .toFixed(2)
-    .replace(".", ",")} €/kWh`;
-}
-
 export function FilterRail({
   filters,
   onChange,
-  hitCount,
-  priceBand,
   cpos,
+  cposLoading = false,
   expanded,
   onToggle,
   showCorridorFilter = true,
 }: Props) {
-  function isPowerTierActive(filtersToTest: CandidateFilters, tier: "Alle" | "AC" | "DC" | "HPC") {
+  function isPowerTierActive(filtersToTest: CandidateFilters, tier: PowerTier) {
     if (tier === "Alle") {
       return !filtersToTest.currentTypes && !filtersToTest.minPowerKw && !filtersToTest.maxPowerKw;
     }
@@ -162,7 +165,7 @@ export function FilterRail({
     return false;
   }
 
-  function handleToggleTier(tier: "Alle" | "AC" | "DC" | "HPC") {
+  function handleToggleTier(tier: PowerTier) {
     if (tier === "Alle" || isPowerTierActive(filters, tier)) {
       const next = { ...filters };
       delete next.currentTypes;
@@ -189,7 +192,7 @@ export function FilterRail({
     onChange(next);
   }
 
-  let activeTier = "Alle";
+  let activeTier: PowerTier = "Alle";
   if (isPowerTierActive(filters, "AC")) activeTier = "AC";
   else if (isPowerTierActive(filters, "DC")) activeTier = "DC";
   else if (isPowerTierActive(filters, "HPC")) activeTier = "HPC";
@@ -261,12 +264,12 @@ export function FilterRail({
               <div className="space-y-6 pt-5 pb-2">
               {showCorridorFilter ? (
                 <section>
-                  <p className="metric-label mb-2">Korridor entlang der Route</p>
+                  <p className="metric-label mb-2">Maximale Entfernung zur Route</p>
                   <input
                     type="range"
-                    min={1}
+                    min={MIN_CORRIDOR_KM}
                     max={MAX_CORRIDOR_KM}
-                    step={1}
+                    step={0.1}
                     value={filters.corridorKm ?? DEFAULT_CORRIDOR_KM}
                     onChange={(event) =>
                       onChange({
@@ -277,11 +280,11 @@ export function FilterRail({
                     className="w-full accent-[var(--accent)]"
                   />
                   <div className="mt-2 flex items-center justify-between text-sm text-[var(--muted)]">
-                    <span>1 km</span>
+                    <span>{corridorLabel(MIN_CORRIDOR_KM)}</span>
                     <strong className="text-[var(--foreground)]">
-                      {(filters.corridorKm ?? DEFAULT_CORRIDOR_KM).toFixed(0)} km
+                      {corridorLabel(filters.corridorKm ?? DEFAULT_CORRIDOR_KM)}
                     </strong>
-                    <span>{MAX_CORRIDOR_KM} km</span>
+                    <span>{corridorLabel(MAX_CORRIDOR_KM)}</span>
                   </div>
                 </section>
               ) : null}
@@ -414,6 +417,16 @@ export function FilterRail({
 
               <CollapsibleFilterSection title="Anbieter">
                 <div className="max-h-44 space-y-2 overflow-y-auto px-1 -mx-1 text-sm custom-scrollbar scroll-shadow">
+                  {cposLoading ? (
+                    <p className="rounded-2xl bg-white/72 px-3 py-2 text-[var(--muted)]">
+                      Anbieter werden geladen...
+                    </p>
+                  ) : null}
+                  {!cposLoading && cpos.length === 0 ? (
+                    <p className="rounded-2xl bg-white/72 px-3 py-2 text-[var(--muted)]">
+                      Anbieter erscheinen nach dem Laden.
+                    </p>
+                  ) : null}
                   {cpos.map((cpo) => (
                     <label key={cpo.id} className="flex items-center justify-between gap-3 rounded-2xl bg-white/72 px-3 py-2">
                       <span className="flex items-center gap-3">

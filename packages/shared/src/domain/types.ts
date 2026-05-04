@@ -125,6 +125,7 @@ export const routeCandidateSchema = z.object({
   addressLine: z.string(),
   city: z.string(),
   distanceFromRouteKm: z.number().nonnegative(),
+  distanceFromStartKm: z.number().nonnegative().default(0),
   detourMinutes: z.number().nonnegative(),
   maxPowerKw: z.number().nonnegative(),
   chargePointCount: z.number().int().positive(),
@@ -191,7 +192,7 @@ export const stationDetailSchema = stationRecordSchema.extend({
 export type StationDetail = z.infer<typeof stationDetailSchema>;
 
 export const candidateFiltersSchema = z.object({
-  corridorKm: z.number().positive().optional(),
+  corridorKm: z.number().min(0.1).max(2).optional(),
   maxPriceKwh: z.number().positive().optional(),
   minPriceKwh: z.number().nonnegative().optional(),
   minPowerKw: z.number().positive().optional(),
@@ -206,7 +207,7 @@ export const candidateFiltersSchema = z.object({
   allowBlockingFee: z.boolean().optional(),
   onlyCompletePrices: z.boolean().optional(),
   freshWithinMinutes: z.number().int().positive().optional(),
-  sort: z.enum(["price", "detour", "power"]).optional(),
+  sort: z.enum(["price", "detour", "power", "route"]).optional(),
 });
 export type CandidateFilters = z.infer<typeof candidateFiltersSchema>;
 
@@ -342,6 +343,7 @@ export const publicCandidatesResponseSchema = z.object({
     route: routePlanSchema,
     filters: candidateFiltersSchema,
     candidates: z.array(routeCandidateSchema),
+    totalCandidateCount: z.number().int().nonnegative().optional(),
     providerList: z.array(
       z.object({
         cpoId: z.string(),
@@ -358,6 +360,16 @@ export const publicCandidatesResponseSchema = z.object({
 
 export const publicMapStationsResponseSchema = z.object({
   data: z.array(routeCandidateSchema),
+});
+
+export const publicCposResponseSchema = z.object({
+  data: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      stations: z.number().int().nonnegative(),
+    }),
+  ),
 });
 
 export const publicStationStatsResponseSchema = z.object({

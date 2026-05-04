@@ -2,6 +2,7 @@ import {
   adminStationRecordSchema,
   publicLocationSuggestionsResponseSchema,
   publicMapStationsResponseSchema,
+  publicCposResponseSchema,
   publicCandidatesResponseSchema,
   publicReverseLocationResponseSchema,
   publicRoutePlanResponseSchema,
@@ -103,6 +104,11 @@ export async function fetchRouteCandidates(payload: {
   });
 
   return publicCandidatesResponseSchema.parse(response).data;
+}
+
+export async function fetchCpos(): Promise<Array<{ id: string; name: string; stations: number }>> {
+  const response = await requestJson<unknown>("/api/public/cpos?limit=150");
+  return publicCposResponseSchema.parse(response).data;
 }
 
 export async function fetchMapStations(payload: {

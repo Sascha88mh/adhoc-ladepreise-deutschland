@@ -25,6 +25,7 @@ const MAP_STYLES = {
 
 const INTERACTIVE_STATION_LAYERS = [
   "browse-points",
+  "candidate-halo",
   "candidate-points",
   "browse-power-labels",
   "candidate-power-labels",
@@ -32,6 +33,7 @@ const INTERACTIVE_STATION_LAYERS = [
 const STATION_TILE_SOURCE_ID = "station-tiles";
 const STATION_TILE_SOURCE_LAYER = "stations";
 const STATION_TILE_FILTER_LAYERS = ["browse-points", "browse-power-labels"] as const;
+const STATION_TILE_MAX_ZOOM = 14;
 const STATION_TILE_URL_TEMPLATE =
   process.env.NEXT_PUBLIC_MAP_TILE_URL ??
   "/api/public/stations/tiles/{z}/{x}/{y}";
@@ -181,7 +183,7 @@ function candidateCollection(candidates: RouteCandidate[]) {
   const now = Date.now();
   return {
     type: "FeatureCollection" as const,
-    features: candidates.map((candidate) => {
+    features: candidates.map((candidate, index) => {
       const lastStatusMs = new Date(candidate.lastStatusUpdateAt).getTime();
       const statusAgeMin = lastStatusMs === 0
         ? 2147483647
@@ -194,6 +196,7 @@ function candidateCollection(candidates: RouteCandidate[]) {
         },
         properties: {
           id: candidate.stationId,
+          rank: index + 1,
           available: candidate.availabilitySummary.available,
           status_age_min: statusAgeMin,
           power: candidate.maxPowerKw,
@@ -488,7 +491,7 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
       type: "vector",
       tiles: [stationTileUrl()],
       minzoom: 5,
-      maxzoom: 16,
+      maxzoom: STATION_TILE_MAX_ZOOM,
     });
   }
 
@@ -579,12 +582,12 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
           "interpolate",
           ["linear"],
           ["zoom"],
-          5, 2.0,
-          9, 3.5,
-          11, 6.0,
-          12, 10.5,
-          14, 12.5,
-          16, 14.5,
+          5, 1.8,
+          9, 3.2,
+          11, 5.4,
+          12, 9.5,
+          14, 11.3,
+          16, 13.0,
         ],
         "circle-opacity": [
           "interpolate",
@@ -618,6 +621,52 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
     });
   }
 
+  if (!map.getLayer("candidate-halo")) {
+    map.addLayer({
+      id: "candidate-halo",
+      type: "circle",
+      source: "candidates",
+      paint: {
+        "circle-color": palette.line,
+        "circle-opacity": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          0.18,
+          10,
+          0.3,
+          14,
+          0.42,
+        ],
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          7,
+          9,
+          12,
+          12,
+          20,
+          16,
+          28,
+        ],
+        "circle-stroke-color": palette.line,
+        "circle-stroke-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          8,
+          1,
+          13,
+          3,
+        ],
+        "circle-stroke-opacity": 0.82,
+      },
+    });
+  }
+
   if (!map.getLayer("candidate-points")) {
     map.addLayer({
       id: "candidate-points",
@@ -636,14 +685,14 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
           "interpolate",
           ["linear"],
           ["zoom"],
-          5, 2.7,
-          9, 4.5,
-          11, 7.5,
-          12, 12.5,
-          14, 15.0,
-          16, 17.0,
+          5, 4.0,
+          9, 6.4,
+          11, 9.4,
+          12, 13.8,
+          14, 16.5,
+          16, 18.5,
         ],
-        "circle-opacity": 0.84,
+        "circle-opacity": 0.96,
         "circle-stroke-color": palette.candidateStroke,
         "circle-stroke-width": [
           "interpolate",
@@ -693,26 +742,33 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
       id: "candidate-power-labels",
       type: "symbol",
       source: "candidates",
-      minzoom: 11,
+      minzoom: 8,
       layout: {
-        "text-field": ["to-string", ["get", "power"]],
+        "text-field": [
+          "concat",
+          ["to-string", ["get", "rank"]],
+          " · ",
+          ["to-string", ["get", "power"]],
+          " kW",
+        ],
         "text-size": [
           "interpolate",
           ["linear"],
           ["zoom"],
-          11,
-          9,
+          8,
+          10,
           15,
-          11.5,
+          12.5,
         ],
         "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
-        "text-allow-overlap": false,
-        "text-ignore-placement": false,
+        "text-allow-overlap": true,
+        "text-ignore-placement": true,
+        "text-offset": [0, 1.35],
       },
       paint: {
         "text-color": "#ffffff",
-        "text-halo-color": "rgba(15, 23, 42, 0.5)",
-        "text-halo-width": 0.8,
+        "text-halo-color": "rgba(15, 23, 42, 0.78)",
+        "text-halo-width": 1.4,
       },
     });
   }
@@ -745,6 +801,8 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
 
   map.setPaintProperty("route-glow", "line-color", palette.glow);
   map.setPaintProperty("route-line", "line-color", palette.line);
+  map.setPaintProperty("candidate-halo", "circle-color", palette.line);
+  map.setPaintProperty("candidate-halo", "circle-stroke-color", palette.line);
   map.setPaintProperty("focus-halo", "circle-color", palette.focusHalo);
   map.setPaintProperty("focus-halo", "circle-stroke-color", palette.focusCore);
   map.setPaintProperty("focus-core", "circle-color", palette.focusCore);

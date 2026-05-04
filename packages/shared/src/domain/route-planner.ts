@@ -60,7 +60,7 @@ function toRoutePlan(
   return routePlanSchema.parse({
     routeId: createId([origin.label, destination.label, profile, source]),
     profile,
-    corridorKm: 5,
+    corridorKm: 0.5,
     origin,
     destination,
     geometry: summary.geometry,

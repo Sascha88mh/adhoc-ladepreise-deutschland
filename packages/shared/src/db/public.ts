@@ -46,6 +46,17 @@ type StationTile = {
   y: number;
 };
 
+type RoutePoint = {
+  lat: number;
+  lng: number;
+};
+
+type RouteCorridorFilter = {
+  points: RoutePoint[];
+  corridorKm: number;
+  rowLimit?: number;
+};
+
 type PaymentFilterProperty = "pay_emv" | "pay_applepay" | "pay_googlepay" | "pay_website";
 
 type StationStatsRow = {
@@ -356,11 +367,28 @@ async function loadStationRows(
   stationCode?: string,
   client?: PoolClient,
   bounds?: StationBounds,
+  routeCorridor?: RouteCorridorFilter,
 ) {
   const executor = client ?? getPool();
   const normalizedBounds = bounds ? normalizeBounds(bounds) : null;
+  const routeLats = routeCorridor?.points.map((point) => point.lat) ?? null;
+  const routeLngs = routeCorridor?.points.map((point) => point.lng) ?? null;
+  const corridorMeters = routeCorridor ? routeCorridor.corridorKm * 1000 : null;
+  const rowLimit = routeCorridor?.rowLimit ?? null;
   const result = await executor.query<StationRow>(
-    `select
+    `with route_line as (
+       select ST_SetSRID(
+         ST_MakeLine(point_geom order by ord),
+         4326
+       ) as geom
+       from (
+         select
+           ST_MakePoint(point.lng, point.lat) as point_geom,
+           point.ord
+         from unnest($6::float8[], $7::float8[]) with ordinality as point(lat, lng, ord)
+       ) points
+     )
+     select
         s.id::text as station_id,
         s.station_code,
         s.cpo_id,
@@ -388,6 +416,7 @@ async function loadStationRows(
         on c.id = s.cpo_id
  left join station_overrides o
         on o.station_id = s.id
+ cross join route_line route
  left join lateral (
         select nullif(max(
           case
@@ -414,14 +443,26 @@ async function loadStationRows(
          $2::float8 is null
          or s.geom && ST_MakeEnvelope($2::float8, $3::float8, $4::float8, $5::float8, 4326)
        )
+       and (
+         $8::float8 is null
+         or ST_DWithin(s.geom::geography, route.geom::geography, $8::float8)
+       )
        and coalesce(o.is_hidden, false) = false
-     order by c.name asc, name asc`,
+     order by
+       case when $8::float8 is null then null else s.geom <-> route.geom end asc nulls last,
+       c.name asc,
+       name asc
+     limit coalesce($9::int, 2147483647)`,
     [
       stationCode ?? null,
       normalizedBounds?.minLng ?? null,
       normalizedBounds?.minLat ?? null,
       normalizedBounds?.maxLng ?? null,
       normalizedBounds?.maxLat ?? null,
+      routeLats ?? [],
+      routeLngs ?? [],
+      corridorMeters,
+      rowLimit,
     ],
   );
 
@@ -676,6 +717,17 @@ export async function listStationRecordsInBoundsDb(
   client?: PoolClient,
 ) {
   return mapStationRowsToRecords(await loadStationRows(undefined, client, bounds), client);
+}
+
+export async function listStationRecordsNearRouteDb(
+  bounds: StationBounds,
+  routeCorridor: RouteCorridorFilter,
+  client?: PoolClient,
+) {
+  return mapStationRowsToRecords(
+    await loadStationRows(undefined, client, bounds, routeCorridor),
+    client,
+  );
 }
 
 export async function loadStationStatsInBoundsDb(

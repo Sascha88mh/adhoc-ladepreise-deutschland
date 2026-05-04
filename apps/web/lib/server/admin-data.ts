@@ -1,7 +1,6 @@
 import type { FeedConfig } from "@adhoc/shared";
 import {
   createFeedConfigDb,
-  cleanupStuckSyncRunsDb,
   deleteFeedConfigDb,
   type ListFeedConfigsOptions,
   listFeedConfigsDb,
@@ -61,7 +60,6 @@ export async function deleteAdminFeedConfig(id: string) {
 
 export async function listAdminSyncRuns() {
   requireAdminDatabase();
-  await cleanupStuckSyncRunsDb();
   return listSyncRunsDb();
 }
 

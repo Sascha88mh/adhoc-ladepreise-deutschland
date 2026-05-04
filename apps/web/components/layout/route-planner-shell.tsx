@@ -17,11 +17,13 @@ import type {
 } from "@adhoc/shared";
 import {
   fetchLocationFocus,
+  fetchCpos,
   fetchIpLocation,
   fetchReverseLocation,
   fetchRouteCandidates,
   fetchRoutePlan,
   fetchStationDetail,
+  priceLabel,
 } from "@/lib/client/api";
 import {
   readRoutePlannerUrlState,
@@ -61,6 +63,12 @@ const MAP_MODE_OPTIONS: Array<{ id: MapMode; label: string }> = [
   { id: "satellite", label: "Satellit" },
 ];
 const EMPTY_BROWSE_CANDIDATES: RouteCandidate[] = [];
+const DEFAULT_ROUTE_CORRIDOR_KM = 0.5;
+const DEFAULT_ROUTE_POWER_FILTERS: CandidateFilters = {
+  corridorKm: DEFAULT_ROUTE_CORRIDOR_KM,
+  currentTypes: ["DC"],
+  minPowerKw: 100,
+};
 
 function mapTheme(): CSSProperties {
   return {
@@ -75,6 +83,7 @@ type Props = {
     route: RoutePlan;
     filters: CandidateFilters;
     candidates: RouteCandidate[];
+    totalCandidateCount?: number;
     providerList: Array<{ cpoId: string; cpoName: string; stations: number }>;
     priceBand: { min: number | null; max: number | null };
   };
@@ -99,6 +108,22 @@ function useDebouncedValue<T>(value: T, delayMs: number) {
   }, [value, delayMs]);
 
   return debouncedValue;
+}
+
+function routeDefaultFilters(source: CandidateFilters): CandidateFilters {
+  const next: CandidateFilters = {
+    ...source,
+    corridorKm: source.corridorKm ?? DEFAULT_ROUTE_CORRIDOR_KM,
+    currentTypes: DEFAULT_ROUTE_POWER_FILTERS.currentTypes,
+    minPowerKw: DEFAULT_ROUTE_POWER_FILTERS.minPowerKw,
+  };
+  delete next.maxPowerKw;
+  return next;
+}
+
+function csvCell(value: string | number | null | undefined) {
+  const text = value == null ? "" : String(value);
+  return `"${text.replaceAll('"', '""')}"`;
 }
 
 export function RoutePlannerShell({
@@ -133,8 +158,11 @@ export function RoutePlannerShell({
   const [filters, setFilters] = useState<CandidateFilters>({});
   const debouncedFilters = useDebouncedValue(filters, 800);
   const [results, setResults] = useState(initialResults);
+  const [cpos, setCpos] = useState(initialCpos);
+  const [cposLoading, setCposLoading] = useState(false);
   const browseCandidates = EMPTY_BROWSE_CANDIDATES;
   const [selectedStationId, setSelectedStationId] = useState<string | null>(null);
+  const [selectedForExportIds, setSelectedForExportIds] = useState<Set<string>>(() => new Set());
   const [hoveredStationId, setHoveredStationId] = useState<string | null>(null);
   const [detail, setDetail] = useState<StationDetail | null>(null);
   
@@ -154,11 +182,17 @@ export function RoutePlannerShell({
   const [preserveUrlViewport, setPreserveUrlViewport] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
   const mapCandidates = query.mode === "route" ? results.candidates : [];
+  const visibleSelectedForExportIds = new Set(
+    results.candidates
+      .filter((candidate) => selectedForExportIds.has(candidate.stationId))
+      .map((candidate) => candidate.stationId),
+  );
   const activeStationId = selectedStationId;
   const activeDetail =
     detail?.stationId === activeStationId ? detail : null;
   const showRouteCandidatesUi = query.mode === "route";
   const globalLoading = routeLoading || resultsLoading;
+  const routeCanHaveCandidates = query.mode === "route" && route.destination.label !== "Umgebung";
 
   useEffect(() => {
     let ignore = false;
@@ -188,7 +222,11 @@ export function RoutePlannerShell({
         locationLabel: urlState.location?.label ?? "",
       });
       setMapMode(urlState.style);
-      setFilters(urlState.filters);
+      setFilters(
+        urlState.mode === "route" && Object.keys(urlState.filters).length === 0
+          ? routeDefaultFilters(urlState.filters)
+          : urlState.filters,
+      );
       setSelectedStationId(null);
       setDetail(null);
       setDetailOpen(false);
@@ -303,6 +341,39 @@ export function RoutePlannerShell({
   }, []);
 
   useEffect(() => {
+    if (!filtersOpen || cpos.length > 0) {
+      return;
+    }
+
+    let ignore = false;
+
+    async function loadCpos() {
+      setCposLoading(true);
+
+      try {
+        const next = await fetchCpos();
+        if (!ignore) {
+          setCpos(next);
+        }
+      } catch (caught) {
+        if (!ignore) {
+          setError(caught instanceof Error ? caught.message : "Anbieter konnten nicht geladen werden.");
+        }
+      } finally {
+        if (!ignore) {
+          setCposLoading(false);
+        }
+      }
+    }
+
+    void loadCpos();
+
+    return () => {
+      ignore = true;
+    };
+  }, [cpos.length, filtersOpen]);
+
+  useEffect(() => {
     if (restoringUrlState) {
       return;
     }
@@ -310,6 +381,20 @@ export function RoutePlannerShell({
     let ignore = false;
 
     async function updateCandidates() {
+      if (!routeCanHaveCandidates) {
+        setResults({
+          route,
+          filters: effectiveFilters(debouncedFilters, query.mode),
+          candidates: [],
+          totalCandidateCount: 0,
+          providerList: [],
+          priceBand: { min: null, max: null },
+        });
+        setCandidatesOpen(false);
+        setPendingCandidateAutoOpen(false);
+        return;
+      }
+
       setResultsLoading(true);
       setError(null);
 
@@ -349,7 +434,7 @@ export function RoutePlannerShell({
     return () => {
       ignore = true;
     };
-  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, restoringUrlState, showRouteCandidatesUi]);
+  }, [route, debouncedFilters, pendingCandidateAutoOpen, query.mode, refreshTick, restoringUrlState, routeCanHaveCandidates, showRouteCandidatesUi]);
 
   useEffect(() => {
     if (!activeStationId) {
@@ -414,7 +499,7 @@ export function RoutePlannerShell({
       setRouteLoading(true);
       setError(null);
       setCandidatesOpen(false);
-      setPendingCandidateAutoOpen(true);
+      setPendingCandidateAutoOpen(false);
 
       try {
         let lat: number | null = null;
@@ -508,6 +593,13 @@ export function RoutePlannerShell({
     setMapViewport(state.viewport);
   }
 
+  function handleQueryChange(nextQuery: SearchQueryState) {
+    setQuery(nextQuery);
+    if (query.mode !== "route" && nextQuery.mode === "route") {
+      setFilters((current) => routeDefaultFilters(current));
+    }
+  }
+
   async function handleRoutePlan() {
     setRouteLoading(true);
     setError(null);
@@ -562,6 +654,65 @@ export function RoutePlannerShell({
     }
   }
 
+  function handleToggleExportCandidate(stationId: string) {
+    setSelectedForExportIds((current) => {
+      const next = new Set(current);
+      if (next.has(stationId)) {
+        next.delete(stationId);
+      } else {
+        next.add(stationId);
+      }
+      return next;
+    });
+  }
+
+  function handleExportSelectedCandidates() {
+    const selectedCandidates = results.candidates.filter((candidate) =>
+      selectedForExportIds.has(candidate.stationId),
+    );
+
+    if (selectedCandidates.length === 0) {
+      return;
+    }
+
+    const rows = [
+      [
+        "Name",
+        "Betreiber",
+        "Adresse",
+        "Stadt",
+        "Leistung kW",
+        "Ladepunkte",
+        "Entfernung ab Start km",
+        "Max. Entfernung zur Route km",
+        "D-Tour Minuten",
+        "Preis",
+        "Google Maps",
+      ],
+      ...selectedCandidates.map((candidate) => [
+        candidate.stationName,
+        candidate.cpoName,
+        candidate.addressLine,
+        candidate.city,
+        candidate.maxPowerKw,
+        candidate.chargePointCount,
+        candidate.distanceFromStartKm.toFixed(1).replace(".", ","),
+        candidate.distanceFromRouteKm.toFixed(1).replace(".", ","),
+        candidate.detourMinutes,
+        priceLabel(candidate),
+        `https://www.google.com/maps/search/?api=1&query=${candidate.lat},${candidate.lng}`,
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(csvCell).join(";")).join("\n");
+    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `route-ladestopps-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div
       className="relative h-full w-full overflow-hidden bg-[var(--background)]"
@@ -590,7 +741,7 @@ export function RoutePlannerShell({
         <div className="pointer-events-auto w-full shrink-0 shadow-[0_8px_30px_rgb(0,0,0,0.12)] rounded-[30px] glass-panel-strong">
           <RouteSearchBar
             query={query}
-            onChange={setQuery}
+            onChange={handleQueryChange}
             onSubmit={handleRoutePlan}
             pending={routeLoading}
           />
@@ -608,7 +759,8 @@ export function RoutePlannerShell({
             onChange={setFilters}
             hitCount={results.candidates.length}
             priceBand={results.priceBand}
-            cpos={initialCpos}
+            cpos={cpos}
+            cposLoading={cposLoading}
             expanded={filtersOpen}
             onToggle={() => setFiltersOpen((current) => !current)}
             showCorridorFilter={query.mode === "route"}
@@ -630,9 +782,13 @@ export function RoutePlannerShell({
                 candidates={results.candidates}
                 selectedStationId={activeStationId}
                 hoveredStationId={hoveredStationId}
+                selectedForExportIds={visibleSelectedForExportIds}
                 onSelect={handleSelectStation}
                 onHover={setHoveredStationId}
+                onToggleExport={handleToggleExportCandidate}
+                onExportSelected={handleExportSelectedCandidates}
                 loading={resultsLoading}
+                totalCandidateCount={results.totalCandidateCount}
               />
             </div>
           </motion.div>

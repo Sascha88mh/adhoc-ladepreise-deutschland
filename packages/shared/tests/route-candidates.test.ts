@@ -179,17 +179,16 @@ describe("route candidate selection", () => {
     expect(result.candidates[0].cpoName).toBe("Mer Germany");
   });
 
-  it("sorts default results by price, then detour, then power", async () => {
+  it("sorts route results by distance from the start", async () => {
     const route = await planRoute("52.520008,13.404954", "53.551086,9.993682", "auto");
     const result = findCandidatesForRoute(route, {
       maxPriceKwh: 0.7,
     }, TEST_STATIONS);
 
     expect(result.candidates.length).toBeGreaterThan(2);
-    expect(result.candidates[0].cpoName).toBe("Mer Germany");
+    expect(result.candidates[0].cpoName).toBe("EnBW");
     expect(
-      (result.candidates[0].tariffSummary.pricePerKwh ?? 0) <=
-        (result.candidates[1].tariffSummary.pricePerKwh ?? 0),
+      result.candidates[0].distanceFromStartKm <= result.candidates[1].distanceFromStartKm,
     ).toBe(true);
   });
 
@@ -274,11 +273,11 @@ describe("route candidate selection", () => {
 
   it("reduces results when the route corridor is narrowed", async () => {
     const route = await planRoute("52.520008,13.404954", "53.551086,9.993682", "auto");
-    const wide = findCandidatesForRoute(route, {}, TEST_STATIONS);
+    const wide = findCandidatesForRoute({ ...route, corridorKm: 2 }, {}, TEST_STATIONS);
     const narrow = findCandidatesForRoute(
       {
         ...route,
-        corridorKm: 2,
+        corridorKm: 0.1,
       },
       {},
       TEST_STATIONS,

@@ -388,12 +388,13 @@ export async function getAppSecret(key: string): Promise<string | null> {
 
 export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
   const executor = client ?? getPool();
+  const staleAfter = process.env.SYNC_RUN_STALE_AFTER ?? "45 minutes";
   const running = await executor.query<{ id: string }>(
     `with stale as (
        select id
         from sync_runs
         where status = 'running'
-          and coalesce(heartbeat_at, started_at) < now() - interval '15 minutes'
+          and coalesce(heartbeat_at, started_at) < now() - ($1::text)::interval
         for update skip locked
      )
      update sync_runs
@@ -401,11 +402,12 @@ export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
             finished_at = now(),
             message = 'Abgebrochen (Timeout)',
             progress_stage = 'failed',
-            progress_detail = 'Timeout-Cleanup nach 15 Minuten',
+            progress_detail = 'Timeout-Cleanup nach ' || $1::text,
             heartbeat_at = now()
        from stale
       where sync_runs.id = stale.id
       returning sync_runs.id::text`,
+    [staleAfter],
   );
   const queued = await executor.query<{ id: string }>(
     `with stale as (
@@ -427,6 +429,68 @@ export async function cleanupStuckSyncRunsDb(client?: PoolClient) {
       returning sync_runs.id::text`,
   );
   return (running.rowCount ?? 0) + (queued.rowCount ?? 0);
+}
+
+async function deleteOldRows(
+  executor: PoolClient | ReturnType<typeof getPool>,
+  table: "raw_feed_payloads" | "availability_snapshots" | "price_snapshots",
+  timestampColumn: "created_at" | "recorded_at",
+  retentionDays: number,
+  limit: number,
+) {
+  const result = await executor.query<{ deleted_count: number }>(
+    `with doomed as (
+       select ctid
+         from ${table}
+        where ${timestampColumn} < now() - ($1::int * interval '1 day')
+        order by ${timestampColumn} asc
+        limit $2::int
+     ),
+     deleted as (
+       delete from ${table}
+        where ctid in (select ctid from doomed)
+       returning 1
+     )
+     select count(*)::int as deleted_count from deleted`,
+    [retentionDays, limit],
+  );
+
+  return Number(result.rows[0]?.deleted_count ?? 0);
+}
+
+export async function cleanupIngestHistoryDb(client?: PoolClient) {
+  const executor = client ?? getPool();
+  const limit = Math.max(1, Number(process.env.INGEST_HISTORY_CLEANUP_LIMIT ?? 5_000));
+  const rawRetentionDays = Math.max(1, Number(process.env.RAW_FEED_PAYLOAD_RETENTION_DAYS ?? 7));
+  const snapshotRetentionDays = Math.max(1, Number(process.env.SNAPSHOT_RETENTION_DAYS ?? 14));
+
+  const rawPayloads = await deleteOldRows(
+    executor,
+    "raw_feed_payloads",
+    "created_at",
+    rawRetentionDays,
+    limit,
+  );
+  const availabilitySnapshots = await deleteOldRows(
+    executor,
+    "availability_snapshots",
+    "recorded_at",
+    snapshotRetentionDays,
+    limit,
+  );
+  const priceSnapshots = await deleteOldRows(
+    executor,
+    "price_snapshots",
+    "recorded_at",
+    snapshotRetentionDays,
+    limit,
+  );
+
+  return {
+    rawPayloads,
+    availabilitySnapshots,
+    priceSnapshots,
+  };
 }
 
 export async function terminateFeedRunDb(feedId: string, client?: PoolClient) {

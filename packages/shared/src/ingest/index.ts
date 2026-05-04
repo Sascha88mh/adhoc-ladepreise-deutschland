@@ -13,12 +13,13 @@ import {
   resolveSecretRef,
 } from "../mobilithek/client";
 import {
+  cleanupIngestHistoryDb,
   cleanupStuckSyncRunsDb,
   getFeedConfigDb,
   listFeedConfigsDb,
   updateFeedConfigDb,
 } from "../db/admin";
-import { getPool } from "../db/pool";
+import { configuredPgPoolMax, getPool } from "../db/pool";
 
 type FeedAction = "test" | "manual" | "reconciliation" | "webhook";
 
@@ -498,11 +499,11 @@ async function cleanupStaleActiveRun(feedId: string) {
             heartbeat_at = now()
       where feed_id = $1::uuid
         and (
-          (status = 'running' and coalesce(heartbeat_at, started_at) < now() - interval '15 minutes')
+          (status = 'running' and coalesce(heartbeat_at, started_at) < now() - ($2::text)::interval)
           or
           (status = 'queued' and started_at < now() - interval '60 minutes')
         )`,
-    [feedId],
+    [feedId, process.env.SYNC_RUN_STALE_AFTER ?? "45 minutes"],
   );
 }
 
@@ -618,9 +619,11 @@ async function updateRunProgress(
     processedCount?: number | null;
     totalCount?: number | null;
   },
-  client?: PoolClient,
+  _client?: PoolClient,
 ) {
-  const executor = client ?? getPool();
+  // Progress must be committed independently from long ingest transactions.
+  // Otherwise static/dynamic bulk writes look stuck at "parsed" until COMMIT.
+  const executor = getPool();
   await executor.query(
     `update sync_runs
         set progress_stage = $2,
@@ -645,9 +648,15 @@ async function updateRunProgress(
 }
 
 async function configureIngestTransaction(client: PoolClient) {
-  await client.query(`set local statement_timeout = '10min'`);
-  await client.query(`set local lock_timeout = '30s'`);
-  await client.query(`set local idle_in_transaction_session_timeout = '10min'`);
+  await client.query(`select set_config('statement_timeout', $1, true)`, [
+    process.env.INGEST_STATEMENT_TIMEOUT ?? "30min",
+  ]);
+  await client.query(`select set_config('lock_timeout', $1, true)`, [
+    process.env.INGEST_LOCK_TIMEOUT ?? "30s",
+  ]);
+  await client.query(`select set_config('idle_in_transaction_session_timeout', $1, true)`, [
+    process.env.INGEST_IDLE_IN_TRANSACTION_TIMEOUT ?? "30min",
+  ]);
 }
 
 export async function enqueueFeedSync(feedId: string) {
@@ -2039,9 +2048,11 @@ async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
  * FEED_RUN_TIMEOUT_MS. Default 90s — enough for a 40 MB Vaylens pull + parse.
  */
 const FEED_RUN_TIMEOUT_MS = Number(process.env.FEED_RUN_TIMEOUT_MS ?? 90_000);
+const FEED_CYCLE_LOCK_KEY = "adhoc.ingest.run_due_feed_cycle";
+const FEED_CYCLE_POOL_MAX = configuredPgPoolMax();
 const FEED_CYCLE_CONCURRENCY = Math.max(
   1,
-  Number(process.env.FEED_CYCLE_CONCURRENCY ?? Math.min(Number(process.env.PG_POOL_MAX ?? 10), 4)),
+  Number(process.env.FEED_CYCLE_CONCURRENCY ?? Math.min(Math.max(FEED_CYCLE_POOL_MAX - 1, 1), 2)),
 );
 const FEED_CYCLE_QUEUE_LIMIT = Math.max(
   1,
@@ -2388,6 +2399,35 @@ export async function runFeedAction(
 }
 
 export async function runDueFeedCycle() {
+  const cycleClient = await getPool().connect();
+  let lockHeld = false;
+
+  try {
+    const lockResult = await cycleClient.query<{ locked: boolean }>(
+      `select pg_try_advisory_lock(hashtext($1), 0) as locked`,
+      [FEED_CYCLE_LOCK_KEY],
+    );
+    lockHeld = lockResult.rows[0]?.locked === true;
+    if (!lockHeld) {
+      console.log("[ingest] another feed cycle is already running; skipping this tick");
+      return 0;
+    }
+
+    return await runDueFeedCycleLocked();
+  } finally {
+    if (lockHeld) {
+      await cycleClient.query(
+        `select pg_advisory_unlock(hashtext($1), 0)`,
+        [FEED_CYCLE_LOCK_KEY],
+      ).catch((error) => {
+        console.error("[ingest] failed to release feed cycle lock:", errorMessage(error));
+      });
+    }
+    cycleClient.release();
+  }
+}
+
+async function runDueFeedCycleLocked() {
   // Clean up sync_runs stuck in "running" from prior Lambda timeouts or crashes.
   const cleaned = await cleanupStuckSyncRunsDb().catch((error) => {
     console.error("[ingest] cleanupStuckSyncRuns failed:", errorMessage(error));
@@ -2395,6 +2435,21 @@ export async function runDueFeedCycle() {
   });
   if (cleaned) {
     console.log(`[ingest] cleaned up ${cleaned} stuck sync run(s)`);
+  }
+
+  if (process.env.INGEST_HISTORY_CLEANUP !== "0") {
+    const historyCleanup = await cleanupIngestHistoryDb().catch((error) => {
+      console.error("[ingest] cleanupIngestHistory failed:", errorMessage(error));
+      return null;
+    });
+    if (
+      historyCleanup &&
+      (historyCleanup.rawPayloads ||
+        historyCleanup.availabilitySnapshots ||
+        historyCleanup.priceSnapshots)
+    ) {
+      console.log("[ingest] cleaned up ingest history", historyCleanup);
+    }
   }
 
   let feeds: FeedConfig[];

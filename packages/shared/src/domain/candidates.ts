@@ -9,7 +9,7 @@ import type {
   TariffSummary,
 } from "./types";
 import { routeCandidateSchema, stationDetailSchema, stationStatsSchema } from "./types";
-import { distanceFromRouteKm } from "../geo/route-corridor";
+import { routeProgressAtNearestPointKm } from "../geo/route-corridor";
 
 function normalizePaymentMethod(method: string) {
   const normalized = method.toLowerCase();
@@ -202,7 +202,9 @@ function stationMatchesFilters(
 function mapStationCandidate(
   station: StationRecord,
   tariff: TariffSummary,
-  overrides?: Partial<Pick<RouteCandidate, "distanceFromRouteKm" | "detourMinutes">>,
+  overrides?: Partial<
+    Pick<RouteCandidate, "distanceFromRouteKm" | "distanceFromStartKm" | "detourMinutes">
+  >,
 ) {
   return routeCandidateSchema.parse({
     stationId: station.stationId,
@@ -214,6 +216,7 @@ function mapStationCandidate(
     addressLine: station.addressLine,
     city: station.city,
     distanceFromRouteKm: overrides?.distanceFromRouteKm ?? 0,
+    distanceFromStartKm: overrides?.distanceFromStartKm ?? 0,
     detourMinutes: overrides?.detourMinutes ?? 0,
     maxPowerKw: station.maxPowerKw,
     chargePointCount: station.chargePointCount,
@@ -238,43 +241,59 @@ export function findCandidatesForRoute(
 ) {
   const candidates = stations
     .map((station) => {
-      const distanceKm = distanceFromRouteKm(route.geometry, station.coordinates);
+      const progress = routeProgressAtNearestPointKm(route.geometry, station.coordinates);
       const candidateTariff = matchingTariff(station, filters);
 
       return {
         station,
-        distanceKm,
+        progress,
         candidateTariff,
       };
     })
-    .filter(({ station, distanceKm, candidateTariff }) => {
-      if (distanceKm > route.corridorKm) {
+    .filter(({ station, progress, candidateTariff }) => {
+      if (progress.distanceFromRouteKm > route.corridorKm) {
         return false;
       }
 
       return stationMatchesFilters(station, filters, candidateTariff);
     })
-    .map(({ station, distanceKm, candidateTariff }) => {
+    .map(({ station, progress, candidateTariff }) => {
       return mapStationCandidate(station, candidateTariff!, {
-        distanceFromRouteKm: Number(distanceKm.toFixed(1)),
-        detourMinutes: detourMinutes(distanceKm, station.maxPowerKw),
+        distanceFromRouteKm: Number(progress.distanceFromRouteKm.toFixed(1)),
+        distanceFromStartKm: Number(progress.distanceFromStartKm.toFixed(1)),
+        detourMinutes: detourMinutes(progress.distanceFromRouteKm, station.maxPowerKw),
       });
     });
 
-  const sortMode = filters.sort ?? "price";
+  const sortMode = filters.sort ?? "route";
   candidates.sort((left, right) => {
     if (sortMode === "power") {
-      return right.maxPowerKw - left.maxPowerKw || left.detourMinutes - right.detourMinutes;
+      return right.maxPowerKw - left.maxPowerKw || left.distanceFromStartKm - right.distanceFromStartKm;
     }
 
     if (sortMode === "detour") {
-      return left.detourMinutes - right.detourMinutes || (left.tariffSummary.pricePerKwh ?? 999) - (right.tariffSummary.pricePerKwh ?? 999);
+      return (
+        left.detourMinutes - right.detourMinutes ||
+        left.distanceFromStartKm - right.distanceFromStartKm ||
+        (left.tariffSummary.pricePerKwh ?? 999) - (right.tariffSummary.pricePerKwh ?? 999)
+      );
+    }
+
+    if (sortMode === "price") {
+      return (
+        (left.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY) -
+          (right.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY) ||
+        left.distanceFromStartKm - right.distanceFromStartKm ||
+        left.detourMinutes - right.detourMinutes ||
+        right.maxPowerKw - left.maxPowerKw
+      );
     }
 
     return (
+      left.distanceFromStartKm - right.distanceFromStartKm ||
+      left.detourMinutes - right.detourMinutes ||
       (left.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY) -
         (right.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY) ||
-      left.detourMinutes - right.detourMinutes ||
       right.maxPowerKw - left.maxPowerKw
     );
   });

@@ -1,18 +1,32 @@
-import { cleanupStuckSyncRunsDb, isRetryableDbError, resetPool, usingDatabase } from "@adhoc/shared/db";
+import { cleanupStuckSyncRunsDb, usingDatabase } from "@adhoc/shared/db";
 import { listAdminSyncRuns } from "@/lib/server/admin-data";
 
-export async function GET() {
-  try {
-    return Response.json({ data: await listAdminSyncRuns() });
-  } catch (error) {
-    if (isRetryableDbError(error)) {
-      await resetPool();
-      return Response.json({ data: await listAdminSyncRuns() });
-    }
+const ADMIN_SYNC_RUNS_TIMEOUT_MS = Math.max(
+  500,
+  Number(process.env.ADMIN_SYNC_RUNS_TIMEOUT_MS ?? 4000),
+);
 
-    const message = error instanceof Error ? error.message : "Sync runs could not be loaded";
-    return Response.json({ error: message }, { status: 500 });
-  }
+export async function GET() {
+  const runsPromise = listAdminSyncRuns()
+    .then((data) => Response.json({ data }))
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : "Sync runs could not be loaded";
+      console.error("[admin/sync-runs] run list load failed:", message);
+      return Response.json({ error: message }, { status: 503 });
+    });
+
+  const timeout = new Promise<Response>((resolve) => {
+    setTimeout(() => {
+      resolve(
+        Response.json(
+          { error: "Sync runs could not be loaded" },
+          { status: 503 },
+        ),
+      );
+    }, ADMIN_SYNC_RUNS_TIMEOUT_MS);
+  });
+
+  return Promise.race([runsPromise, timeout]);
 }
 
 export async function DELETE() {

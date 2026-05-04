@@ -388,8 +388,9 @@ Während langer Läufe schreibt `runFeedAction` Live-Fortschritt nach `sync_runs
 `progress_stage`, `progress_detail`, `heartbeat_at`, `payload_size_bytes`,
 `processed_count`, `total_count`. Vor der Schreibtransaktion werden diese Werte separat
 aktualisiert; innerhalb der Schreibtransaktion laufen sie über dieselbe DB-Verbindung.
-So bleiben sie im Admin sichtbar und blockieren auch bei kleinen Poolgrößen
-(`PG_POOL_MAX=1`) nicht auf eine zweite Verbindung.
+So bleiben sie im Admin sichtbar und blockieren bei kleinen Poolgrößen nicht auf eine
+zweite Verbindung pro Feed. Für den globalen Cycle-Lock wird mindestens eine weitere
+Pool-Verbindung reserviert; `PG_POOL_MAX` wird deshalb effektiv auf mindestens `2` gesetzt.
 
 Bei Exception während HTTP, Parse oder DB-Schreibphase: `markFeedFailure` setzt `last_error_message`, `consecutive_failures++`,
 `sync_runs.status='failed'`. Der Error wird zurückgegeben (und von `runDueFeedCycle` geloggt).
@@ -410,9 +411,13 @@ persistente `sync_runs`-Queue und können ebenso von `apps/ingest` oder einem de
 Cron-Service verarbeitet werden. Wichtige Regel: Admin/API-Requests starten keine langen
 Downloads direkt, sondern schreiben/claimen nur Jobs.
 
+- **Ein globaler Cycle zur Zeit.** `runDueFeedCycle()` hält während eines Durchlaufs einen
+  Postgres-Advisory-Lock. Überlappt der Minutentakt mit einem noch laufenden Background-Job,
+  steigt der neue Tick sofort aus, statt weitere DB-Clients und Mobilithek-Abrufe zu öffnen.
 - **Begrenzt parallel.** Der Cycle arbeitet fällige Feeds mit `FEED_CYCLE_CONCURRENCY` ab
-  (Default `min(PG_POOL_MAX, 4)`). Dadurch bleiben Datenbank-Pool, Netlify-Invocation und
-  Mobilithek auch bei 100+ konfigurierten Feeds stabil.
+  (Default `min(max(PG_POOL_MAX - 1, 1), 2)`). Die reservierte Verbindung hält den Cycle-Lock;
+  dadurch bleiben Datenbank-Pool, Netlify-Invocation und Mobilithek auch bei 100+
+  konfigurierten Feeds stabil.
 - **Durable Queue:** Admin-Syncs laufen nicht als kurzlebige Serverless-Hintergrundarbeit.
   Der Button schreibt einen echten `queued`-Run; der nächste Cron-Tick übernimmt ihn.
   Wenn Queue-Runs vorhanden sind, verarbeitet der Cycle nur diese Queue-Arbeit und startet
@@ -429,7 +434,7 @@ Downloads direkt, sondern schreiben/claimen nur Jobs.
   umgehen diesen Backoff bewusst.
 - **Top-Level Try/Catch:** Selbst eine geworfene Exception aus `runDueFeedCycle` killt die Netlify-Invocation nicht — damit der nächste Cron-Tick nicht ausgesetzt wird.
 - **Stuck-Run Cleanup:** Vor jedem Cycle und beim Laden der Admin-Runs werden `running`-Runs
-  älter als 5 Minuten auf `failed` gesetzt; `queued`-Runs laufen erst nach 60 Minuten als
+  ohne frischen Heartbeat nach 15 Minuten auf `failed` gesetzt; `queued`-Runs laufen erst nach 60 Minuten als
   Queue-Timeout ab.
 
 **Env-Knöpfe:**
@@ -437,14 +442,22 @@ Downloads direkt, sondern schreiben/claimen nur Jobs.
 | Variable                  | Default     | Zweck                                                  |
 | ------------------------- | ----------- | ------------------------------------------------------ |
 | `FEED_RUN_TIMEOUT_MS`     | `90000`     | Max. Laufzeit eines Einzel-Feeds im Cycle              |
-| `FEED_CYCLE_CONCURRENCY`  | `min(PG_POOL_MAX, 4)` | Max. gleichzeitige Feed-Aktionen pro Cron-Cycle |
+| `FEED_CYCLE_CONCURRENCY`  | `min(max(PG_POOL_MAX - 1, 1), 2)` | Max. gleichzeitige Feed-Aktionen pro Cron-Cycle |
 | `FEED_CYCLE_QUEUE_LIMIT`  | `FEED_CYCLE_CONCURRENCY` | Max. Queue-Runs, die ein Cron-Tick zuerst übernimmt |
+| `SYNC_RUN_STALE_AFTER`    | `45 minutes` | Ab wann ein `running`-Run ohne frischen Heartbeat als stuck gilt |
+| `INGEST_STATEMENT_TIMEOUT` | `30min`    | Statement-Timeout innerhalb langer Ingest-Schreibtransaktionen |
+| `INGEST_HISTORY_CLEANUP`  | _(enabled)_ | `=0` deaktiviert automatisches Pruning alter Ingest-Historie |
+| `RAW_FEED_PAYLOAD_RETENTION_DAYS` | `7` | Retention für `raw_feed_payloads`                    |
+| `SNAPSHOT_RETENTION_DAYS` | `14`        | Retention für Availability-/Price-Snapshots            |
+| `INGEST_HISTORY_CLEANUP_LIMIT` | `5000` | Max. gelöschte Rows pro Tabelle und Cleanup-Durchlauf |
 | `MOBILITHEK_TIMEOUT_MS`   | `60000`     | axios-Timeout pro HTTP-Request                         |
 | `RAW_PAYLOAD_MAX_BYTES`   | `524288`    | Ab dieser Größe wird der Raw-Payload zusammengefasst    |
 | `MOBILITHEK_BASE_URL`     | `https://m2m.mobilithek.info` | Override für Staging/Testing             |
 | `MOBILITHEK_USE_FIXTURES` | _(unset)_   | `=1` verwendet die Fixtures aus `db/fixtures/`          |
 | `MOBILITHEK_FORWARD_SECRET` | _(unset)_ | Schuetzt `/api/internal/mobilithek/webhook`; in Produktion setzen |
-| `PG_POOL_MAX`             | `10`        | Max. offene PG-Connections                             |
+| `PG_POOL_MAX`             | `3`         | Max. offene PG-Connections pro Prozess/Function (Minimum `2`) |
+| `PG_CONNECTION_TIMEOUT_MS` | `5000`     | Wartezeit auf eine freie PG-Connection                 |
+| `PG_IDLE_TIMEOUT_MS`      | `10000`     | Idle-Verbindungen im lokalen Pool schließen            |
 
 ---
 
@@ -674,7 +687,7 @@ Zusätzliche Arbeitsregeln für Preis- und Statusfeeds:
   2. Static-Payloads werden erst nach erfolgreichem Run-Claim von Mobilithek geladen.
      Dadurch erzeugt ein überfälliger großer Static-Feed keine parallelen 40–80-MB-Abrufe.
   3. `FEED_CYCLE_CONCURRENCY` begrenzt die parallelen Feed-Aktionen pro Cron-Cycle
-     (Default `min(PG_POOL_MAX, 4)`) für 100+ konfigurierte Feeds.
+     (Default `min(max(PG_POOL_MAX - 1, 1), 2)`) für 100+ konfigurierte Feeds.
 - **2026-04-26 v6** — Mobilithek-Push-Feeds produktionsfest dokumentiert:
   1. **Netlify Edge Webhook-Pfad** (§1, §3.6, §7, §10): gzip+`application/json` muss ueber `apps/web/netlify/edge-functions/mobilithek-webhook.ts` laufen; normaler Netlify-Function-Fallback kann gzip irreversibel beschaedigen.
   2. **Forward-Secret** (§3.6, §5, §10): `MOBILITHEK_FORWARD_SECRET` schuetzt den internen `/api/internal/mobilithek/webhook`-Forward. Ohne Secret muss dieser Endpunkt `401` liefern.

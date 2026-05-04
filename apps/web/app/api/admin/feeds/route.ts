@@ -22,6 +22,10 @@ const createSchema = z.object({
 });
 
 const booleanParamSchema = z.enum(["true", "false"]).transform((value) => value === "true");
+const ADMIN_FEEDS_TIMEOUT_MS = Math.max(
+  500,
+  Number(process.env.ADMIN_FEEDS_TIMEOUT_MS ?? 4000),
+);
 
 const listSchema = z.object({
   query: z.string().trim().optional(),
@@ -42,19 +46,36 @@ export async function GET(request: Request) {
     const params = listSchema.parse(Object.fromEntries(new URL(request.url).searchParams));
     const { q, query, ...filters } = params;
 
-    return Response.json({
-      data: await listAdminFeeds({
+    const feedsPromise = listAdminFeeds({
         ...filters,
         query: query || q,
-      }),
+      })
+      .then((data) => Response.json({ data }))
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : "Feeds konnten nicht geladen werden.";
+        console.error("[admin/feeds] feed list load failed:", message);
+        return Response.json({ error: message }, { status: 503 });
+      });
+
+    const timeout = new Promise<Response>((resolve) => {
+      setTimeout(() => {
+        resolve(
+          Response.json(
+            { error: "Feeds konnten gerade nicht geladen werden." },
+            { status: 503 },
+          ),
+        );
+      }, ADMIN_FEEDS_TIMEOUT_MS);
     });
+
+    return Promise.race([feedsPromise, timeout]);
   } catch (error) {
     if (error instanceof ZodError) {
       return Response.json({ error: "Ungültige Feed-Filter." }, { status: 400 });
     }
 
     const message = error instanceof Error ? error.message : "Feeds konnten nicht geladen werden.";
-    return Response.json({ error: message }, { status: 500 });
+    return Response.json({ error: message }, { status: 503 });
   }
 }
 

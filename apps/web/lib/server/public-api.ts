@@ -9,15 +9,49 @@ import {
   routeBounds,
   routeDistanceKm,
   type CandidateFilters,
+  type RouteCandidate,
   type RoutePlan,
 } from "@adhoc/shared";
 import {
   listStationRecordsDb,
   listStationRecordsInBoundsDb,
+  listStationRecordsNearRouteDb,
   listCpoSummariesDb,
   loadChargePointRowsDb,
   usingDatabase,
 } from "@adhoc/shared/db";
+
+const MAX_ROUTE_CANDIDATES = 80;
+const MAX_ROUTE_CANDIDATES_FOR_ROUTING = 160;
+const ROUTING_CONCURRENCY = 6;
+const CPO_CACHE_TTL_MS = 5 * 60_000;
+const ROUTE_CANDIDATE_CACHE_TTL_MS = 60_000;
+const ROUTE_CANDIDATE_CACHE_MAX = 50;
+let cpoCache:
+  | {
+      expiresAt: number;
+      data: Array<{ id: string; name: string; stations: number }>;
+    }
+  | null = null;
+const routeCandidateCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    data: Awaited<ReturnType<typeof buildCandidateResponseUncached>>;
+  }
+>();
+const OSRM_URL = process.env.OSRM_URL ?? "https://router.project-osrm.org";
+
+type OsrmViaRouteResponse = {
+  routes?: Array<{
+    distance?: number;
+    duration?: number;
+    legs?: Array<{
+      distance?: number;
+      duration?: number;
+    }>;
+  }>;
+};
 
 function requirePublicDatabase() {
   if (!usingDatabase()) {
@@ -29,7 +63,7 @@ export function createRouteFromPolyline(polyline: RoutePlan["geometry"], routeId
   return routePlanSchema.parse({
     routeId: routeId ?? `polyline-${Date.now()}`,
     profile: routeProfileSchema.parse("auto"),
-    corridorKm: 5,
+    corridorKm: 0.5,
     origin: {
       label: "Custom origin",
       coordinates: polyline[0],
@@ -67,7 +101,7 @@ export async function createLocationFocusRoute(query: string) {
   return routePlanSchema.parse({
     routeId: `focus-${Date.now()}`,
     profile: routeProfileSchema.parse("auto"),
-    corridorKm: 5,
+    corridorKm: 0.5,
     origin: location,
     destination: {
       label: "Umgebung",
@@ -96,7 +130,155 @@ function expandedRouteBounds(route: RoutePlan) {
   };
 }
 
-export async function buildCandidateResponse(route: RoutePlan, filters: CandidateFilters) {
+function simplifyRouteForDbPrefilter(points: RoutePlan["geometry"]) {
+  const maxPoints = 160;
+  if (points.length <= maxPoints) {
+    return points;
+  }
+
+  const step = Math.ceil(points.length / maxPoints);
+  const simplified = points.filter((_, index) => index % step === 0);
+  const last = points[points.length - 1];
+
+  if (simplified[simplified.length - 1] !== last) {
+    simplified.push(last);
+  }
+
+  return simplified;
+}
+
+function stableCachePart(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableCachePart).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableCachePart(entry)}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function routeCandidateCacheKey(route: RoutePlan, filters: CandidateFilters) {
+  return [
+    "route-candidates:v2",
+    route.routeId,
+    route.corridorKm,
+    route.geometry.length,
+    stableCachePart(filters),
+  ].join(":");
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  items: TInput[],
+  concurrency: number,
+  mapper: (item: TInput) => Promise<TOutput>,
+) {
+  const results = new Array<TOutput>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
+  );
+
+  return results;
+}
+
+async function addRoadMetrics(route: RoutePlan, candidate: RouteCandidate): Promise<RouteCandidate> {
+  if (route.profile !== "auto") {
+    return candidate;
+  }
+
+  try {
+    const origin = route.origin.coordinates;
+    const destination = route.destination.coordinates;
+    const coordinates = [
+      `${origin.lng},${origin.lat}`,
+      `${candidate.lng},${candidate.lat}`,
+      `${destination.lng},${destination.lat}`,
+    ].join(";");
+    const url = new URL(`/route/v1/driving/${coordinates}`, OSRM_URL);
+    url.searchParams.set("overview", "false");
+    url.searchParams.set("alternatives", "false");
+    url.searchParams.set("steps", "false");
+
+    const response = await fetch(url, {
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      return candidate;
+    }
+
+    const payload = (await response.json()) as OsrmViaRouteResponse;
+    const viaRoute = payload.routes?.[0];
+    if (!viaRoute?.distance || !viaRoute.duration) {
+      return candidate;
+    }
+
+    const viaDistanceKm = viaRoute.distance / 1000;
+    const viaDurationMinutes = viaRoute.duration / 60;
+    const distanceFromStartKm = (viaRoute.legs?.[0]?.distance ?? 0) / 1000;
+    const detourDistanceKm = Math.max(0, viaDistanceKm - route.distanceKm);
+    const distanceFromRouteKm = detourDistanceKm / 2;
+    const detourMinutes = Math.max(0, Math.round(viaDurationMinutes - route.durationMinutes));
+
+    return {
+      ...candidate,
+      distanceFromRouteKm: Number(distanceFromRouteKm.toFixed(2)),
+      distanceFromStartKm: Number(
+        (distanceFromStartKm || candidate.distanceFromStartKm).toFixed(1),
+      ),
+      detourMinutes,
+    };
+  } catch {
+    return candidate;
+  }
+}
+
+function summarizeRouteCandidates(candidates: RouteCandidate[]) {
+  const providerMap = new Map<string, { cpoId: string; cpoName: string; stations: number }>();
+  const pricePoints: number[] = [];
+
+  for (const candidate of candidates) {
+    const provider = providerMap.get(candidate.cpoId);
+    if (provider) {
+      provider.stations += 1;
+    } else {
+      providerMap.set(candidate.cpoId, {
+        cpoId: candidate.cpoId,
+        cpoName: candidate.cpoName,
+        stations: 1,
+      });
+    }
+
+    if (candidate.tariffSummary.pricePerKwh != null) {
+      pricePoints.push(candidate.tariffSummary.pricePerKwh);
+    }
+  }
+
+  return {
+    providerList: [...providerMap.values()].sort((left, right) => right.stations - left.stations),
+    priceBand: {
+      min: pricePoints.length ? Math.min(...pricePoints) : null,
+      max: pricePoints.length ? Math.max(...pricePoints) : null,
+    },
+  };
+}
+
+async function buildCandidateResponseUncached(route: RoutePlan, filters: CandidateFilters) {
   requirePublicDatabase();
   const effectiveRoute =
     filters.corridorKm && filters.corridorKm !== route.corridorKm
@@ -107,22 +289,81 @@ export async function buildCandidateResponse(route: RoutePlan, filters: Candidat
       : route;
   const results = findCandidatesForRoute(
     effectiveRoute,
-    filters,
-    await listStationRecordsInBoundsDb(expandedRouteBounds(effectiveRoute)),
+    { ...filters, sort: "route" },
+    await listStationRecordsNearRouteDb(
+      expandedRouteBounds(effectiveRoute),
+      {
+        points: simplifyRouteForDbPrefilter(effectiveRoute.geometry),
+        corridorKm: effectiveRoute.corridorKm + 1,
+        rowLimit: 500,
+      },
+    ),
   );
+  const routedCandidates = await mapWithConcurrency(
+    results.candidates.slice(0, MAX_ROUTE_CANDIDATES_FOR_ROUTING),
+    ROUTING_CONCURRENCY,
+    (candidate) => addRoadMetrics(effectiveRoute, candidate),
+  );
+  const sortedCandidates = routedCandidates
+    .filter((candidate) => candidate.distanceFromRouteKm <= effectiveRoute.corridorKm)
+    .sort(
+      (left, right) =>
+        left.distanceFromStartKm - right.distanceFromStartKm ||
+        left.detourMinutes - right.detourMinutes ||
+        (left.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY) -
+          (right.tariffSummary.pricePerKwh ?? Number.POSITIVE_INFINITY),
+    );
+  const limitedCandidates = sortedCandidates.slice(0, MAX_ROUTE_CANDIDATES);
+  const summary = summarizeRouteCandidates(sortedCandidates);
 
   return {
     route: effectiveRoute,
     filters,
-    candidates: results.candidates,
-    providerList: results.providerList,
-    priceBand: results.priceBand,
+    candidates: limitedCandidates,
+    totalCandidateCount: sortedCandidates.length,
+    providerList: summary.providerList,
+    priceBand: summary.priceBand,
   };
+}
+
+export async function buildCandidateResponse(route: RoutePlan, filters: CandidateFilters) {
+  const key = routeCandidateCacheKey(route, filters);
+  const now = Date.now();
+  const cached = routeCandidateCache.get(key);
+
+  if (cached && cached.expiresAt > now) {
+    return cached.data;
+  }
+
+  const data = await buildCandidateResponseUncached(route, filters);
+  routeCandidateCache.set(key, {
+    data,
+    expiresAt: now + ROUTE_CANDIDATE_CACHE_TTL_MS,
+  });
+
+  if (routeCandidateCache.size > ROUTE_CANDIDATE_CACHE_MAX) {
+    const oldestKey = routeCandidateCache.keys().next().value;
+    if (oldestKey) {
+      routeCandidateCache.delete(oldestKey);
+    }
+  }
+
+  return data;
 }
 
 export async function listCpos() {
   requirePublicDatabase();
-  return listCpoSummariesDb();
+  const now = Date.now();
+  if (cpoCache && cpoCache.expiresAt > now) {
+    return cpoCache.data;
+  }
+
+  const data = await listCpoSummariesDb();
+  cpoCache = {
+    data,
+    expiresAt: now + CPO_CACHE_TTL_MS,
+  };
+  return data;
 }
 
 export async function loadStationDetail(stationId: string) {
