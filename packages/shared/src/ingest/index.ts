@@ -19,7 +19,7 @@ import {
   listFeedConfigsDb,
   updateFeedConfigDb,
 } from "../db/admin";
-import { configuredPgPoolMax, getPool } from "../db/pool";
+import { getPool } from "../db/pool";
 
 type FeedAction = "test" | "manual" | "reconciliation" | "webhook";
 
@@ -2048,10 +2048,9 @@ async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
  * FEED_RUN_TIMEOUT_MS. Default 90s — enough for a 40 MB Vaylens pull + parse.
  */
 const FEED_RUN_TIMEOUT_MS = Number(process.env.FEED_RUN_TIMEOUT_MS ?? 90_000);
-const FEED_CYCLE_POOL_MAX = configuredPgPoolMax();
 const FEED_CYCLE_CONCURRENCY = Math.max(
   1,
-  Number(process.env.FEED_CYCLE_CONCURRENCY ?? Math.min(Math.max(FEED_CYCLE_POOL_MAX - 1, 1), 2)),
+  Number(process.env.FEED_CYCLE_CONCURRENCY ?? 1),
 );
 const FEED_CYCLE_QUEUE_LIMIT = Math.max(
   1,

@@ -9,7 +9,7 @@ const MVT_CONTENT_TYPE = "application/vnd.mapbox-vector-tile";
 const MAX_TILE_ZOOM = 16;
 const MAX_TILE_DB_IN_FLIGHT = Math.max(
   1,
-  Number(process.env.MAP_TILE_DB_CONCURRENCY ?? 8),
+  Number(process.env.MAP_TILE_DB_CONCURRENCY ?? 4),
 );
 
 declare global {
