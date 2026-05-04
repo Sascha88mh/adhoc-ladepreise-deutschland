@@ -2048,7 +2048,6 @@ async function markFeedNoopSuccess(client: PoolClient, feed: FeedConfig) {
  * FEED_RUN_TIMEOUT_MS. Default 90s — enough for a 40 MB Vaylens pull + parse.
  */
 const FEED_RUN_TIMEOUT_MS = Number(process.env.FEED_RUN_TIMEOUT_MS ?? 90_000);
-const FEED_CYCLE_LOCK_KEY = "adhoc.ingest.run_due_feed_cycle";
 const FEED_CYCLE_POOL_MAX = configuredPgPoolMax();
 const FEED_CYCLE_CONCURRENCY = Math.max(
   1,
@@ -2399,32 +2398,12 @@ export async function runFeedAction(
 }
 
 export async function runDueFeedCycle() {
-  const cycleClient = await getPool().connect();
-  let lockHeld = false;
-
-  try {
-    const lockResult = await cycleClient.query<{ locked: boolean }>(
-      `select pg_try_advisory_lock(hashtext($1), 0) as locked`,
-      [FEED_CYCLE_LOCK_KEY],
-    );
-    lockHeld = lockResult.rows[0]?.locked === true;
-    if (!lockHeld) {
-      console.log("[ingest] another feed cycle is already running; skipping this tick");
-      return 0;
-    }
-
-    return await runDueFeedCycleLocked();
-  } finally {
-    if (lockHeld) {
-      await cycleClient.query(
-        `select pg_advisory_unlock(hashtext($1), 0)`,
-        [FEED_CYCLE_LOCK_KEY],
-      ).catch((error) => {
-        console.error("[ingest] failed to release feed cycle lock:", errorMessage(error));
-      });
-    }
-    cycleClient.release();
-  }
+  // No cycle-wide mutex: per-feed claims (`claimFeedRun`) already guarantee
+  // that the same feed is never processed by two cycles at once. A session-
+  // level advisory lock here would leak under Supavisor transaction-pooling
+  // and pin a pool slot for the whole cycle, starving inner queries and
+  // producing "timeout exceeded when trying to connect".
+  return await runDueFeedCycleLocked();
 }
 
 async function runDueFeedCycleLocked() {
