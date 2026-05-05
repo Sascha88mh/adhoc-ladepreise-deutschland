@@ -1,5 +1,8 @@
+import { redirect } from "next/navigation";
 import { AdminConsole } from "@/components/layout/admin-console";
+import { AdminHeader } from "@/components/layout/admin-header";
 import { listAdminFeeds, listAdminSyncRuns } from "@/lib/server/admin-data";
+import { requireAdmin } from "@/lib/supabase/require-admin";
 
 export const dynamic = "force-dynamic";
 
@@ -39,6 +42,11 @@ function loadWithFallback<T>(input: {
 }
 
 export default async function AdminPage() {
+  const guard = await requireAdmin();
+  if (!guard.ok) {
+    redirect("/login?next=/admin");
+  }
+
   const [feedsResult, runsResult] = await Promise.all([
     loadWithFallback({
       label: "Feeds",
@@ -58,6 +66,7 @@ export default async function AdminPage() {
 
   return (
     <main className="min-h-screen px-4 py-4 sm:px-6 lg:px-8">
+      <AdminHeader email={guard.email} />
       <AdminConsole
         initialFeeds={feedsResult.data}
         initialSyncRuns={runsResult.data}

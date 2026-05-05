@@ -1,6 +1,29 @@
 import { z, ZodError } from "zod";
 import { createAdminFeedConfig, listAdminFeeds } from "@/lib/server/admin-data";
 import { cpoExistsDb, usingDatabase } from "@adhoc/shared/db";
+import { adminGuardResponse, requireAdmin } from "@/lib/supabase/require-admin";
+
+const ALLOWED_FEED_HOSTS = new Set(["m2m.mobilithek.info"]);
+
+const urlOverrideSchema = z
+  .string()
+  .nullable()
+  .refine(
+    (value) => {
+      if (value === null || value === "") return true;
+      try {
+        const url = new URL(value);
+        if (url.protocol !== "https:") return false;
+        return ALLOWED_FEED_HOSTS.has(url.hostname);
+      } catch {
+        return false;
+      }
+    },
+    {
+      message:
+        "urlOverride muss eine HTTPS-URL auf einen erlaubten Mobilithek-Host sein (z. B. https://m2m.mobilithek.info/...).",
+    },
+  );
 
 const createSchema = z.object({
   source: z.enum(["mobilithek"]).default("mobilithek"),
@@ -9,7 +32,7 @@ const createSchema = z.object({
   mode: z.enum(["push", "pull", "hybrid"]),
   type: z.enum(["static", "dynamic"]),
   subscriptionId: z.string().min(1),
-  urlOverride: z.string().nullable(),
+  urlOverride: urlOverrideSchema,
   pollIntervalMinutes: z.number().int().positive().nullable(),
   reconciliationIntervalMinutes: z.number().int().positive().nullable(),
   isActive: z.boolean(),
@@ -42,6 +65,8 @@ const listSchema = z.object({
 });
 
 export async function GET(request: Request) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   try {
     const params = listSchema.parse(Object.fromEntries(new URL(request.url).searchParams));
     const { q, query, ...filters } = params;
@@ -80,6 +105,8 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   try {
     const body = createSchema.parse(await request.json());
 

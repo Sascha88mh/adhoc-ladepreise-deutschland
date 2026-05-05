@@ -10,6 +10,11 @@ coverage
 # Local Netlify folder
 .netlify
 
+# Environment files — never commit (only .env.example is tracked)
+.env
+.env.*
+!.env.example
+
 # Secrets — never commit certificates
 certs/
 *.p12

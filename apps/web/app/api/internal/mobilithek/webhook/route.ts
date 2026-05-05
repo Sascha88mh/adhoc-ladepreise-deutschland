@@ -1,6 +1,14 @@
+import { timingSafeEqual } from "node:crypto";
 import { processFeedWebhook } from "@adhoc/shared/ingest";
 import { usingDatabase } from "@adhoc/shared/db";
 import { findAdminFeedBySubscriptionId } from "@/lib/server/admin-data";
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
 
 export async function POST(request: Request) {
   if (!usingDatabase()) {
@@ -11,9 +19,14 @@ export async function POST(request: Request) {
   }
 
   const expectedForwardSecret = process.env.MOBILITHEK_FORWARD_SECRET;
+  if (!expectedForwardSecret) {
+    console.error("[webhook] MOBILITHEK_FORWARD_SECRET is not configured — refusing request");
+    return Response.json({ error: "Webhook endpoint not configured" }, { status: 503 });
+  }
+  const incomingForwardSecret = request.headers.get("x-mobilithek-forward-secret");
   if (
-    expectedForwardSecret &&
-    request.headers.get("x-mobilithek-forward-secret") !== expectedForwardSecret
+    !incomingForwardSecret ||
+    !timingSafeEqualStrings(incomingForwardSecret, expectedForwardSecret)
   ) {
     return Response.json({ error: "Invalid forward secret" }, { status: 401 });
   }

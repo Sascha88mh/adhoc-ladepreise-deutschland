@@ -1,5 +1,13 @@
 import type { PoolClient } from "pg";
 import { gunzipSync } from "node:zlib";
+import { timingSafeEqual } from "node:crypto";
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
 import type { FeedConfig, SyncRun, TariffSummary } from "../domain/types";
 import {
   parseDynamicMobilithekPayload,
@@ -2512,8 +2520,10 @@ export async function processFeedWebhook(feedId: string, payload: string, incomi
   }
 
   const expectedSecret = resolveSecretRef(feed.webhookSecretRef);
-  if (expectedSecret && incomingSecret !== expectedSecret) {
-    throw new Error("Invalid webhook secret");
+  if (expectedSecret) {
+    if (!incomingSecret || !timingSafeEqualStrings(incomingSecret, expectedSecret)) {
+      throw new Error("Invalid webhook secret");
+    }
   }
 
   await getPool().query(

@@ -1,5 +1,6 @@
 import { cleanupStuckSyncRunsDb, usingDatabase } from "@adhoc/shared/db";
 import { listAdminSyncRuns } from "@/lib/server/admin-data";
+import { adminGuardResponse, requireAdmin } from "@/lib/supabase/require-admin";
 
 const ADMIN_SYNC_RUNS_TIMEOUT_MS = Math.max(
   500,
@@ -7,6 +8,9 @@ const ADMIN_SYNC_RUNS_TIMEOUT_MS = Math.max(
 );
 
 export async function GET() {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
+
   const runsPromise = listAdminSyncRuns()
     .then((data) => Response.json({ data }))
     .catch((error) => {
@@ -30,6 +34,9 @@ export async function GET() {
 }
 
 export async function DELETE() {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
+
   if (!usingDatabase()) {
     return Response.json({ error: "Only available in db mode" }, { status: 400 });
   }

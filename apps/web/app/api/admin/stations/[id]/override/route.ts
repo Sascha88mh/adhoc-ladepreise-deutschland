@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { removeStationOverride, saveStationOverride } from "@/lib/server/admin-data";
+import { adminGuardResponse, requireAdmin } from "@/lib/supabase/require-admin";
 
 const patchSchema = z.object({
   displayName: z.string().nullable(),
@@ -15,6 +16,8 @@ export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   try {
     const payload = patchSchema.parse(await request.json());
     const { id } = await params;
@@ -30,6 +33,8 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   try {
     const { id } = await params;
     const removed = await removeStationOverride(id);

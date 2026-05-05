@@ -1,6 +1,29 @@
 import { z, ZodError } from "zod";
 import { deleteAdminFeedConfig, updateAdminFeedConfig } from "@/lib/server/admin-data";
 import { cpoExistsDb, usingDatabase } from "@adhoc/shared/db";
+import { adminGuardResponse, requireAdmin } from "@/lib/supabase/require-admin";
+
+const ALLOWED_FEED_HOSTS = new Set(["m2m.mobilithek.info"]);
+
+const urlOverrideSchema = z
+  .string()
+  .nullable()
+  .refine(
+    (value) => {
+      if (value === null || value === "") return true;
+      try {
+        const url = new URL(value);
+        if (url.protocol !== "https:") return false;
+        return ALLOWED_FEED_HOSTS.has(url.hostname);
+      } catch {
+        return false;
+      }
+    },
+    {
+      message:
+        "urlOverride muss eine HTTPS-URL auf einen erlaubten Mobilithek-Host sein (z. B. https://m2m.mobilithek.info/...).",
+    },
+  );
 
 const patchSchema = z.object({
   source: z.enum(["mobilithek"]).optional(),
@@ -9,7 +32,7 @@ const patchSchema = z.object({
   mode: z.enum(["push", "pull", "hybrid"]).optional(),
   type: z.enum(["static", "dynamic"]).optional(),
   subscriptionId: z.string().min(1).optional(),
-  urlOverride: z.string().nullable().optional(),
+  urlOverride: urlOverrideSchema.optional(),
   pollIntervalMinutes: z.number().int().positive().nullable().optional(),
   reconciliationIntervalMinutes: z.number().int().positive().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -32,6 +55,8 @@ export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   try {
     const body = patchSchema.parse(await request.json());
 
@@ -82,6 +107,8 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   const { id } = await params;
   const removed = await deleteAdminFeedConfig(id);
   return Response.json({ ok: removed }, { status: removed ? 200 : 404 });

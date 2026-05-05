@@ -33,6 +33,7 @@ const INTERACTIVE_STATION_LAYERS = [
 const STATION_TILE_SOURCE_ID = "station-tiles";
 const STATION_TILE_SOURCE_LAYER = "stations";
 const STATION_TILE_FILTER_LAYERS = ["browse-points", "browse-power-labels"] as const;
+const STATION_TILE_MIN_ZOOM = 4;
 const STATION_TILE_MAX_ZOOM = 14;
 const STATION_TILE_URL_TEMPLATE =
   process.env.NEXT_PUBLIC_MAP_TILE_URL ??
@@ -490,7 +491,7 @@ function ensureOperationalLayers(map: MaplibreMap, mapMode: MapMode) {
     map.addSource(STATION_TILE_SOURCE_ID, {
       type: "vector",
       tiles: [stationTileUrl()],
-      minzoom: 5,
+      minzoom: STATION_TILE_MIN_ZOOM,
       maxzoom: STATION_TILE_MAX_ZOOM,
     });
   }
@@ -886,6 +887,7 @@ export function RouteMap({
   candidatesOpen,
 }: Props) {
   const [mapInstance, setMapInstance] = useState<MaplibreMap | null>(null);
+  const [mapError, setMapError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MaplibreMap | null>(null);
   const onSelectRef = useRef(onSelect);
@@ -928,22 +930,33 @@ export function RouteMap({
       return;
     }
 
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: mapStyleForMode(mapModeRef.current),
-      center: [
-        initialViewportRef.current?.lng ?? routeRef.current.origin.coordinates.lng,
-        initialViewportRef.current?.lat ?? routeRef.current.origin.coordinates.lat,
-      ],
-      zoom: initialViewportRef.current?.zoom ?? (isLocationFocusRoute(routeRef.current) ? 14 : 6),
-      bearing: initialViewportRef.current?.bearing ?? 0,
-      pitch: initialViewportRef.current?.pitch ?? 20,
-      maxZoom: 16,
-      attributionControl: false,
-    });
+    let map: MaplibreMap;
+
+    try {
+      map = new maplibregl.Map({
+        container: containerRef.current,
+        style: mapStyleForMode(mapModeRef.current),
+        center: [
+          initialViewportRef.current?.lng ?? routeRef.current.origin.coordinates.lng,
+          initialViewportRef.current?.lat ?? routeRef.current.origin.coordinates.lat,
+        ],
+        zoom: initialViewportRef.current?.zoom ?? (isLocationFocusRoute(routeRef.current) ? 14 : 6),
+        bearing: initialViewportRef.current?.bearing ?? 0,
+        pitch: initialViewportRef.current?.pitch ?? 20,
+        maxZoom: 16,
+        attributionControl: false,
+      });
+    } catch {
+      containerRef.current.replaceChildren();
+      window.queueMicrotask(() => {
+        setMapError("Karte konnte in diesem Browser nicht gestartet werden.");
+      });
+      return;
+    }
 
     mapRef.current = map;
     setMapInstance(map);
+    setMapError(null);
 
     const renderCurrentState = () => {
       const currentRoute = routeRef.current;
@@ -1152,9 +1165,18 @@ export function RouteMap({
   }, [route.routeId, preserveViewport]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <>
+    <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
-      {mapInstance && <CustomCompass map={mapInstance} candidatesOpen={candidatesOpen} />}
-    </>
+      {mapError && (
+        <div className="absolute inset-0 flex items-center justify-center bg-[var(--background)] px-6 text-center">
+          <div className="glass-panel-strong max-w-sm rounded-[28px] px-6 py-5 text-sm text-[var(--foreground)] shadow-2xl">
+            {mapError}
+          </div>
+        </div>
+      )}
+      {mapInstance && !mapError && (
+        <CustomCompass map={mapInstance} candidatesOpen={candidatesOpen} />
+      )}
+    </div>
   );
 }

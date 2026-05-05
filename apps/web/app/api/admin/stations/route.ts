@@ -1,4 +1,5 @@
 import { searchAdminStations } from "@/lib/server/admin-data";
+import { adminGuardResponse, requireAdmin } from "@/lib/supabase/require-admin";
 
 const ADMIN_STATIONS_TIMEOUT_MS = Math.max(
   500,
@@ -19,6 +20,8 @@ function emptyStationsAfter(ms: number) {
 }
 
 export async function GET(request: Request) {
+  const guard = await requireAdmin();
+  if (!guard.ok) return adminGuardResponse(guard);
   const { searchParams } = new URL(request.url);
   const query = searchParams.get("query") ?? "";
 

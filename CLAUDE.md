@@ -1,7 +1,10 @@
 # CLAUDE.md — Adhoc Plattform
 
-Operativer Leitfaden für Claude-Sessions in diesem Monorepo.
-Für Feed-System-Details → `docs/FEEDS.md` (Single Source of Truth).
+Operativer Leitfaden für Claude-Sessions in diesem Monorepo. Für tiefe Doku → [`docs/`](./docs/):
+- [`ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — Aufbau, Datenflüsse, Hot-Spot-Dateien
+- [`SECURITY.md`](./docs/SECURITY.md) — Auth, Webhooks, Secrets
+- [`DEPLOYMENT.md`](./docs/DEPLOYMENT.md) — Netlify/Railway/Supabase-Setup
+- [`FEEDS.md`](./docs/FEEDS.md) — Feed-Onboarding und -Betrieb (Single Source of Truth)
 
 ---
 
@@ -14,14 +17,15 @@ Für Feed-System-Details → `docs/FEEDS.md` (Single Source of Truth).
 
 ---
 
-## Projektstruktur
+## Projektstruktur (Schnellüberblick)
 
 ```
-apps/web/          Next.js App (Frontend + Admin-UI + API-Routes)
-apps/ingest/       Lokaler Ingest-Runner (CLI, kein Netlify)
-packages/shared/   Geteilte Logik: Parser, DB-Queries, Domain-Typen
-db/                SQL-Schema + Migrationen (schema.sql, migrations/)
-docs/FEEDS.md      Feed-Onboarding, Betrieb, Troubleshooting
+apps/web/                Next.js 16 App + Admin
+apps/ingest/             Cron-Worker (CLI)
+apps/mobilithek-gateway/ Cloudflare Worker (Webhook-Reserve)
+packages/shared/         Domain (Parser, DB, Ingest, Geo)
+db/                      schema.sql + migrations/ + fixtures/
+docs/                    Doku (siehe oben)
 ```
 
 Wichtige Dateien:
@@ -33,9 +37,10 @@ Wichtige Dateien:
 | Domain-Typen (Zod) | `packages/shared/src/domain/types.ts` |
 | DB-Queries (public) | `packages/shared/src/db/public.ts` |
 | DB-Queries (admin) | `packages/shared/src/db/admin.ts` |
-| Station-Detail (Backend) | `apps/web/lib/server/public-api.ts` |
-| Station-Drawer (UI) | `apps/web/components/results/station-drawer.tsx` |
-| Netlify Scheduled Function | `apps/web/netlify/functions/ingest-sync.mts` |
+| Admin-Auth-Middleware | `apps/web/middleware.ts` + `apps/web/lib/supabase/middleware.ts` |
+| Admin-API-Guard | `apps/web/lib/supabase/require-admin.ts` |
+| Edge Webhook | `apps/web/netlify/edge-functions/mobilithek-webhook.ts` |
+| Cron Sync | `apps/web/netlify/functions/ingest-sync.mts` |
 
 ---
 
@@ -46,7 +51,7 @@ Wichtige Dateien:
 cd packages/shared && npx tsc --noEmit
 cd apps/web && npx tsc --noEmit
 
-# Parser gegen echte Payload testen (absoluter Importpfad nötig)
+# Parser gegen echte Payload testen
 cat > /tmp/test.mts << 'EOF'
 import { parseStaticMobilithekPayload } from '/abs/path/to/packages/shared/src/mobilithek/parser.ts';
 import { readFileSync } from 'fs';
@@ -55,7 +60,7 @@ console.log('Stationen:', result.catalog.length);
 EOF
 npx tsx /tmp/test.mts
 
-# DB direkt abfragen (kein psql nötig — pg-Modul aus pnpm-Store)
+# DB direkt abfragen
 cat > /tmp/db.mjs << 'EOF'
 import { createRequire } from 'module';
 import { readFileSync } from 'fs';
@@ -81,8 +86,25 @@ node /tmp/db.mjs
 | Admin-Console Sync-Button (lokal) | **Lokaler Code** — sofort nach Speichern |
 | `next dev` API-Routes | **Lokaler Code** — hot-reload aktiv |
 
-→ **Nach Parser-Fixes immer manuell über lokale Admin-Console synchen** (`/admin` → Feed → Sync), nicht auf Netlify-Cron warten.
-→ Wenn Netlify-App läuft aber DB-Daten falsch sind: Prüfen ob Netlify mit altem Code deployt ist.
+→ Nach Parser-Fixes immer manuell über lokale Admin-Console synchen (`/admin` → Feed → Sync), nicht auf Netlify-Cron warten.
+→ Wenn Netlify-App läuft aber DB-Daten falsch sind: Prüfen, ob Netlify mit altem Code deployt ist.
+
+---
+
+## Auth (seit 2026-05-05)
+
+- Admin-Bereich (`/admin`, `/api/admin/*`) ist hinter Supabase Auth.
+- Schutz: **Middleware (apps/web/middleware.ts)** + **`requireAdmin()` in jeder API-Route** (Defense in Depth).
+- User wird im Supabase-Dashboard manuell angelegt.
+- Allowlist via `ADMIN_EMAILS` (Komma-Liste). Nur diese Emails dürfen Admin sein, auch wenn ein Supabase-User sonst existiert.
+- Logout-Button im Admin-Header.
+
+Beim Anlegen einer **neuen Admin-API-Route**: zwingend mit
+```ts
+const guard = await requireAdmin();
+if (!guard.ok) return adminGuardResponse(guard);
+```
+beginnen. Middleware allein reicht nicht — Defense in Depth.
 
 ---
 
@@ -127,6 +149,7 @@ energyInfrastructureSite        ← Physischer Standort (eine Adresse)
 - `tariffs.tariff_code` — UNIQUE (`energyRate.idG`)
 - Alle FK-Cascades: `ON DELETE CASCADE` auf `charge_points`, `tariffs`, `connectors`
 - Advisory Locks: `pg_try_advisory_xact_lock(hash(feedId))` — auto-release bei COMMIT/ROLLBACK
+- Migrationen 003 existieren als zwei Files (`003_sync_run_claims.sql`, `003_tariff_instances_*.sql`) — alphabetische Reihenfolge ist beabsichtigt; nicht umbenennen ohne DB-Audit.
 
 ---
 
@@ -145,5 +168,14 @@ energyInfrastructureSite        ← Physischer Standort (eine Adresse)
 4. Wenn DB ok, Frontend falsch → Browser-Cache leeren oder Next.js-Cache prüfen
 
 **„Feed wird bereits verarbeitet (Lock belegt)"**
-→ Normal bei überlappenden Syncs. Wenn dauerhaft: Admin-Console → „Beenden erzwingen",
-dann warten bis Lock-Transaktion committed/rollbacked (Advisory Lock auto-release).
+→ Normal bei überlappenden Syncs. Wenn dauerhaft: Admin-Console → „Beenden erzwingen", dann warten bis Lock-Transaktion committed/rollbacked (Advisory Lock auto-release).
+
+**„Admin-Login funktioniert nicht"**
+1. `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY` gesetzt?
+2. `ADMIN_EMAILS` enthält die User-Email (lowercased)?
+3. User in Supabase angelegt und bestätigt?
+4. Browser-Cookies löschen → erneut versuchen.
+
+**„Webhook 401/503 nach Deploy"**
+- 503: `MOBILITHEK_FORWARD_SECRET` ist nicht gesetzt — endpoint blockiert. Setzen + redeploy.
+- 401: Forward-Secret stimmt nicht zwischen Edge-Function/Cloudflare-Worker und App überein.

@@ -8,6 +8,22 @@ type IpApiResponse = {
   longitude?: number;
 };
 
+function fallbackLocation() {
+  return Response.json({
+    data: {
+      id: "fallback-deutschland",
+      label: "Deutschland",
+      secondaryLabel: null,
+      inputLabel: "Deutschland",
+      query: "51.16570, 10.45150",
+      coordinates: {
+        lat: 51.1657,
+        lng: 10.4515,
+      },
+    },
+  });
+}
+
 export async function GET() {
   try {
     const response = await fetch("https://ipapi.co/json/", {
@@ -18,10 +34,7 @@ export async function GET() {
     });
 
     if (!response.ok) {
-      return Response.json(
-        { error: "IP-Standort konnte nicht geladen werden." },
-        { status: 502 },
-      );
+      return fallbackLocation();
     }
 
     const payload = (await response.json()) as IpApiResponse;
@@ -30,10 +43,7 @@ export async function GET() {
       typeof payload.latitude !== "number" ||
       typeof payload.longitude !== "number"
     ) {
-      return Response.json(
-        { error: "IP-Standort konnte nicht aufgeloest werden." },
-        { status: 502 },
-      );
+      return fallbackLocation();
     }
 
     const reverse = await reverseGeocodeLocation(payload.latitude, payload.longitude);
@@ -65,9 +75,6 @@ export async function GET() {
       },
     });
   } catch {
-    return Response.json(
-      { error: "IP-Standort konnte nicht geladen werden." },
-      { status: 502 },
-    );
+    return fallbackLocation();
   }
 }

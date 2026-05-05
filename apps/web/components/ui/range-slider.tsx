@@ -1,7 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
-
 export function DualRangeSlider({
   min,
   max,
@@ -17,17 +15,8 @@ export function DualRangeSlider({
   onChange: (value: [number, number]) => void;
   className?: string;
 }) {
-  const [minVal, setMinVal] = useState(value[0]);
-  const [maxVal, setMaxVal] = useState(value[1]);
-
-  useEffect(() => {
-    setMinVal(value[0]);
-    setMaxVal(value[1]);
-  }, [value[0], value[1]]);
-
-  // Ensure minimums don't visually break
-  const safeMinVal = Math.min(minVal, maxVal);
-  const safeMaxVal = Math.max(minVal, maxVal);
+  const safeMinVal = Math.min(value[0], value[1]);
+  const safeMaxVal = Math.max(value[0], value[1]);
 
   const minPercent = ((safeMinVal - min) / (max - min)) * 100;
   const maxPercent = ((safeMaxVal - min) / (max - min)) * 100;
@@ -42,7 +31,6 @@ export function DualRangeSlider({
         value={safeMinVal}
         onChange={(e) => {
           const val = Math.min(Number(e.target.value), safeMaxVal);
-          setMinVal(val);
           onChange([val, safeMaxVal]);
         }}
         className="pointer-events-none absolute z-20 h-0 w-full appearance-none outline-none slider-thumb-min"
@@ -55,7 +43,6 @@ export function DualRangeSlider({
         value={safeMaxVal}
         onChange={(e) => {
           const val = Math.max(Number(e.target.value), safeMinVal);
-          setMaxVal(val);
           onChange([safeMinVal, val]);
         }}
         className="pointer-events-none absolute z-30 h-0 w-full appearance-none outline-none slider-thumb-max"

@@ -1,5 +1,3 @@
-import type { Context } from "@netlify/edge-functions";
-
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -65,7 +63,7 @@ async function decodeBody(request: Request) {
   };
 }
 
-export default async (request: Request, _context: Context) => {
+export default async function mobilithekWebhook(request: Request) {
   if (request.method === "HEAD") {
     return new Response(null, { status: 204 });
   }
@@ -125,4 +123,4 @@ export default async (request: Request, _context: Context) => {
       500,
     );
   }
-};
+}

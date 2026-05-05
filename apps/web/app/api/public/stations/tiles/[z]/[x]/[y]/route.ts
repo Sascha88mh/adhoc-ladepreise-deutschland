@@ -11,6 +11,11 @@ const MAX_TILE_DB_IN_FLIGHT = Math.max(
   1,
   Number(process.env.MAP_TILE_DB_CONCURRENCY ?? 4),
 );
+const TILE_SLOT_RETRY_DELAY_MS = 40;
+const TILE_SLOT_WAIT_TIMEOUT_MS = Math.max(
+  500,
+  Number(process.env.MAP_TILE_SLOT_WAIT_TIMEOUT_MS ?? 8_000),
+);
 
 declare global {
   var __adhocTileDbInFlight: number | undefined;
@@ -49,13 +54,27 @@ function tileResponse(tile: ArrayBuffer | ArrayBufferView) {
   });
 }
 
-function tileBusyResponse() {
+function emptyTileResponse() {
+  return new Response(new Uint8Array(), {
+    headers: {
+      "content-type": MVT_CONTENT_TYPE,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function noContentTileResponse() {
   return new Response(null, {
-    status: 503,
+    status: 204,
     headers: {
       "cache-control": "no-store",
-      "retry-after": "1",
     },
+  });
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
 }
 
@@ -76,6 +95,20 @@ function releaseTileDbSlot() {
   );
 }
 
+async function acquireTileDbSlot() {
+  const deadline = Date.now() + TILE_SLOT_WAIT_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (tryAcquireTileDbSlot()) {
+      return true;
+    }
+
+    await wait(TILE_SLOT_RETRY_DELAY_MS);
+  }
+
+  return tryAcquireTileDbSlot();
+}
+
 export async function GET(
   _request: Request,
   context: { params: Promise<{ z: string; x: string; y: string }> },
@@ -93,14 +126,11 @@ export async function GET(
   }
 
   if (!usingDatabase()) {
-    return Response.json(
-      { error: "Die Karten-Tiles benoetigen APP_DATA_SOURCE=db." },
-      { status: 503 },
-    );
+    return emptyTileResponse();
   }
 
-  if (!tryAcquireTileDbSlot()) {
-    return tileBusyResponse();
+  if (!(await acquireTileDbSlot())) {
+    return noContentTileResponse();
   }
 
   try {
@@ -108,10 +138,7 @@ export async function GET(
     return tileResponse(tile);
   } catch (error) {
     console.warn("[stations/tiles] tile request failed", { z, x, y, error });
-    return new Response(null, {
-      status: 503,
-      headers: { "cache-control": "no-store" },
-    });
+    return emptyTileResponse();
   } finally {
     releaseTileDbSlot();
   }
