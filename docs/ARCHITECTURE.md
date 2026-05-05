@@ -23,7 +23,7 @@ adhoc-plattform/
 │  │     ├─ edge-functions/ Webhook-Vorverarbeitung (gzip-Decode)
 │  │     └─ functions/      Scheduled Sync + Legacy-Webhook-Fallback
 │  ├─ ingest/               Lokaler/Cron-Worker (CLI: `pnpm ingest:sync`)
-│  └─ mobilithek-gateway/   Cloudflare Worker als Webhook-Reserve
+│  └─ mobilithek-gateway/   Cloudflare Worker: /map-stations-Cache + Push-Webhook-Forwarder
 │
 ├─ packages/
 │  └─ shared/               Domain-Logik (vom Browser nicht importierbar)
@@ -130,16 +130,42 @@ adhoc-plattform/
 - Verwendet `@adhoc/shared/ingest` für die gesamte Logik.
 - Wird als Railway-Cron oder lokal per `pnpm ingest:sync` aufgerufen.
 
-### 2.4 `apps/mobilithek-gateway` (Cloudflare Worker, Reserve)
+### 2.4 `apps/mobilithek-gateway` (Cloudflare Worker)
 
-- Empfängt Mobilithek-Webhook-Pushes, dekodiert gzip, leitet als sauberes JSON an `/api/internal/mobilithek/webhook` weiter.
-- **Reserve-Pfad** zur Netlify Edge Function (`mobilithek-webhook.ts`), kann übernehmen, wenn Netlify-Edge bei einem CPO Probleme macht.
+Hat zwei produktive Funktionen:
+
+- **`GET /map-stations`** — primärer öffentlicher Map-Endpoint. Cached `s-maxage=60` mit `stale-while-revalidate=120` und ruft Netlify (`MAP_STATIONS_UPSTREAM_URL`) nur bei Cache-Miss. Reduziert Netlify-Function-Verbrauch auf einen Bruchteil und liefert Edge-nahe Latenz. Browser-Frontend zeigt direkt auf den Worker.
+- **`POST /webhook/<feedId>` (oder `?subscriptionId=…`)** — Push-Webhook-Forwarder: dekodiert gzip, leitet sauberes JSON an `/api/internal/mobilithek/webhook` weiter, setzt `x-mobilithek-forward-secret`. Wird **aktuell nicht aktiv aufgerufen**, weil alle Feeds Pull-Mode haben — steht für künftige Push/Hybrid-Feeds bereit.
+
+Konfiguration im Worker (via `wrangler secret put` / `vars` in `wrangler.toml`):
+
+| Variable | Zweck |
+|---|---|
+| `UPSTREAM_WEBHOOK_URL` | Ziel des Webhook-Forwards (`https://adhoc-plattform.netlify.app/api/internal/mobilithek/webhook`) |
+| `MAP_STATIONS_UPSTREAM_URL` | Ziel des Map-Stations-Cache-Misses (Netlify-Endpoint) |
+| `MOBILITHEK_FORWARD_SECRET` | Muss identisch mit dem App-Wert sein, sobald Push-Feeds aktiv werden |
 
 ---
 
 ## 3. Datenflüsse
 
 ### 3.1 Public-Read-Pfad (Browser → Karte)
+
+**Map-Stations (primär, Cloudflare-cached):**
+
+```
+Browser
+  └─→ GET https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/map-stations
+        └─ Cloudflare Cache (s-maxage=60, stale-while-revalidate=120)
+            ├─ Hit  → direkt Edge-Antwort
+            └─ Miss → POST MAP_STATIONS_UPSTREAM_URL (Netlify)
+                       └─→ packages/shared/src/db/public.ts
+                             └─→ Postgres (PostGIS)
+```
+
+Damit landen die meisten Kartenanfragen im Cloudflare-Cache, Netlify wird nur bei Cache-Miss bzw. Revalidate angefasst — entscheidender Token/Compute-Spar-Win.
+
+**Tiles (direkt gegen App):**
 
 ```
 Browser
@@ -151,23 +177,26 @@ Browser
 
 Anti-Patterns vermeiden: Tile-Endpoint **muss** mit DB-Concurrency-Limit (`MAP_TILE_DB_CONCURRENCY`) und Slot-Wait-Timeout arbeiten — sonst Pool-Starvation auf Nano-Tier-Supabase.
 
-### 3.2 Mobilithek-Webhook-Pfad (Push)
+### 3.2 Mobilithek-Webhook-Pfad (Push) — *aktuell inaktiv*
+
+> Stand 2026-05-05: Alle Feeds laufen im Pull-Mode. Dieser Pfad ist nur dann aktiv, wenn ein Feed in `/admin` auf `mode: "push"` oder `"hybrid"` gesetzt wird.
 
 ```
 Mobilithek-Server
-  └─→ POST  https://<domain>/api/admin/mobilithek/webhook/<feedId>
-        ├─→ Netlify Edge Function `mobilithek-webhook`           ← gzip-Decode + Header-Forward
-        │     └─→ POST /api/internal/mobilithek/webhook          ← x-mobilithek-forward-secret
-        │           └─→ packages/shared/src/ingest::processFeedWebhook
-        │                 ├─ webhookSecretRef-Check (timing-safe)
-        │                 └─→ enqueue → runFeedAction("webhook", payload)
-        │
-        └─→ (Fallback) Cloudflare Worker `apps/mobilithek-gateway`
-              └─→ /api/internal/mobilithek/webhook  (gleicher Pfad)
+  └─→ POST  https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/webhook/<feedId>
+        └─→ Cloudflare Worker `apps/mobilithek-gateway`           ← gzip-Decode + JSON-Normalize
+              └─→ POST https://<netlify>/api/internal/mobilithek/webhook
+                    └─ x-mobilithek-forward-secret               ← timing-safe Vergleich
+                          └─→ packages/shared/src/ingest::processFeedWebhook
+                                ├─ webhookSecretRef-Check (timing-safe)
+                                └─→ enqueue → runFeedAction("webhook", payload)
 ```
 
+(In `netlify.toml` ist außerdem eine Netlify Edge Function als alternativer Eingang konfiguriert, wird aber aktuell nicht angesprochen, weil Mobilithek auf den Cloudflare-Worker zeigt.)
+
 Wichtig:
-- `MOBILITHEK_FORWARD_SECRET` ist **pflicht** — der interne Endpoint failed-closed, wenn die env-Var nicht gesetzt ist.
+- `MOBILITHEK_FORWARD_SECRET` ist **pflicht** auf der App-Seite — der interne Endpoint failed-closed, wenn die env-Var nicht gesetzt ist.
+- Sobald der erste Push-Feed aktiviert wird: Worker-Wert per `wrangler secret put MOBILITHEK_FORWARD_SECRET` mit dem App-Wert synchronisieren.
 - Pro-Feed-Secret aus `webhookSecretRef` wird zusätzlich timing-safe verglichen.
 
 ### 3.3 Sync-Pfad (Pull / Cron)

@@ -16,7 +16,7 @@ Dieses Dokument beschreibt, wie die Adhoc Plattform produktiv deployed wird. Fü
 | `apps/web/netlify/functions/ingest-sync-background.mts` | Netlify Background | Lange laufender Sync (Backfill) |
 | `apps/web/netlify/functions/mobilithek-webhook.mts` | Netlify Function | Legacy-Webhook-Fallback |
 | `apps/ingest` | Railway-Cron oder lokal | Alternative Cron-Quelle (statt Netlify) |
-| `apps/mobilithek-gateway` | Cloudflare Worker | Reserve-Webhook-Eingang |
+| `apps/mobilithek-gateway` | Cloudflare Worker | Primärer `/map-stations`-Cache + Push-Webhook-Forwarder |
 | Postgres + PostGIS | Supabase | Master-DB |
 | Auth | Supabase Auth | Admin-Login |
 
@@ -101,7 +101,7 @@ ADMIN_EMAILS=admin@example.com
 
 MOBILITHEK_BASE_URL=https://m2m.mobilithek.info
 MOBILITHEK_USER_AGENT=AdhocPlattform/1.0
-MOBILITHEK_FORWARD_SECRET=<32+ random chars — auch im Cloudflare-Worker setzen>
+MOBILITHEK_FORWARD_SECRET=<32+ random chars; auch im Cloudflare-Worker spiegeln, sobald Push-Feeds aktiv werden>
 
 OSM_GEOCODER_USER_AGENT=AdhocPlattform/1.0 contact@example.com
 ```
@@ -151,19 +151,43 @@ APP_DATA_SOURCE=db DATABASE_URL=... pnpm --filter ingest bootstrap:tesla
 
 ---
 
-## 6. Cloudflare Worker (Webhook-Reserve)
+## 6. Cloudflare Worker (`apps/mobilithek-gateway`)
 
-Falls Mobilithek-Push trotz Edge-Function Probleme macht:
+Der Worker erfüllt zwei Aufgaben:
+
+1. **Cache vor `GET /map-stations`** — primärer Browser-Endpoint für die Karte, reduziert Netlify-Function-Verbrauch drastisch.
+2. **Webhook-Forwarder** für Push-Feeds (steht bereit, aktuell ohne aktiven Verkehr, weil alle Feeds Pull-Mode haben).
+
+### 6.1 Erstdeploy / Update
 
 ```bash
 cd apps/mobilithek-gateway
 pnpm install
-wrangler secret put MOBILITHEK_FORWARD_SECRET
-wrangler secret put INTERNAL_WEBHOOK_URL  # https://<domain>/api/internal/mobilithek/webhook
+pnpm typecheck
 pnpm deploy
 ```
 
-Mobilithek-Ziel-URL danach auf den Worker umstellen.
+### 6.2 Secrets / Variables
+
+In `wrangler.toml` als `[vars]` oder via `wrangler secret put`:
+
+| Name | Wert |
+|---|---|
+| `UPSTREAM_WEBHOOK_URL` | `https://<netlify-domain>/api/internal/mobilithek/webhook` |
+| `MAP_STATIONS_UPSTREAM_URL` | Netlify-Endpoint für Map-Stations (siehe `MAP_STATIONS_UPSTREAM_URL` im App-Code) |
+| `MOBILITHEK_FORWARD_SECRET` | **Identischer String wie in Netlify-Env.** Pflicht, sobald der erste Push-Feed aktiviert wird. |
+
+### 6.3 Push-Feed aktivieren (Zukunft)
+
+Sobald in `/admin` ein Feed mit `mode: "push"` oder `"hybrid"` angelegt wird:
+
+1. `MOBILITHEK_FORWARD_SECRET` im Worker per `wrangler secret put` mit Netlify-Wert synchronisieren.
+2. Mobilithek-Subscription im Portal auf
+   ```
+   https://adhoc-mobilithek-gateway.sas-wilms.workers.dev/webhook/<feedId>
+   ```
+   umstellen.
+3. Test-Push aus dem Mobilithek-Portal triggern → in DB `webhook_deliveries` prüfen.
 
 ---
 

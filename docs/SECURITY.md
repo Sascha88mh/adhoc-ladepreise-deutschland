@@ -67,9 +67,11 @@ Wenn die Middleware versehentlich nicht läuft (z. B. fehlerhafte `matcher`-Conf
 
 ### 3.1 Schichten
 
+> Hinweis: Aktuell laufen alle Feeds im Pull-Mode — dieser Pfad ist „armed but unused", er greift erst, sobald ein Push-/Hybrid-Feed aktiviert wird.
+
 ```
 Mobilithek
-   └─→ Edge Function (Netlify) ODER Cloudflare Worker (Reserve)
+   └─→ Cloudflare Worker `apps/mobilithek-gateway` (primär)
         └─ setzt Header  x-mobilithek-forward-secret: <FORWARD_SECRET>
               └─→ POST /api/internal/mobilithek/webhook
                    ├─ FAIL CLOSED wenn MOBILITHEK_FORWARD_SECRET unset (503)
@@ -78,9 +80,12 @@ Mobilithek
                         └─ pro-Feed-Secret-Check (timing-safe) wenn webhookSecretRef gesetzt
 ```
 
+Der Netlify Edge Function als alternativer Eingang ist in `netlify.toml` konfiguriert, wird aber nicht angesprochen, solange Mobilithek auf den Cloudflare-Worker zeigt.
+
 ### 3.2 Pflicht-Konfiguration
 
-- `MOBILITHEK_FORWARD_SECRET` **muss** gesetzt sein — sonst antwortet der interne Endpoint mit `503 "Webhook endpoint not configured"`. Truthy-Bypass wurde entfernt.
+- `MOBILITHEK_FORWARD_SECRET` **muss** in der App-Env (Netlify) gesetzt sein — sonst antwortet der interne Endpoint mit `503 "Webhook endpoint not configured"`. Truthy-Bypass wurde entfernt.
+- Cloudflare-Worker (`apps/mobilithek-gateway`) braucht denselben Wert (`wrangler secret put MOBILITHEK_FORWARD_SECRET`), **bevor** der erste Push-Feed aktiviert wird. Solange alle Feeds Pull-Mode haben, schadet eine Diskrepanz nicht — wird aber zum Show-Stopper, sobald jemand auf Push umschaltet.
 - Pro Feed mit `webhookSecretRef` muss die referenzierte env-Var (z. B. `ENBW_WEBHOOK_SECRET`) gesetzt sein.
 - Beide Secrets werden **timing-safe** verglichen (`node:crypto.timingSafeEqual`) — kein Leak via String-Vergleich-Timing.
 

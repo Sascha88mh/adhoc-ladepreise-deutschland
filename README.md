@@ -17,7 +17,7 @@ pnpm dev
 ```
 apps/web/                Next.js 16 App: Public-Frontend, APIs, Admin-UI
 apps/ingest/             CLI-Worker für Mobilithek-Sync
-apps/mobilithek-gateway/ Cloudflare Worker (Webhook-Reserve)
+apps/mobilithek-gateway/ Cloudflare Worker: /map-stations-Cache + Push-Webhook-Forwarder
 packages/shared/         Domain-Logik (Parser, DB, Geo, Ingest)
 db/                      Schema + Migrationen + Test-Fixtures
 docs/                    Architektur, Security, Deployment, Feeds

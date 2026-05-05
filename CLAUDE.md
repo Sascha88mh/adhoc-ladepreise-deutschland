@@ -22,7 +22,7 @@ Operativer Leitfaden für Claude-Sessions in diesem Monorepo. Für tiefe Doku �
 ```
 apps/web/                Next.js 16 App + Admin
 apps/ingest/             Cron-Worker (CLI)
-apps/mobilithek-gateway/ Cloudflare Worker (Webhook-Reserve)
+apps/mobilithek-gateway/ Cloudflare Worker: /map-stations-Cache (primär) + Push-Webhook-Forwarder (Reserve)
 packages/shared/         Domain (Parser, DB, Ingest, Geo)
 db/                      schema.sql + migrations/ + fixtures/
 docs/                    Doku (siehe oben)
@@ -176,6 +176,6 @@ energyInfrastructureSite        ← Physischer Standort (eine Adresse)
 3. User in Supabase angelegt und bestätigt?
 4. Browser-Cookies löschen → erneut versuchen.
 
-**„Webhook 401/503 nach Deploy"**
-- 503: `MOBILITHEK_FORWARD_SECRET` ist nicht gesetzt — endpoint blockiert. Setzen + redeploy.
-- 401: Forward-Secret stimmt nicht zwischen Edge-Function/Cloudflare-Worker und App überein.
+**„Webhook 401/503 nach Deploy"** (relevant erst sobald Push-Feeds aktiv sind — aktuell laufen alle Feeds im Pull-Mode)
+- 503: `MOBILITHEK_FORWARD_SECRET` in Netlify nicht gesetzt — interner Endpoint blockiert. Setzen + redeploy.
+- 401: Forward-Secret stimmt nicht zwischen Cloudflare-Worker (`apps/mobilithek-gateway`) und Netlify-App überein. Worker per `wrangler secret put MOBILITHEK_FORWARD_SECRET` synchronisieren.
